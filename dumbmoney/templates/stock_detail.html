@@ -473,8 +473,8 @@
                     <span class="stock-exchange">${data.exchange}</span>
                 </div>
                 <div class="stock-price-row">
-                    <span class="stock-price">$${formatPrice(data.price)}</span>
-                    <span class="stock-change ${changeClass}">${data.change_pct > 0 ? '+' : ''}${data.change_pct.toFixed(2)}%</span>
+                    <span class="stock-price" id="liveStockPrice" data-symbol="${data.symbol}">$${formatPrice(data.price)}</span>
+                    <span class="stock-change ${changeClass}" id="liveStockChange">${data.change_pct > 0 ? '+' : ''}${data.change_pct.toFixed(2)}%</span>
                     ${data.pre_price != null ? `<span class="stock-pre">Pre: $${data.pre_price.toFixed(2)}</span>` : ''}
                     ${data.post_price != null ? `<span class="stock-post">Post: $${data.post_price.toFixed(2)}</span>` : ''}
                 </div>
@@ -2294,7 +2294,16 @@
     // Resize handler
     window.addEventListener('resize', () => drawChart());
 
-
+    // ── Live Price ─────────────────────────────────────────────────
+    startLivePrices([currentSymbol], function(prices) {
+        const p = prices[currentSymbol];
+        if (!p || !p.price) return;
+        const priceEl = document.getElementById('liveStockPrice');
+        if (priceEl) {
+            priceEl.textContent = '$' + p.price.toFixed(2);
+            priceEl.style.color = 'var(--green)';
+        }
+    }, 1500);
 
     // Load
     loadStock(currentSymbol);

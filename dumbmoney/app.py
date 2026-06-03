@@ -270,6 +270,18 @@ def migrate_db():
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+    # Add profit detail columns
+    for col, typedef in [
+        ('profit_millions', 'REAL'),
+        ('profit_expectations', "TEXT DEFAULT 'N/A'"),
+        ('profit_post_result_dir', "TEXT DEFAULT 'flat'"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE stats ADD COLUMN {col} {typedef}")
+            print(f"  Added column: stats.{col}")
+        except sqlite3.OperationalError:
+            pass
+
     # Create assets table if not exists
     c.execute("""
         CREATE TABLE IF NOT EXISTS assets (
@@ -1668,8 +1680,9 @@ def full_refresh():
                                     else:
                                         ps = 'loss_making'
                                         qoq = None
-                                    conn.execute("UPDATE stats SET profit_status = ?, profit_last_qtr_pct = ? WHERE symbol = ?",
-                                                 (ps, qoq, sym))
+                                    profit_millions = round(latest_ni / 1000000, 2) if latest_ni else None
+                                    conn.execute("UPDATE stats SET profit_status = ?, profit_last_qtr_pct = ?, profit_millions = ? WHERE symbol = ?",
+                                                 (ps, qoq, profit_millions, sym))
                                     profit_updated += 1
                     except Exception:
                         pass
@@ -2715,23 +2728,31 @@ def compute_atr(symbol, timeframe='1Day', period=14, multiplier=2):
     }
 
 
-def compute_atr_for_screener(symbol, timeframe='1Day', multiplier=2):
+def compute_atr_for_screener(symbol, timeframe='1Day', multiplier=2, end_date=None):
     """Compute Supertrend-style ATR trailing stop for screener.
     Uses LATEST bars (DESC LIMIT, then reversed) for accurate recent ATR.
+    If end_date is set, only uses bars on or before that date.
     Returns dict with atr_value, atr_stop, atr_signal, crossed flags, streak.
     """
     conn = get_db()
+    date_condition = " AND date <= ?" if end_date else ""
 
     # For 1Week/1Month, aggregate from 1Day bars
     if timeframe in ('1Week', '1Month'):
         tf_bars = aggregate_bars_to_tf(symbol, timeframe)
+        if end_date:
+            tf_bars = [b for b in tf_bars if b['date'] <= end_date]
     else:
-        tf_bars = conn.execute("""
+        query = f"""
             SELECT date, open, high, low, close, volume FROM bars
-            WHERE symbol = ? AND timeframe = '1Day'
+            WHERE symbol = ? AND timeframe = '1Day'{date_condition}
             ORDER BY date DESC
             LIMIT 250
-        """, (symbol.upper(),)).fetchall()
+        """
+        params = [symbol.upper()]
+        if end_date:
+            params.append(end_date)
+        tf_bars = conn.execute(query, params).fetchall()
         tf_bars.reverse()
 
     conn.close()
@@ -3295,7 +3316,7 @@ def screener():
                s.price, s.change_pct, s.weighted_alpha, s.volume, s.atrp,
                s.streak, s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct,
                s.atr_value, s.atr_stop, s.atr_signal, s.atr_crossed_above, s.atr_crossed_below, s.atr_streak, s.atr_multiplier,
-               s.profit_status, s.profit_last_qtr_pct,
+               s.profit_status, s.profit_last_qtr_pct, s.profit_millions, s.profit_expectations, s.profit_post_result_dir,
                ai.overall_score, ai.bias, ai.tech_score, ai.momentum_score, ai.volume_score, ai.events_score,
                ai.volume_profile_score, ai.trendline_score, ai.sentiment_score, ai.conclusion
         FROM stats s
@@ -3514,6 +3535,9 @@ def screener():
                 "atr_multiplier": row["atr_multiplier"],
                 "profit_status": row["profit_status"],
                 "profit_last_qtr_pct": row["profit_last_qtr_pct"],
+                "profit_millions": row.get("profit_millions"),
+                "profit_expectations": row.get("profit_expectations", "N/A"),
+                "profit_post_result_dir": row.get("profit_post_result_dir", "flat"),
                 "ai_score": row["overall_score"],
                 "ai_bias": row["bias"],
                 "ai_tech": row["tech_score"],
@@ -3565,6 +3589,16 @@ def screener():
                 s["pre_change_pct"] = None
                 s["post_price"] = None
                 s["post_change_pct"] = None
+            # Recompute ATR and streak from historical data
+            atr_data = compute_atr_for_screener(s["symbol"], timeframe, 2, end_date=date_cutoff)
+            if atr_data:
+                s["atr_value"] = atr_data.get("atr_value", 0)
+                s["atr_stop"] = atr_data.get("atr_stop", 0)
+                s["atr_signal"] = atr_data.get("atr_signal", 0)
+                s["atr_crossed_above"] = atr_data.get("crossed_above", 0)
+                s["atr_crossed_below"] = atr_data.get("crossed_below", 0)
+                s["atr_streak"] = atr_data.get("atr_streak", 0)
+                s["streak"] = atr_data.get("atr_streak", 0)
 
     else:
         # 1Week / 1Month: compute stats on-the-fly from aggregated 1Day bars
@@ -3593,6 +3627,9 @@ def screener():
                 stat['ai_conclusion'] = row["conclusion"]
                 stat['profit_status'] = row["profit_status"]
                 stat['profit_last_qtr_pct'] = row["profit_last_qtr_pct"]
+                stat['profit_millions'] = row.get("profit_millions")
+                stat['profit_expectations'] = row.get("profit_expectations", "N/A")
+                stat['profit_post_result_dir'] = row.get("profit_post_result_dir", "flat")
                 # Compute ATR for this timeframe
                 atr_data = compute_atr_for_screener(sym, timeframe, 2)
                 if atr_data:
@@ -4523,6 +4560,93 @@ def _quick_start():
     threading.Thread(target=_bg_full, daemon=True).start()
 
 
+# ── Live Price Manager (Alpaca WebSocket) ──────────────────────────────
+import asyncio
+_live_prices = {}
+_live_subscriptions = set()
+_live_lock = threading.Lock()
+_live_ws = None
+
+async def _alpaca_ws_loop():
+    global _live_prices, _live_ws
+    uri = "wss://stream.data.alpaca.markets/v2/iex"
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=20) as ws:
+                _live_ws = ws
+                auth = {"action": "auth", "key": API_KEY, "secret": API_SECRET}
+                await ws.send(json.dumps(auth))
+                resp = await asyncio.wait_for(ws.recv(), timeout=10)
+                auth_resp = json.loads(resp)
+                if not any(msg.get('T') == 'success' for msg in (auth_resp if isinstance(auth_resp, list) else [auth_resp])):
+                    print(f"  Live: Auth failed: {auth_resp}")
+                    await asyncio.sleep(30)
+                    continue
+                print("  Live: Connected to Alpaca IEX WebSocket")
+
+                syms = list(_live_subscriptions)
+                if syms:
+                    await ws.send(json.dumps({"action": "subscribe", "trades": syms}))
+
+                while True:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                    for data in json.loads(msg):
+                        if data.get('T') == 't':
+                            sym = data.get('S', '')
+                            price = data.get('p', 0)
+                            ts = data.get('t', '')
+                            if sym and price > 0:
+                                with _live_lock:
+                                    _live_prices[sym] = {"price": price, "time": ts}
+                        elif data.get('T') == 'subscription':
+                            pass
+        except asyncio.TimeoutError:
+            continue
+        except websockets.exceptions.ConnectionClosed:
+            print("  Live: Disconnected, reconnecting...")
+            await asyncio.sleep(5)
+            continue
+        except Exception as e:
+            print(f"  Live: Error: {e}")
+            await asyncio.sleep(10)
+            continue
+
+def _subscribe_symbols(symbols):
+    new_syms = []
+    with _live_lock:
+        for s in symbols:
+            if s.upper() not in _live_subscriptions:
+                _live_subscriptions.add(s.upper())
+                new_syms.append(s.upper())
+    return new_syms
+
+@app.route('/api/live/subscribe', methods=['POST'])
+def api_live_subscribe():
+    data = request.json or {}
+    symbols = data.get('symbols', [])
+    new_syms = _subscribe_symbols(symbols)
+    return jsonify({"status": "ok", "subscribed": len(new_syms)})
+
+@app.route('/api/live/prices')
+def api_live_prices():
+    symbols = request.args.get('symbols', '')
+    if not symbols:
+        return jsonify({})
+    sym_list = [s.strip().upper() for s in symbols.split(',') if s.strip()]
+    with _live_lock:
+        result = {s: _live_prices.get(s) for s in sym_list}
+    conn = get_db()
+    missing = [s for s in sym_list if not result.get(s)]
+    if missing:
+        placeholders = ','.join('?' * len(missing))
+        rows = conn.execute(f"SELECT symbol, price FROM stats WHERE symbol IN ({placeholders})", missing).fetchall()
+        for r in rows:
+            if not result.get(r['symbol']):
+                result[r['symbol']] = {"price": r['price'], "time": None, "from_db": True}
+    conn.close()
+    return jsonify(result)
+
+# ── Server Start ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     import threading
     import os
@@ -4530,19 +4654,27 @@ if __name__ == "__main__":
     # Schema migrations are fast — run synchronously.
     # Heavy data backfills (oldest_data) run in background.
     migrate_db()
-    # Streak recompute at startup is opt-in via env var; on Windows the
-    # background thread sometimes dies silently. Use /api/recompute-streaks.
-    if os.environ.get("DUMBMONEY_STARTUP_RECOMPUTE") == "1":
-        t = threading.Thread(target=recompute_all_streaks, daemon=True)
-        t.start()
+    # Recompute streaks at startup to ensure no stocks show streak=0 with >=2 bars
+    t = threading.Thread(target=recompute_all_streaks, daemon=True)
+    t.start()
     print()
     print("=" * 55)
     print(f"  DumbMoney Server #{SERVER_ID}")
     print(f"  http://localhost:{PORT}")
     print(f"  Database: {DB_PATH}")
     print(f"  Alpaca Paper Trading")
+    if 'websockets' in dir():
+        print(f"  Live Prices: Enabled (IEX WebSocket)")
     print("=" * 55)
     print()
+
+    # Start live WebSocket background thread
+    def _run_live():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_alpaca_ws_loop())
+    t = threading.Thread(target=_run_live, daemon=True)
+    t.start()
 
     # Quick-start
     conn = get_db()

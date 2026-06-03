@@ -808,14 +808,20 @@ function renderTable(stocks) {
         // Profit
         let profitHtml = '<span style="color:var(--text-tertiary)">—</span>';
         const ps = s.profit_status;
+        let profitDetailHtml = '';
+        if (s.profit_millions != null) {
+            const dir = s.profit_post_result_dir === 'up' ? '&#9650;' : s.profit_post_result_dir === 'down' ? '&#9660;' : '';
+            const exp = s.profit_expectations === 'above' ? '&#9650;' : s.profit_expectations === 'below' ? '&#9660;' : '';
+            profitDetailHtml = `<br><span style="font-size:10px;color:var(--text-tertiary)">$${s.profit_millions.toFixed(1)}M ${dir} ${exp}</span>`;
+        }
         if (ps === 'profitable') {
-            profitHtml = '<span style="color:var(--green);font-weight:600">Profitable</span>';
+            profitHtml = '<span style="color:var(--green);font-weight:600">Profitable</span>' + profitDetailHtml;
         } else if (ps === 'loss_making') {
-            profitHtml = '<span style="color:var(--red);font-weight:600">Loss</span>';
+            profitHtml = '<span style="color:var(--red);font-weight:600">Loss</span>' + profitDetailHtml;
         } else if (ps === 'growing') {
-            profitHtml = '<span style="color:var(--green);font-weight:600">&#9650; Growing</span>';
+            profitHtml = '<span style="color:var(--green);font-weight:600">&#9650; Growing</span>' + profitDetailHtml;
         } else if (ps === 'declining') {
-            profitHtml = '<span style="color:var(--red);font-weight:600">&#9660; Declining</span>';
+            profitHtml = '<span style="color:var(--red);font-weight:600">&#9660; Declining</span>' + profitDetailHtml;
         } else if (ps === 'N/A') {
             profitHtml = '<span style="color:var(--text-tertiary)">N/A</span>';
         }
@@ -1046,3 +1052,56 @@ renderTable = function(stocks) {
     origRenderTable(stocks);
     initColumnResize();
 };
+
+// ── Live Price Polling ──────────────────────────────────────────────────
+let _liveTimers = {};
+
+function startLivePrices(symbols, callback, intervalMs = 1500) {
+    const key = callback.toString();
+    if (_liveTimers[key]) stopLivePrices(key);
+    // Subscribe to backend
+    fetch('/api/live/subscribe', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbols})
+    }).catch(() => {});
+    // Poll
+    function poll() {
+        const s = Object.keys(_liveTimers).length > 0
+            ? [...new Set(Object.values(_liveTimers).flatMap(t => t.symbols))].join(',')
+            : symbols.join(',');
+        if (!s) return;
+        fetch(`/api/live/prices?symbols=${s}`)
+            .then(r => r.json())
+            .then(data => callback(data))
+            .catch(() => {});
+    }
+    _liveTimers[key] = { symbols, interval: setInterval(poll, intervalMs), callback };
+    poll();
+}
+
+function stopLivePrices(key) {
+    if (!key) {
+        Object.values(_liveTimers).forEach(t => clearInterval(t.interval));
+        _liveTimers = {};
+        return;
+    }
+    if (_liveTimers[key]) {
+        clearInterval(_liveTimers[key].interval);
+        delete _liveTimers[key];
+    }
+}
+
+function updateLivePrice(elementId, prices) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    const sym = el.dataset.symbol;
+    if (sym && prices[sym]) {
+        const p = prices[sym];
+        if (p.price) {
+            el.textContent = '$' + p.price.toFixed(2);
+            if (p.from_db) el.style.color = 'var(--text-secondary)';
+            else el.style.color = 'var(--accent)';
+        }
+    }
+}

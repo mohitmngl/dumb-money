@@ -205,6 +205,10 @@
         const stats = data.stats || {};
         document.getElementById('pfTitle').textContent = escapeHtml(pf.name || 'Portfolio');
 
+        // Start live prices for this portfolio's symbols
+        const symNames = syms.map(s => s.symbol);
+        startLivePrices(symNames, updatePortfolioPrices, 1500);
+
         let totalValue = 0, totalCost = 0, totalPL = 0, totalPLPct = 0, count = 0;
         let rows = syms.map(s => {
             const st = stats[s.symbol] || {};
@@ -215,15 +219,19 @@
             const cost = avg ? avg * qty : 0;
             const pl = avg ? (price - avg) * qty : 0;
             const plPct = avg && avg > 0 ? ((price - avg) / avg * 100) : 0;
+            const livePrice = livePriceData[s.symbol];
+            const liveP = livePrice && livePrice.price ? livePrice.price : price;
+            const livePL = avg ? (liveP - avg) * qty : 0;
+            const livePLPct = avg && avg > 0 ? ((liveP - avg) / avg * 100) : 0;
             if (qty > 0) { totalValue += value; totalCost += cost; totalPL += pl; count++; }
             return `<tr>
                 <td><button class="btn btn-danger btn-sm" onclick="removeSymbol('${s.symbol}')" style="padding:0.1rem 0.3rem;font-size:0.7rem">&#10005;</button></td>
                 <td class="sym"><a href="/stock/${s.symbol}" target="_blank">${s.symbol}</a></td>
                 <td><input class="pf-edit-inline" type="number" step="any" value="${qty}" id="qty_${s.symbol}" onchange="updateSymbol('${s.symbol}','qty',this.value)"></td>
                 <td><input class="pf-edit-inline" type="number" step="0.01" value="${avg || ''}" id="pr_${s.symbol}" onchange="updateSymbol('${s.symbol}','avg_price',this.value || null)" placeholder="—"></td>
-                <td>${price ? '$' + price.toFixed(2) : '—'}</td>
-                <td class="${avg && price > avg ? 'change-up' : avg && price < avg ? 'change-down' : ''}">${avg ? (pl > 0 ? '+' : '') + pl.toFixed(2) : '—'}</td>
-                <td class="${plPct > 0 ? 'change-up' : plPct < 0 ? 'change-down' : ''}">${avg ? (plPct > 0 ? '+' : '') + plPct.toFixed(2) + '%' : '—'}</td>
+                <td><span class="live-price" data-symbol="${s.symbol}">${price ? '$' + price.toFixed(2) : '—'}</span></td>
+                <td class="${avg && livePL > 0 ? 'change-up' : avg && livePL < 0 ? 'change-down' : ''}"><span class="live-pl">${avg ? (livePL >= 0 ? '+' : '') + livePL.toFixed(2) : '—'}</span></td>
+                <td class="${livePLPct > 0 ? 'change-up' : livePLPct < 0 ? 'change-down' : ''}"><span class="live-plpct">${avg ? (livePLPct >= 0 ? '+' : '') + livePLPct.toFixed(2) + '%' : '—'}</span></td>
                 <td>${st.change_pct != null ? (st.change_pct > 0 ? '+' : '') + st.change_pct.toFixed(2) + '%' : '—'}</td>
                 <td>${st.weighted_alpha != null ? (st.weighted_alpha > 0 ? '+' : '') + st.weighted_alpha.toFixed(1) + '%' : '—'}</td>
                 <td style="font-size:0.7rem">${st.profit_status || '—'}</td>
@@ -396,7 +404,50 @@
         return d.innerHTML;
     }
 
-    // Add symbol count to sidebar by fetching on load
+    // ── Live Prices ────────────────────────────────────────────────
+    let livePriceData = {};
+
+    function updatePortfolioPrices(prices) {
+        livePriceData = prices;
+        const table = document.querySelector('.pf-table');
+        if (!table) return;
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach(row => {
+            const symEl = row.querySelector('.sym a');
+            if (!symEl) return;
+            const sym = symEl.textContent.trim();
+            const p = prices[sym];
+            if (!p || !p.price) return;
+            const priceCell = row.querySelector('.live-price');
+            if (priceCell) {
+                priceCell.textContent = '$' + p.price.toFixed(2);
+                priceCell.style.color = 'var(--accent)';
+            }
+            // Update P&L if avg_price exists
+            const avgInput = row.querySelector('input[id^="pr_"]');
+            if (avgInput && avgInput.value) {
+                const avg = parseFloat(avgInput.value);
+                const qtyInput = row.querySelector('input[id^="qty_"]');
+                const qty = qtyInput ? parseFloat(qtyInput.value) || 0 : 0;
+                const pl = (p.price - avg) * qty;
+                const plPct = avg > 0 ? ((p.price - avg) / avg * 100) : 0;
+                const plCell = row.querySelector('.live-pl');
+                if (plCell) {
+                    plCell.textContent = (pl >= 0 ? '+' : '') + pl.toFixed(2);
+                    plCell.className = pl >= 0 ? 'change-up' : 'change-down';
+                }
+                const plPctCell = row.querySelector('.live-plpct');
+                if (plPctCell) {
+                    plPctCell.textContent = (plPct >= 0 ? '+' : '') + plPct.toFixed(2) + '%';
+                    plPctCell.className = plPct >= 0 ? 'change-up' : 'change-down';
+                }
+            }
+        });
+    }
+
+    // ── Init ───────────────────────────────────────────────────────
+    loadPortfolios().then(() => { if (portfolios.length > 0) enrichSidebar(); });
+
     async function enrichSidebar() {
         for (const p of portfolios) {
             try {
@@ -407,8 +458,6 @@
         }
         renderSidebar();
     }
-
-    loadPortfolios().then(() => { if (portfolios.length > 0) enrichSidebar(); });
     </script>
 </body>
 </html>
