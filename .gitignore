@@ -1,0 +1,12 @@
+*.err
+*.log
+*.jsonl
+__pycache__/
+*.pyc
+.env
+data/screener.db
+data/stocks-screener-*.csv
+attachments/
+long_responses/
+plans/
+session.jsonl

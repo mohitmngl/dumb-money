@@ -1,0 +1,2303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ symbol }} — DumbMoney</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/stock-detail.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-icon">&#9632;</span>
+                <span class="logo-text">DumbMoney</span>
+            </div>
+            <div class="stock-nav">
+                <button class="btn-nav" onclick="goBack()" title="Back">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+                </button>
+                <button class="btn-nav" onclick="goForward()" title="Forward">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                </button>
+            </div>
+            <div class="header-actions">
+                <button class="btn-news" id="btnNews" onclick="openNews()" title="News & Social Media Analysis">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8"/><path d="M15 18h-5"/><path d="M10 6h8v4h-8z"/></svg>
+                    <span>News & Sentiment</span>
+                </button>
+                <button class="btn-news" id="btnAnalysis" onclick="openAnalysis()" title="AI Analysis">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+                    <span>AI Analysis</span>
+                </button>
+                <a href="/" class="btn-back-home">Screener</a>
+            </div>
+        </div>
+    </header>
+
+    <main class="stock-detail-main">
+        <div class="stock-detail-container" id="stockDetail">
+            <div class="loading-cell">Loading {{ symbol }}...</div>
+        </div>
+    </main>
+
+    <script>
+    const API_BASE = '';
+    let currentSymbol = '{{ symbol }}';
+    let currentTimeframe = '1Day';
+    let allBars = [];
+    let visibleBars = [];
+    let totalBarsAvailable = 0;
+    let stockInfo = null;
+
+    // ── Chart State ───────────────────────────────────────────────────
+    let chartState = {
+        offset: 0,        // how many bars from the right (0 = show most recent)
+        barWidth: 8,
+        candleGap: 3,
+        priceScale: 1,    // vertical price scaling
+        isDragging: false,
+        dragStartX: 0,
+        dragStartOffset: 0,
+        mouseX: -1,
+        mouseY: -1,
+        loadedOlder: new Set(),
+        loadedNewer: new Set(),
+        showATR: false,
+        atrData: null,     // { trailing_stop: [], direction: [], atr_offset: period, ... }
+        atrLoading: false,
+        atrMultiplier: 2,
+        drawingMode: null, // 'position' or 'trendline'
+        drawings: [],
+        currentDrawing: null,
+        trendlineData: null,  // { start, end, angle, touches, priceLevel, aboveCount, belowCount, confidence }
+        trendlineVisible: true,
+    };
+
+    // ── Navigation ─────────────────────────────────────────────────────
+    function goBack() { window.history.back(); }
+    function goForward() { window.history.forward(); }
+
+    // ── Timeframe Tabs ─────────────────────────────────────────────────
+    function setTimeframe(tf) {
+        currentTimeframe = tf;
+        document.querySelectorAll('.tf-tab').forEach(t => t.classList.remove('active'));
+        document.querySelector(`.tf-tab[data-tf="${tf}"]`).classList.add('active');
+
+        // Reload ATR for new timeframe if active
+        if (chartState.showATR) {
+            loadATR();
+        }
+
+        updateChartData();
+        drawChart();
+
+        // Auto-generate trendline analysis for the new timeframe
+        if (visibleBars.length >= 20) {
+            autoDetectTrendline();
+        }
+
+        // Render volume profile
+        renderVolumeProfile();
+    }
+
+    function autoDetectTrendline() {
+        if (!visibleBars || visibleBars.length < 20) return;
+
+        // Find the price level with the most touches (support/resistance)
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+
+        // Bin prices into levels and count touches
+        const numBins = 20;
+        const binSize = priceRange / numBins;
+        const binCounts = new Array(numBins).fill(0);
+        const binPrices = new Array(numBins).fill(0);
+
+        visibleBars.forEach(bar => {
+            for (let i = 0; i < numBins; i++) {
+                const binLow = minPrice + i * binSize;
+                const binHigh = binLow + binSize;
+                const binMid = (binLow + binHigh) / 2;
+                // Count if bar's high, low, or close is in this bin
+                if ((bar.high >= binLow && bar.high < binHigh) ||
+                    (bar.low >= binLow && bar.low < binHigh) ||
+                    (bar.close >= binLow && bar.close < binHigh)) {
+                    binCounts[i]++;
+                    binPrices[i] += (bar.high + bar.low + bar.close) / 3;
+                }
+            }
+        });
+
+        // Find the bin with the most touches
+        let maxTouches = 0;
+        let bestBin = 0;
+        for (let i = 0; i < numBins; i++) {
+            if (binCounts[i] > maxTouches) {
+                maxTouches = binCounts[i];
+                bestBin = i;
+            }
+        }
+
+        if (maxTouches < 3) return; // Need at least 3 touches
+
+        const levelPrice = binPrices[bestBin] / binCounts[bestBin];
+
+        // Create a horizontal trendline spanning the visible bars
+        const startBarIndex = 0;
+        const endBarIndex = visibleBars.length - 1;
+
+        const aboveCount = visibleBars.filter(b => b.close > levelPrice).length;
+        const belowCount = visibleBars.filter(b => b.close < levelPrice).length;
+        const totalBars = visibleBars.length;
+        const abovePct = totalBars > 0 ? (aboveCount / totalBars) * 100 : 50;
+        const belowPct = totalBars > 0 ? (belowCount / totalBars) * 100 : 50;
+
+        chartState.trendlineData = {
+            angle: 0,
+            priceLevel: levelPrice,
+            touches: maxTouches,
+            aboveCount, belowCount,
+            abovePct, belowPct,
+            totalBars,
+            position: visibleBars[visibleBars.length - 1].close > levelPrice ? 'above' : 'below',
+            confidence: maxTouches >= 5 ? 'HIGH' : maxTouches >= 3 ? 'MEDIUM' : 'LOW',
+            start: { barIndex: startBarIndex, price: levelPrice },
+            end: { barIndex: endBarIndex, price: levelPrice },
+            isHorizontal: true,
+        };
+
+        // Save to drawings for persistence
+        chartState.drawings = [{
+            type: 'trendline',
+            start: chartState.trendlineData.start,
+            end: chartState.trendlineData.end,
+        }];
+
+        chartState.trendlineVisible = true;
+        drawChart();
+    }
+
+    // ── Volume Profile ─────────────────────────────────────────────────
+    function computeVolumeProfile() {
+        if (!visibleBars || visibleBars.length < 5) return null;
+
+        const prices = visibleBars.map(b => (b.high + b.low + b.close) / 3);
+        const volumes = visibleBars.map(b => b.volume);
+        const minPrice = Math.min(...visibleBars.map(b => b.low));
+        const maxPrice = Math.max(...visibleBars.map(b => b.high));
+        const priceRange = maxPrice - minPrice || 1;
+
+        // Create price bins
+        const numBins = 30;
+        const binSize = priceRange / numBins;
+        const bins = [];
+        for (let i = 0; i < numBins; i++) {
+            bins.push({
+                priceLow: minPrice + i * binSize,
+                priceHigh: minPrice + (i + 1) * binSize,
+                priceMid: minPrice + (i + 0.5) * binSize,
+                volume: 0,
+                buyVolume: 0,
+                sellVolume: 0,
+            });
+        }
+
+        // Distribute volume into bins
+        visibleBars.forEach((bar, i) => {
+            const typicalPrice = (bar.high + bar.low + bar.close) / 3;
+            // Buying pressure: close > open → more buying
+            const buyPressure = bar.close >= bar.open ? 1 : 0.3;
+            const sellPressure = bar.close < bar.open ? 1 : 0.3;
+
+            for (let j = 0; j < numBins; j++) {
+                if (typicalPrice >= bins[j].priceLow && typicalPrice < bins[j].priceHigh) {
+                    bins[j].volume += bar.volume;
+                    bins[j].buyVolume += bar.volume * buyPressure;
+                    bins[j].sellVolume += bar.volume * sellPressure;
+                    break;
+                }
+            }
+        });
+
+        // Filter out empty bins and sort by volume
+        const activeBins = bins.filter(b => b.volume > 0).sort((a, b) => b.volume - a.volume);
+        if (activeBins.length === 0) return null;
+
+        // POC = bin with highest volume
+        const pocBin = activeBins[0];
+        const poc = pocBin.priceMid;
+
+        // Value Area: price range containing 70% of volume, centered on POC
+        const totalVolume = activeBins.reduce((s, b) => s + b.volume, 0);
+        const targetVolume = totalVolume * 0.70;
+        let accumulatedVolume = pocBin.volume;
+        let vaLow = pocBin.priceLow;
+        let vaHigh = pocBin.priceHigh;
+
+        // Expand outward from POC
+        let aboveIdx = activeBins.findIndex(b => b.priceMid > poc);
+        let belowIdx = activeBins.findIndex(b => b.priceMid < poc);
+
+        while (accumulatedVolume < targetVolume) {
+            const aboveVol = aboveIdx < activeBins.length ? activeBins[aboveIdx].volume : 0;
+            const belowVol = belowIdx >= 0 && belowIdx < activeBins.length ? activeBins[belowIdx].volume : 0;
+
+            if (aboveVol >= belowVol && aboveIdx < activeBins.length) {
+                accumulatedVolume += aboveVol;
+                vaHigh = activeBins[aboveIdx].priceHigh;
+                aboveIdx++;
+            } else if (belowIdx >= 0) {
+                accumulatedVolume += belowVol;
+                vaLow = activeBins[belowIdx].priceLow;
+                belowIdx++;
+            } else {
+                break;
+            }
+        }
+
+        // Compute volume delta for the current bar
+        const currentBar = visibleBars[visibleBars.length - 1];
+        const currentDelta = currentBar.close >= currentBar.open ? currentBar.volume : -currentBar.volume;
+
+        // Overall buying pressure (%)
+        const totalBuy = bins.reduce((s, b) => s + b.buyVolume, 0);
+        const totalSell = bins.reduce((s, b) => s + b.sellVolume, 0);
+        const buyPct = totalVolume > 0 ? (totalBuy / totalVolume) * 100 : 50;
+
+        return {
+            bins: activeBins,
+            poc,
+            vaLow,
+            vaHigh,
+            totalVolume,
+            pocVolume: pocBin.volume,
+            currentPrice: currentBar.close,
+            currentDelta,
+            buyPct,
+            priceRange,
+            minPrice,
+            maxPrice,
+        };
+    }
+
+    function computeVolumeProfileSignal(vpData) {
+        if (!vpData) return { signal: 'NEUTRAL', confidence: 0, reasons: [] };
+
+        let score = 0;
+        const reasons = [];
+
+        // Factor 1: Price near POC (strong S/R)
+        const distToPoc = Math.abs(vpData.currentPrice - vpData.poc);
+        const pocThreshold = vpData.priceRange * 0.02; // 2% of range
+        if (distToPoc < pocThreshold) {
+            score += 1;
+            reasons.push('Price near POC (strong S/R)');
+        } else if (distToPoc > pocThreshold * 3) {
+            score -= 1;
+            reasons.push('Price far from POC');
+        }
+
+        // Factor 2: ATR alignment (check if we have ATR data)
+        if (chartState.showATR && chartState.atrData) {
+            const atrResult = computeATRTrailingStop();
+            if (atrResult && atrResult.length > 0) {
+                const currentStop = atrResult[atrResult.length - 1].stop;
+                const currentDir = atrResult[atrResult.length - 1].dir;
+                if (currentDir === 1 && vpData.currentPrice > currentStop) {
+                    score += 1;
+                    reasons.push('Above ATR stop (uptrend)');
+                } else if (currentDir === -1 && vpData.currentPrice < currentStop) {
+                    score -= 1;
+                    reasons.push('Below ATR stop (downtrend)');
+                }
+            }
+        }
+
+        // Factor 3: Volume delta (buying vs selling pressure)
+        if (vpData.currentDelta > 0) {
+            score += 1;
+            reasons.push('Buying volume pressure');
+        } else if (vpData.currentDelta < 0) {
+            score -= 1;
+            reasons.push('Selling volume pressure');
+        }
+
+        // Factor 4: WTD Alpha (smart money accumulation)
+        if (stockInfo) {
+            const wa = stockInfo.weighted_alpha || 0;
+            if (wa > 20) {
+                score += 1;
+                reasons.push('Positive WTD Alpha (accumulation)');
+            } else if (wa < -10) {
+                score -= 1;
+                reasons.push('Negative WTD Alpha (distribution)');
+            }
+        }
+
+        // Determine signal
+        const maxScore = 4;
+        const signal = score >= 2 ? 'BUY' : score <= -2 ? 'SELL' : 'NEUTRAL';
+        const confidence = Math.abs(score) / maxScore * 100;
+
+        return { signal, confidence: Math.round(confidence), reasons };
+    }
+
+    function renderVolumeProfile() {
+        const section = document.getElementById('volumeProfileSection');
+        if (!section) return;
+
+        const vpData = computeVolumeProfile();
+        if (!vpData || vpData.bins.length === 0) {
+            section.style.display = 'none';
+            return;
+        }
+
+        const signal = computeVolumeProfileSignal(vpData);
+        const signalEl = document.getElementById('vpSignal');
+        const signalColor = signal.signal === 'BUY' ? 'var(--green)' : signal.signal === 'SELL' ? 'var(--red)' : 'var(--text-secondary)';
+        const signalBg = signal.signal === 'BUY' ? 'var(--green-bg)' : signal.signal === 'SELL' ? 'var(--red-bg)' : 'rgba(0,0,0,0.05)';
+        signalEl.innerHTML = `<span class="vp-signal-badge" style="background:${signalBg};color:${signalColor}">${signal.signal} ${signal.confidence}%</span>`;
+
+        document.getElementById('vpPoc').textContent = `$${vpData.poc.toFixed(2)}`;
+        document.getElementById('vpValueArea').textContent = `$${vpData.vaLow.toFixed(2)} – $${vpData.vaHigh.toFixed(2)}`;
+        document.getElementById('vpTotalVol').textContent = formatVolume(vpData.totalVolume);
+
+        // Build horizontal bar chart
+        const maxVol = Math.max(...vpData.bins.map(b => b.volume));
+        const chartEl = document.getElementById('vpChart');
+        let barsHtml = '';
+
+        vpData.bins.forEach(bin => {
+            const widthPct = (bin.volume / maxVol) * 100;
+            const isPoc = Math.abs(bin.priceMid - vpData.poc) < vpData.priceRange / 60;
+            const inVA = bin.priceMid >= vpData.vaLow && bin.priceMid <= vpData.vaHigh;
+            const isCurrent = Math.abs(bin.priceMid - vpData.currentPrice) < vpData.priceRange / 60;
+
+            let barClass = 'vp-bar';
+            if (isPoc) barClass += ' vp-bar-poc';
+            else if (inVA) barClass += ' vp-bar-va';
+            if (isCurrent) barClass += ' vp-bar-current';
+
+            barsHtml += `
+                <div class="vp-bar-row ${isCurrent ? 'vp-current-row' : ''}">
+                    <span class="vp-bar-price">$${bin.priceMid.toFixed(2)}</span>
+                    <div class="vp-bar-track">
+                        <div class="${barClass}" style="width:${widthPct}%"></div>
+                        ${isCurrent ? '<div class="vp-current-marker"></div>' : ''}
+                    </div>
+                    <span class="vp-bar-vol">${formatVolume(bin.volume)}</span>
+                </div>
+            `;
+        });
+
+        chartEl.innerHTML = barsHtml;
+        section.style.display = 'block';
+    }
+
+    // ── Load Stock Data ────────────────────────────────────────────────
+    async function loadStock(symbol) {
+        currentSymbol = symbol;
+        document.title = `${symbol} — DumbMoney`;
+        const container = document.getElementById('stockDetail');
+        container.innerHTML = '<div class="loading-cell">Loading...</div>';
+
+        // Reset ATR state
+        chartState.showATR = false;
+        chartState.atrData = null;
+        chartState.atrLoading = false;
+        chartState.atrMultiplier = 2;
+        const atrBtn = document.getElementById('btnATR');
+        if (atrBtn) atrBtn.classList.remove('active');
+        // Reset multiplier buttons
+        document.querySelectorAll('.btn-atr-mult').forEach(b => {
+            b.classList.toggle('active', parseInt(b.dataset.mult) === 2);
+        });
+        // Reset trendline state
+        chartState.trendlineData = null;
+        chartState.trendlineVisible = true;
+        chartState.drawings = [];
+        const tlPanel = document.getElementById('trendlinePanel');
+        if (tlPanel) tlPanel.style.display = 'none';
+
+        try {
+            const res = await fetch(`/api/stock/${symbol}`);
+            const data = await res.json();
+
+            if (data.error) {
+                container.innerHTML = `<div class="empty-cell">${data.error}</div>`;
+                return;
+            }
+
+            stockInfo = data;
+            allBars = data.bars || [];
+            totalBarsAvailable = data.total_bars || allBars.length;
+            chartState.offset = 0;
+            chartState.loadedOlder.clear();
+            chartState.loadedNewer.clear();
+
+            renderStockDetail(data);
+            updateChartData();
+            drawChart();
+
+            // Auto-detect trendline after initial chart render
+            setTimeout(() => {
+                if (visibleBars.length >= 20) {
+                    autoDetectTrendline();
+                }
+                renderVolumeProfile();
+            }, 300);
+        } catch (err) {
+            const errMsg = err.message || 'Unknown error';
+            container.innerHTML = `<div class="empty-cell" style="color:var(--red)">Error loading stock data<br><small style="color:var(--text-secondary)">${escapeHtml(errMsg)}</small></div>`;
+        }
+    }
+
+    function renderStockDetail(data) {
+        const container = document.getElementById('stockDetail');
+        const waClass = data.weighted_alpha > 20 ? 'wa-bullish' : data.weighted_alpha < -10 ? 'wa-bearish' : 'wa-neutral';
+        const changeClass = data.change_pct > 0 ? 'change-positive' : data.change_pct < 0 ? 'change-negative' : '';
+        const oldestFormatted = data.oldest_data ? formatOldestData(data.oldest_data) : '—';
+
+        container.innerHTML = `
+            <div class="stock-header">
+                <div class="stock-title-row">
+                    <h1 class="stock-symbol">${data.symbol}</h1>
+                    <span class="stock-name">${escapeHtml(data.name)}</span>
+                    <span class="stock-exchange">${data.exchange}</span>
+                </div>
+                <div class="stock-price-row">
+                    <span class="stock-price">$${formatPrice(data.price)}</span>
+                    <span class="stock-change ${changeClass}">${data.change_pct > 0 ? '+' : ''}${data.change_pct.toFixed(2)}%</span>
+                    ${data.pre_price != null ? `<span class="stock-pre">Pre: $${data.pre_price.toFixed(2)}</span>` : ''}
+                    ${data.post_price != null ? `<span class="stock-post">Post: $${data.post_price.toFixed(2)}</span>` : ''}
+                </div>
+                <div class="stock-meta-row" style="font-size:0.75rem;color:var(--text-tertiary);margin-top:0.25rem">
+                    <span>Oldest: ${oldestFormatted}</span>
+                    <span style="margin-left:1rem">Updated: ${data.last_updated ? new Date(data.last_updated).toLocaleString() : '—'}</span>
+                </div>
+            </div>
+
+            <div class="tf-tabs">
+                <button class="tf-tab active" data-tf="1Day" onclick="setTimeframe('1Day')">1 Day</button>
+                <button class="tf-tab" data-tf="1Week" onclick="setTimeframe('1Week')">1 Week</button>
+                <button class="tf-tab" data-tf="1Month" onclick="setTimeframe('1Month')">1 Month</button>
+            </div>
+
+            <div class="chart-header-row">
+                <div class="chart-controls">
+                    <button class="btn-chart-control" onclick="zoomIn()" title="Zoom In">+</button>
+                    <button class="btn-chart-control" onclick="zoomOut()" title="Zoom Out">&minus;</button>
+                    <button class="btn-chart-control" onclick="resetChart()" title="Reset">&#8634;</button>
+                    <div class="atr-control-group">
+                        <button class="btn-chart-control btn-atr-toggle" id="btnATR" onclick="toggleATR()" title="Toggle ATR Trailing Stop">ATR</button>
+                        <button class="btn-chart-control btn-atr-mult atr-mult-1" data-mult="1" onclick="setATRMult(1)" title="1x ATR">1x</button>
+                        <button class="btn-chart-control btn-atr-mult atr-mult-2 active" data-mult="2" onclick="setATRMult(2)" title="2x ATR">2x</button>
+                        <button class="btn-chart-control btn-atr-mult atr-mult-3" data-mult="3" onclick="setATRMult(3)" title="3x ATR">3x</button>
+                    </div>
+                    <button class="btn-chart-control btn-draw-toggle" id="btnPosition" onclick="toggleDrawMode('position')" title="Position Sizing Tool">Pos</button>
+                    <button class="btn-chart-control btn-draw-toggle" id="btnTrendline" onclick="handleTrendlineClick()" title="180&#176; Trendline">Line</button>
+                    <button class="btn-chart-control btn-draw-toggle" id="btnPattern" onclick="runPatternDetection()" title="Detect Patterns">&#9733;</button>
+                </div>
+                <div class="chart-info">
+                    <span class="chart-bar-count" id="chartBarCount">${allBars.length} bars</span>
+                    <span class="chart-total-info">/ ${totalBarsAvailable.toLocaleString()} total</span>
+                </div>
+            </div>
+
+            <div class="chart-wrapper" id="chartWrapper">
+                <svg id="candleChart" class="chart-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+                <div class="chart-crosshair-v" id="crossV" style="display:none"></div>
+                <div class="chart-crosshair-h" id="crossH" style="display:none"></div>
+                <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
+            </div>
+
+            <!-- Volume Profile Section -->
+            <div class="volume-profile-section" id="volumeProfileSection" style="display:none">
+                <div class="volume-profile-header">
+                    <h3>Volume Profile</h3>
+                    <div class="vp-signal" id="vpSignal"></div>
+                </div>
+                <div class="volume-profile-body">
+                    <div class="vp-info-row">
+                        <div class="vp-info-item">
+                            <span class="vp-info-label">POC (Point of Control)</span>
+                            <span class="vp-info-value" id="vpPoc">—</span>
+                        </div>
+                        <div class="vp-info-item">
+                            <span class="vp-info-label">Value Area (70%)</span>
+                            <span class="vp-info-value" id="vpValueArea">—</span>
+                        </div>
+                        <div class="vp-info-item">
+                            <span class="vp-info-label">Total Volume</span>
+                            <span class="vp-info-value" id="vpTotalVol">—</span>
+                        </div>
+                    </div>
+                    <div class="vp-chart" id="vpChart"></div>
+                </div>
+            </div>
+
+            <!-- Trendline Analysis Panel (below chart) -->
+            <div class="trendline-panel" id="trendlinePanel" style="display:none">
+                <div class="trendline-panel-header">
+                    <h3>Trendline Analysis</h3>
+                    <div class="trendline-panel-actions">
+                        <button class="btn-chart-control" onclick="toggleTrendlineVisibility()" title="Show/Hide trendline on chart" id="btnTrendlineToggle">&#9673; Hide</button>
+                        <button class="btn-chart-control" onclick="clearTrendline()" title="Remove trendline">&#10005; Clear</button>
+                    </div>
+                </div>
+                <div class="trendline-panel-body" id="trendlineAnalysisBody">
+                    <div class="trendline-stats-grid" id="trendlineStatsGrid"></div>
+                </div>
+            </div>
+
+            <!-- Position Sizing Info -->
+            <div class="position-info" id="positionInfo">
+                <div class="position-info-header">Position Sizing</div>
+                <div class="position-row" id="positionRow"></div>
+                <div class="position-instructions" id="positionInstructions">Click on chart to set entry, stop, and target prices</div>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Weighted Alpha</div>
+                    <div class="stat-value ${waClass}">${data.weighted_alpha > 0 ? '+' : ''}${data.weighted_alpha.toFixed(1)}%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">ATRP%</div>
+                    <div class="stat-value">${data.atrp.toFixed(2)}%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">ATR Stop</div>
+                    <div class="stat-value">$${data.atr_stop ? data.atr_stop.toFixed(2) : '—'}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Streak</div>
+                    <div class="stat-value">${data.streak >= 5 ? '🔥 ' : ''}${data.streak} days</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Volume</div>
+                    <div class="stat-value">${formatVolume(data.volume)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Asset Class</div>
+                    <div class="stat-value" style="font-size:14px">${data.asset_class}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Fractionable</div>
+                    <div class="stat-value">${data.fractionable ? 'Yes' : 'No'}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Marginable</div>
+                    <div class="stat-value">${data.marginable ? '<span style="color:var(--green)">2x</span>' : '<span style="color:var(--text-tertiary)">—</span>'}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Oldest Data</div>
+                    <div class="stat-value" style="font-size:14px">${oldestFormatted}</div>
+                </div>
+            </div>
+
+            ${data.profit_status ? `
+                <div class="profit-section">
+                    <div class="profit-header">
+                        <h3>Profitability</h3>
+                        <span class="profit-badge profit-${data.profit_status}">${formatProfitStatus(data.profit_status)}</span>
+                    </div>
+                    ${data.profit_last_qtr_pct != null ? `
+                        <div class="profit-detail">
+                            <span class="profit-qoq-label">Last Quarter Net Income (QoQ)</span>
+                            <span class="profit-qoq-value ${data.profit_last_qtr_pct >= 0 ? 'profit-positive' : 'profit-negative'}">
+                                ${data.profit_last_qtr_pct >= 0 ? '+' : ''}${data.profit_last_qtr_pct}%
+                            </span>
+                        </div>
+                    ` : '<div class="profit-detail"><span class="profit-no-data">Quarter-over-quarter data not available</span></div>'}
+                </div>
+            ` : ''}
+
+            <div class="options-section" style="margin-top:1rem">
+                <button class="btn-chart-control" onclick="loadOptions()" id="btnOptions" style="padding:0.4rem 1rem;font-size:0.8rem">&#9662; Options Chain</button>
+                <div id="optionsContainer" style="display:none;margin-top:0.5rem;max-height:400px;overflow-y:auto"></div>
+            </div>
+
+            ${data.events && data.events.length > 0 ? `
+                <div class="events-section">
+                    <h3>Corporate Events</h3>
+                    <div class="events-list">
+                        ${data.events.map(e => `
+                            <div class="event-item">
+                                <span class="event-type ${e.event_type === 'split' ? 'split' : 'dividend'}">${e.event_type}</span>
+                                <div>
+                                    <div>${escapeHtml(e.description)}</div>
+                                    <div class="event-date">${e.event_date}</div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            ` : ''}
+
+            <!-- News & Sentiment Section (inline) -->
+            <div class="inline-section" id="newsSection" style="display:none">
+                <div class="section-header">
+                    <h3>News & Social Sentiment</h3>
+                </div>
+                <div class="section-body" id="newsBody">
+                    <div class="loading-cell">Analyzing news & social media...</div>
+                </div>
+            </div>
+
+            <!-- AI Analysis Section (inline) -->
+            <div class="inline-section" id="analysisSection" style="display:none">
+                <div class="section-header">
+                    <h3>AI Analysis</h3>
+                </div>
+                <div class="section-body" id="analysisBody">
+                    <div class="loading-cell">Running analysis...</div>
+                </div>
+            </div>
+        `;
+    }
+
+    // ── Chart Data Management ─────────────────────────────────────────
+    function getAggregatedBars(tf) {
+        if (!allBars || allBars.length === 0) return [];
+        if (tf === '1Day') return allBars;
+
+        const groups = {};
+        for (const b of allBars) {
+            const d = new Date(b.date);
+            let period;
+            if (tf === '1Week') {
+                const onejan = new Date(d.getFullYear(), 0, 1);
+                const week = Math.ceil((((d - onejan) / 86400000) + onejan.getDay() + 1) / 7);
+                period = `${d.getFullYear()}-W${week.toString().padStart(2, '0')}`;
+            } else if (tf === '1Month') {
+                period = `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}`;
+            } else {
+                period = b.date;
+            }
+            if (!groups[period]) groups[period] = [];
+            groups[period].push(b);
+        }
+        return Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0])).map(([_, gb]) => ({
+            date: gb[0].date,
+            open: gb[0].open,
+            high: Math.max(...gb.map(b => b.high)),
+            low: Math.min(...gb.map(b => b.low)),
+            close: gb[gb.length - 1].close,
+            volume: gb.reduce((s, b) => s + b.volume, 0),
+        }));
+    }
+
+    function updateChartData() {
+        const aggregated = getAggregatedBars(currentTimeframe);
+        visibleBars = aggregated;
+    }
+
+    // ── SVG Chart Drawing (TradingView-style, vector) ─────────────────
+    function drawChart() {
+        const svg = document.getElementById('candleChart');
+        if (!svg) return;
+
+        const wrapper = document.getElementById('chartWrapper');
+        const wrapperRect = wrapper.getBoundingClientRect();
+        const W = wrapperRect.width;
+        const H = wrapper.clientHeight || 420;
+
+        svg.setAttribute('width', W);
+        svg.setAttribute('height', H);
+        svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        svg.innerHTML = '';
+
+        if (!visibleBars || visibleBars.length === 0) return;
+
+        // Determine visible range based on offset
+        const maxVisible = Math.max(60, Math.min(visibleBars.length, Math.floor(W / (chartState.barWidth + chartState.candleGap))));
+        const endIdx = visibleBars.length - chartState.offset;
+        const startIdx = Math.max(0, endIdx - maxVisible);
+        const bars = visibleBars.slice(startIdx, endIdx);
+
+        if (bars.length === 0) return;
+
+        // Update bar count display
+        const countEl = document.getElementById('chartBarCount');
+        if (countEl) countEl.textContent = `${bars.length} bars`;
+
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const centerY = padding.top + (H - padding.top - padding.bottom) / 2;
+        const chartTop = centerY - chartH / 2;
+        const stepX = chartW / bars.length;
+        const candleW = Math.max(1, stepX * 0.65);
+
+        const allHighs = bars.map(b => b.high);
+        const allLows = bars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+
+        // Helper: price to Y
+        const priceToY = (p) => chartTop + (1 - (p - minPrice) / priceRange) * chartH;
+        const indexToX = (i) => padding.left + i * stepX + stepX / 2;
+
+        // ── SVG Elements ──────────────────────────────────────────────
+        const ns = 'http://www.w3.org/2000/svg';
+
+        // Background
+        const bg = document.createElementNS(ns, 'rect');
+        bg.setAttribute('width', W);
+        bg.setAttribute('height', H);
+        bg.setAttribute('fill', '#fafafa');
+        svg.appendChild(bg);
+
+        // Grid lines (horizontal) - more lines when zoomed in
+        const gridLines = chartState.priceScale > 1.5 ? 10 : 6;
+        for (let i = 0; i <= gridLines; i++) {
+            const y = chartTop + chartH * i / gridLines;
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', padding.left);
+            line.setAttribute('y1', y);
+            line.setAttribute('x2', W - padding.right);
+            line.setAttribute('y2', y);
+            line.setAttribute('stroke', 'rgba(0,0,0,0.08)');
+            line.setAttribute('stroke-width', '1');
+            svg.appendChild(line);
+
+            // Price label - BIG and BLACK
+            const priceLabel = maxPrice - (priceRange * i / gridLines);
+            const text = document.createElementNS(ns, 'text');
+            text.setAttribute('x', W - padding.right + 8);
+            text.setAttribute('y', y + 5);
+            text.setAttribute('font-family', 'Inter, sans-serif');
+            text.setAttribute('font-size', '13');
+            text.setAttribute('font-weight', '600');
+            text.setAttribute('fill', '#000000');
+            text.setAttribute('text-anchor', 'start');
+            text.textContent = '$' + priceLabel.toFixed(2);
+            svg.appendChild(text);
+        }
+
+        // Price axis line
+        const priceAxisLine = document.createElementNS(ns, 'line');
+        priceAxisLine.setAttribute('x1', W - padding.right);
+        priceAxisLine.setAttribute('y1', chartTop);
+        priceAxisLine.setAttribute('x2', W - padding.right);
+        priceAxisLine.setAttribute('y2', chartTop + chartH);
+        priceAxisLine.setAttribute('stroke', 'rgba(0,0,0,0.15)');
+        priceAxisLine.setAttribute('stroke-width', '1.5');
+        svg.appendChild(priceAxisLine);
+
+        // Candles group
+        const candlesGroup = document.createElementNS(ns, 'g');
+        candlesGroup.setAttribute('id', 'candlesGroup');
+
+        for (let i = 0; i < bars.length; i++) {
+            const b = bars[i];
+            const x = indexToX(i);
+            const isUp = b.close >= b.open;
+            const color = isUp ? '#00C805' : '#FF3B30';
+
+            // Wick
+            const wick = document.createElementNS(ns, 'line');
+            wick.setAttribute('x1', x);
+            wick.setAttribute('y1', priceToY(b.high));
+            wick.setAttribute('x2', x);
+            wick.setAttribute('y2', priceToY(b.low));
+            wick.setAttribute('stroke', color);
+            wick.setAttribute('stroke-width', '1.5');
+            wick.setAttribute('stroke-linecap', 'round');
+            candlesGroup.appendChild(wick);
+
+            // Body
+            const yOpen = priceToY(b.open);
+            const yClose = priceToY(b.close);
+            const bodyTop = Math.min(yOpen, yClose);
+            const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+
+            const rect = document.createElementNS(ns, 'rect');
+            rect.setAttribute('x', x - candleW / 2);
+            rect.setAttribute('y', bodyTop);
+            rect.setAttribute('width', candleW);
+            rect.setAttribute('height', bodyH);
+            rect.setAttribute('fill', color);
+            rect.setAttribute('rx', '1');
+            candlesGroup.appendChild(rect);
+        }
+        svg.appendChild(candlesGroup);
+
+        // ── ATR Trailing Stop Line (Supertrend) ─────────────────────────
+        if (chartState.showATR && chartState.atrData) {
+            const stopData = computeATRTrailingStop();
+            if (stopData && stopData.length > 0) {
+                const atrGroup = document.createElementNS(ns, 'g');
+                atrGroup.setAttribute('id', 'atrLine');
+
+                // Draw segments with color changes based on direction
+                let segStart = 0;
+                let segColor = stopData[0].dir === 1 ? '#00C805' : '#FF3B30';
+
+                for (let i = 1; i <= stopData.length; i++) {
+                    const newColor = i < stopData.length ? (stopData[i].dir === 1 ? '#00C805' : '#FF3B30') : null;
+
+                    if (newColor !== segColor || i === stopData.length) {
+                        // Draw segment from segStart to i-1
+                        if (i - 1 >= segStart) {
+                            const segPath = document.createElementNS(ns, 'path');
+                            let d = `M ${indexToX(stopData[segStart].barIdx)} ${priceToY(stopData[segStart].stop)}`;
+                            for (let j = segStart + 1; j < i; j++) {
+                                d += ` L ${indexToX(stopData[j].barIdx)} ${priceToY(stopData[j].stop)}`;
+                            }
+                            segPath.setAttribute('d', d);
+                            segPath.setAttribute('fill', 'none');
+                            segPath.setAttribute('stroke', segColor);
+                            segPath.setAttribute('stroke-width', '2');
+                            segPath.setAttribute('stroke-linecap', 'round');
+                            segPath.setAttribute('stroke-linejoin', 'round');
+                            atrGroup.appendChild(segPath);
+                        }
+                        segStart = i - 1;
+                        segColor = newColor || segColor;
+                    }
+                }
+
+                svg.appendChild(atrGroup);
+            }
+        }
+
+        // Date axis (bottom) - BIG and BLACK labels
+        const labelEvery = Math.max(1, Math.floor(bars.length / (chartState.priceScale > 1.5 ? 10 : 7)));
+        for (let i = 0; i < bars.length; i += labelEvery) {
+            const b = bars[i];
+            const x = indexToX(i);
+            const d = new Date(b.date);
+            let label;
+            if (currentTimeframe === '1Month') {
+                label = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+            } else if (currentTimeframe === '1Week') {
+                label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            } else {
+                label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            }
+
+            const text = document.createElementNS(ns, 'text');
+            text.setAttribute('x', x);
+            text.setAttribute('y', H - 10);
+            text.setAttribute('font-family', 'Inter, sans-serif');
+            text.setAttribute('font-size', '12');
+            text.setAttribute('font-weight', '600');
+            text.setAttribute('fill', '#000000');
+            text.setAttribute('text-anchor', 'middle');
+            text.textContent = label;
+            svg.appendChild(text);
+        }
+
+        // Time axis line
+        const timeAxisLine = document.createElementNS(ns, 'line');
+        timeAxisLine.setAttribute('x1', padding.left);
+        timeAxisLine.setAttribute('y1', H - padding.bottom);
+        timeAxisLine.setAttribute('x2', W - padding.right);
+        timeAxisLine.setAttribute('y2', H - padding.bottom);
+        timeAxisLine.setAttribute('stroke', 'rgba(0,0,0,0.15)');
+        timeAxisLine.setAttribute('stroke-width', '1.5');
+        svg.appendChild(timeAxisLine);
+
+        // ── Crosshair ────────────────────────────────────────────────
+        const crossV = document.getElementById('crossV');
+        const crossH = document.getElementById('crossH');
+        const tooltip = document.getElementById('chartTooltip');
+
+        if (chartState.mouseX >= padding.left && chartState.mouseX <= W - padding.right &&
+            chartState.mouseY >= chartTop && chartState.mouseY <= chartTop + chartH) {
+
+            crossV.style.display = 'block';
+            crossV.style.left = chartState.mouseX + 'px';
+            crossV.style.top = chartTop + 'px';
+            crossV.style.height = chartH + 'px';
+
+            crossH.style.display = 'block';
+            crossH.style.top = chartState.mouseY + 'px';
+            crossH.style.left = padding.left + 'px';
+            crossH.style.width = chartW + 'px';
+
+            // Find nearest bar
+            const barIdx = Math.round((chartState.mouseX - padding.left - stepX / 2) / stepX);
+            if (barIdx >= 0 && barIdx < bars.length) {
+                const bar = bars[barIdx];
+                const price = minPrice + (1 - (chartState.mouseY - chartTop) / chartH) * priceRange;
+
+                tooltip.style.display = 'block';
+                tooltip.style.left = (chartState.mouseX + 15) + 'px';
+                tooltip.style.top = (chartState.mouseY - 10) + 'px';
+                tooltip.innerHTML = `
+                    <strong>${new Date(bar.date).toLocaleDateString()}</strong><br>
+                    O: $${bar.open.toFixed(2)} H: $${bar.high.toFixed(2)}<br>
+                    L: $${bar.low.toFixed(2)} C: $${bar.close.toFixed(2)}<br>
+                    <span style="color:#000;font-weight:600">$${price.toFixed(2)}</span>
+                `;
+            }
+        } else {
+            crossV.style.display = 'none';
+            crossH.style.display = 'none';
+            tooltip.style.display = 'none';
+        }
+
+        // Re-render any saved drawings after chart redraw
+        renderSavedDrawings();
+    }
+
+    // ── Render Saved Drawings (persist across redraws) ─────────────────
+    function renderSavedDrawings() {
+        if (!chartState.drawings || chartState.drawings.length === 0) return;
+
+        chartState.drawings.forEach(d => {
+            if (d.type === 'position_marker') {
+                drawMarkerOnChart(d.price, d.barIndex, d.color, d.label);
+            } else if (d.type === 'trendline') {
+                // Only render trendline on chart if visible
+                if (chartState.trendlineVisible !== false) {
+                    analyzeAndRenderTrendline(d.start, d.end);
+                }
+            }
+        });
+    }
+
+    // ── Chart Controls ────────────────────────────────────────────────
+    function zoomIn() {
+        chartState.barWidth = Math.min(30, chartState.barWidth * 1.3);
+        chartState.candleGap = Math.min(10, chartState.candleGap * 1.3);
+        chartState.priceScale = Math.min(3, chartState.priceScale * 1.2);
+        drawChart();
+    }
+
+    function zoomOut() {
+        chartState.barWidth = Math.max(1, chartState.barWidth / 1.3);
+        chartState.candleGap = Math.max(0.5, chartState.candleGap / 1.3);
+        chartState.priceScale = Math.max(0.5, chartState.priceScale / 1.2);
+        drawChart();
+    }
+
+    function resetChart() {
+        chartState.barWidth = 8;
+        chartState.candleGap = 3;
+        chartState.priceScale = 1;
+        chartState.offset = 0;
+        updateChartData();
+        drawChart();
+    }
+
+    // ── ATR Toggle & Drawing ──────────────────────────────────────────
+    function toggleATR() {
+        const btn = document.getElementById('btnATR');
+        if (chartState.atrLoading) return;
+
+        chartState.showATR = !chartState.showATR;
+
+        if (chartState.showATR) {
+            btn.classList.add('active');
+            loadATR();
+        } else {
+            btn.classList.remove('active');
+            chartState.atrData = null;
+            drawChart();
+        }
+    }
+
+    function setATRMult(mult) {
+        chartState.atrMultiplier = mult;
+        // Update button states
+        document.querySelectorAll('.btn-atr-mult').forEach(b => {
+            b.classList.toggle('active', parseInt(b.dataset.mult) === mult);
+        });
+        // Reload ATR with new multiplier if active
+        if (chartState.showATR) {
+            loadATR();
+        }
+    }
+
+    async function loadATR() {
+        if (!chartState.showATR || chartState.atrLoading) return;
+        chartState.atrLoading = true;
+
+        try {
+            const res = await fetch(`/api/stock/${currentSymbol}/atr?timeframe=${currentTimeframe}&period=14&multiplier=${chartState.atrMultiplier}`);
+            const data = await res.json();
+
+            if (data.error) {
+                chartState.showATR = false;
+                document.getElementById('btnATR').classList.remove('active');
+                chartState.atrLoading = false;
+                return;
+            }
+
+            chartState.atrData = data;
+            chartState.atrLoading = false;
+            drawChart();
+        } catch (e) {
+            console.error('Failed to load ATR:', e);
+            chartState.showATR = false;
+            document.getElementById('btnATR').classList.remove('active');
+            chartState.atrLoading = false;
+        }
+    }
+
+    function computeATRTrailingStop() {
+        if (!chartState.atrData || !visibleBars.length) return null;
+
+        const trailing_stop = chartState.atrData.trailing_stop;
+        const direction = chartState.atrData.direction;
+        const atr_offset = chartState.atrData.atr_offset || 14;
+
+        if (!trailing_stop || !direction || trailing_stop.length === 0) return null;
+
+        // Map ATR data to visible bars
+        // trailing_stop[i] corresponds to bars[atr_offset + i]
+        const result = [];
+        const startBarIdx = atr_offset;
+        const endBarIdx = atr_offset + trailing_stop.length - 1;
+
+        for (let i = 0; i < visibleBars.length; i++) {
+            // Find the corresponding ATR data point
+            const atrIdx = i - startBarIdx;
+            if (atrIdx >= 0 && atrIdx < trailing_stop.length) {
+                result.push({
+                    barIdx: i,
+                    stop: trailing_stop[atrIdx],
+                    dir: direction[atrIdx],
+                });
+            }
+        }
+
+        return result;
+    }
+
+    // ── Drawing Mode (Position Sizing & Trendline) ────────────────────
+    function toggleDrawMode(mode) {
+        // Toggle off if already active
+        if (chartState.drawingMode === mode) {
+            chartState.drawingMode = null;
+            chartState.positionClicks = [];
+            chartState.trendlineStart = null;
+            document.getElementById('btnPosition').classList.remove('active');
+            document.getElementById('btnTrendline').classList.remove('active');
+            document.getElementById('positionInfo').classList.remove('active');
+            document.getElementById('chartWrapper').style.cursor = 'crosshair';
+            drawChart();
+            return;
+        }
+
+        // Deactivate ATR when starting drawing
+        if (chartState.showATR) {
+            toggleATR();
+        }
+
+        // Deactivate other drawing mode
+        chartState.drawingMode = mode;
+        chartState.positionClicks = [];
+        chartState.trendlineStart = null;
+        // Only clear drawings when switching modes, not when re-entering trendline
+        if (mode !== 'trendline' || !chartState.trendlineData) {
+            chartState.drawings = [];
+        }
+
+        document.getElementById('btnPosition').classList.toggle('active', mode === 'position');
+        document.getElementById('btnTrendline').classList.toggle('active', mode === 'trendline');
+        document.getElementById('chartWrapper').style.cursor = mode === 'position' ? 'crosshair' : 'crosshair';
+
+        if (mode === 'position') {
+            document.getElementById('positionInfo').classList.add('active');
+            document.getElementById('positionInstructions').textContent = 'Click 1: Set ENTRY price, Click 2: Set STOP LOSS, Click 3: Set TARGET';
+            document.getElementById('positionRow').innerHTML = '';
+        } else {
+            document.getElementById('positionInfo').classList.remove('active');
+        }
+    }
+
+    function handleTrendlineClick() {
+        // If trendline data exists, toggle visibility
+        if (chartState.trendlineData) {
+            toggleTrendlineVisibility();
+            return;
+        }
+        // Otherwise, enter drawing mode
+        toggleDrawMode('trendline');
+    }
+
+    function toggleTrendlineVisibility() {
+        chartState.trendlineVisible = !chartState.trendlineVisible;
+        const btn = document.getElementById('btnTrendlineToggle');
+        if (btn) {
+            btn.innerHTML = chartState.trendlineVisible ? '&#9673; Hide' : '&#9673; Show';
+        }
+        drawChart();
+    }
+
+    function clearTrendline() {
+        chartState.trendlineData = null;
+        chartState.trendlineVisible = true;
+        chartState.drawings = [];
+        chartState.drawingMode = null;
+        chartState.trendlineStart = null;
+        document.getElementById('btnTrendline').classList.remove('active');
+        document.getElementById('trendlinePanel').style.display = 'none';
+        document.getElementById('chartWrapper').style.cursor = 'crosshair';
+        drawChart();
+    }
+
+    // ── Trendline Analysis (rendered below chart) ──────────────────────
+    function renderTrendlineAnalysisPanel(data) {
+        const panel = document.getElementById('trendlinePanel');
+        const grid = document.getElementById('trendlineStatsGrid');
+        if (!panel || !grid) return;
+
+        chartState.trendlineData = data;
+        chartState.trendlineVisible = true;
+
+        const confidenceColor = data.confidence === 'HIGH' ? 'var(--green)' : data.confidence === 'MEDIUM' ? 'var(--text)' : 'var(--text-tertiary)';
+        const positionColor = data.position === 'above' ? 'var(--green)' : data.position === 'below' ? 'var(--red)' : 'var(--text)';
+        const isHorizontal = Math.abs(data.angle) < 15 || Math.abs(data.angle) > 165;
+        const levelType = isHorizontal ? (data.position === 'above' ? 'Resistance' : 'Support') : 'Trendline';
+
+        grid.innerHTML = `
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Level Type</div>
+                <div class="tl-stat-value" style="color:var(--green)">${levelType}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Price Level</div>
+                <div class="tl-stat-value">$${data.priceLevel.toFixed(2)}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Angle</div>
+                <div class="tl-stat-value">${data.angle.toFixed(0)}&#176; ${isHorizontal ? '(~180&#176; flat)' : ''}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Touches</div>
+                <div class="tl-stat-value">${data.touches}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Confidence</div>
+                <div class="tl-stat-value" style="color:${confidenceColor}">${data.confidence}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Current Position</div>
+                <div class="tl-stat-value" style="color:${positionColor}">${data.position.toUpperCase()}</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Above / Below</div>
+                <div class="tl-stat-value">${data.abovePct.toFixed(0)}% / ${data.belowPct.toFixed(0)}%</div>
+            </div>
+            <div class="tl-stat-card">
+                <div class="tl-stat-label">Bars Analyzed</div>
+                <div class="tl-stat-value">${data.totalBars}</div>
+            </div>
+        `;
+
+        panel.style.display = 'block';
+    }
+
+    function getPriceFromMouse(e) {
+        const wrapper = document.getElementById('chartWrapper');
+        const rect = wrapper.getBoundingClientRect();
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const W = rect.width;
+        const H = wrapper.clientHeight || 420;
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const chartTop = padding.top + (H - padding.top - padding.bottom) / 2 - chartH / 2;
+
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        if (!visibleBars.length) return null;
+
+        const maxVisible = visibleBars.length;
+        const stepX = chartW / maxVisible;
+        const barIdx = Math.round((mouseX - padding.left - stepX / 2) / stepX);
+
+        if (barIdx < 0 || barIdx >= visibleBars.length) return null;
+
+        const bar = visibleBars[barIdx];
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+
+        const price = maxPrice - ((mouseY - chartTop) / chartH) * priceRange;
+
+        return { price: Math.max(minPrice, Math.min(maxPrice, price)), barIndex: barIdx, bar };
+    }
+
+    function handleDrawClick(e) {
+        if (!chartState.drawingMode) return;
+
+        const priceData = getPriceFromMouse(e);
+        if (!priceData) return;
+
+        if (chartState.drawingMode === 'position') {
+            chartState.positionClicks.push(priceData);
+
+            if (chartState.positionClicks.length === 1) {
+                // Entry set - draw line
+                document.getElementById('positionInstructions').textContent = 'Click 2: Set STOP LOSS (red line)';
+                drawChart();
+                renderPositionMarker(0, priceData, '#6366f1', 'ENTRY');
+            } else if (chartState.positionClicks.length === 2) {
+                // Stop set
+                document.getElementById('positionInstructions').textContent = 'Click 3: Set TARGET (green line)';
+                drawChart();
+                renderPositionMarker(1, priceData, '#FF3B30', 'STOP');
+            } else if (chartState.positionClicks.length === 3) {
+                // Target set - calculate and display
+                renderPositionMarker(2, priceData, '#00C805', 'TARGET');
+                drawChart();
+                updatePositionSizing();
+                // Reset for new position after 3 seconds
+                setTimeout(() => {
+                    chartState.positionClicks = [];
+                    document.getElementById('positionInstructions').textContent = 'Click 1: Set ENTRY price, Click 2: Set STOP LOSS, Click 3: Set TARGET';
+                    document.getElementById('positionRow').innerHTML = '';
+                    drawChart();
+                }, 5000);
+            }
+        }
+    }
+
+    function renderPositionMarker(idx, priceData, color, label) {
+        // Store for re-rendering
+        chartState.drawings.push({
+            type: 'position_marker',
+            price: priceData.price,
+            barIndex: priceData.barIndex,
+            color: color,
+            label: label,
+        });
+
+        // Draw immediately
+        drawMarkerOnChart(priceData.price, priceData.barIndex, color, label);
+    }
+
+    function drawMarkerOnChart(price, barIndex, color, label) {
+        const svg = document.getElementById('candleChart');
+        const ns = 'http://www.w3.org/2000/svg';
+        const wrapper = document.getElementById('chartWrapper');
+        const rect = wrapper.getBoundingClientRect();
+        const W = rect.width;
+        const H = wrapper.clientHeight || 420;
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const chartTop = padding.top + (H - padding.top - padding.bottom) / 2 - chartH / 2;
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+        const stepX = chartW / visibleBars.length;
+        const y = chartTop + (1 - (price - minPrice) / priceRange) * chartH;
+
+        const group = document.createElementNS(ns, 'g');
+
+        const line = document.createElementNS(ns, 'line');
+        line.setAttribute('x1', padding.left);
+        line.setAttribute('y1', y);
+        line.setAttribute('x2', W - padding.right);
+        line.setAttribute('y2', y);
+        line.setAttribute('stroke', color);
+        line.setAttribute('stroke-width', '1.5');
+        line.setAttribute('stroke-dasharray', '6 3');
+        group.appendChild(line);
+
+        const text = document.createElementNS(ns, 'text');
+        text.setAttribute('x', W - padding.right + 5);
+        text.setAttribute('y', y + 4);
+        text.setAttribute('font-family', 'Inter, sans-serif');
+        text.setAttribute('font-size', '10');
+        text.setAttribute('font-weight', '700');
+        text.setAttribute('fill', color);
+        text.textContent = `${label} $${price.toFixed(2)}`;
+        group.appendChild(text);
+
+        svg.appendChild(group);
+    }
+
+    function updatePositionSizing() {
+        const clicks = chartState.positionClicks;
+        if (clicks.length < 3) return;
+
+        const entry = clicks[0].price;
+        const stop = clicks[1].price;
+        const target = clicks[2].price;
+        const isLong = target > entry;
+
+        const riskPerShare = Math.abs(entry - stop);
+        const rewardPerShare = Math.abs(target - entry);
+        const rrRatio = riskPerShare > 0 ? (rewardPerShare / riskPerShare).toFixed(2) : '—';
+        const rrClass = rrRatio >= 2 ? 'good' : rrRatio >= 1 ? 'good' : 'poor';
+
+        // Position sizing: risk 1% of account ($10,000 default)
+        const accountSize = 10000;
+        const riskPct = 0.01;
+        const riskAmount = accountSize * riskPct;
+        const shares = riskPerShare > 0 ? Math.floor(riskAmount / riskPerShare) : 0;
+        const positionValue = shares * entry;
+
+        document.getElementById('positionRow').innerHTML = `
+            <div class="position-item"><strong>Entry:</strong> $${entry.toFixed(2)}</div>
+            <div class="position-item"><strong>Stop:</strong> $${stop.toFixed(2)}</div>
+            <div class="position-item"><strong>Target:</strong> $${target.toFixed(2)}</div>
+            <div class="position-item"><strong>Risk/Share:</strong> $${riskPerShare.toFixed(2)}</div>
+            <div class="position-item"><strong>Reward/Share:</strong> $${rewardPerShare.toFixed(2)}</div>
+            <div class="position-item"><strong>Shares:</strong> ${shares.toLocaleString()}</div>
+            <div class="position-item"><strong>Position Value:</strong> $${positionValue.toLocaleString()}</div>
+            <span class="position-rr ${rrClass}">R:R = ${rrRatio}</span>
+        `;
+        document.getElementById('positionInstructions').textContent = `Position sized for 1% risk ($${riskAmount.toLocaleString()}) | ${isLong ? 'LONG' : 'SHORT'} setup`;
+    }
+
+    function renderTrendlinePreview(start, end) {
+        // Remove existing preview
+        const existing = document.getElementById('trendlinePreview');
+        if (existing) existing.remove();
+
+        const svg = document.getElementById('candleChart');
+        const ns = 'http://www.w3.org/2000/svg';
+        const wrapper = document.getElementById('chartWrapper');
+        const rect = wrapper.getBoundingClientRect();
+        const W = rect.width;
+        const H = wrapper.clientHeight || 420;
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const chartTop = padding.top + (H - padding.top - padding.bottom) / 2 - chartH / 2;
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+        const stepX = chartW / visibleBars.length;
+
+        const x1 = padding.left + start.barIndex * stepX + stepX / 2;
+        const y1 = chartTop + (1 - (start.price - minPrice) / priceRange) * chartH;
+        const x2 = padding.left + end.barIndex * stepX + stepX / 2;
+        const y2 = chartTop + (1 - (end.price - minPrice) / priceRange) * chartH;
+
+        const group = document.createElementNS(ns, 'g');
+        group.setAttribute('id', 'trendlinePreview');
+
+        const line = document.createElementNS(ns, 'line');
+        line.setAttribute('x1', x1);
+        line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2);
+        line.setAttribute('y2', y2);
+        line.setAttribute('stroke', '#6366f1');
+        line.setAttribute('stroke-width', '2');
+        line.setAttribute('stroke-dasharray', '8 4');
+        group.appendChild(line);
+
+        // Angle indicator
+        const angle = Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI;
+        const isHorizontal = Math.abs(angle) < 15 || Math.abs(angle) > 165;
+        const angleText = document.createElementNS(ns, 'text');
+        angleText.setAttribute('x', (x1 + x2) / 2);
+        angleText.setAttribute('y', Math.min(y1, y2) - 10);
+        angleText.setAttribute('font-family', 'Inter, sans-serif');
+        angleText.setAttribute('font-size', '11');
+        angleText.setAttribute('font-weight', '600');
+        angleText.setAttribute('fill', isHorizontal ? '#00C805' : '#6E6E73');
+        angleText.setAttribute('text-anchor', 'middle');
+        angleText.textContent = `${angle.toFixed(0)}° ${isHorizontal ? '(~180° flat)' : ''}`;
+        group.appendChild(angleText);
+
+        svg.appendChild(group);
+    }
+
+    function analyzeAndRenderTrendline(start, end) {
+        const svg = document.getElementById('candleChart');
+        const ns = 'http://www.w3.org/2000/svg';
+        const wrapper = document.getElementById('chartWrapper');
+        const rect = wrapper.getBoundingClientRect();
+        const W = rect.width;
+        const H = wrapper.clientHeight || 420;
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const chartTop = padding.top + (H - padding.top - padding.bottom) / 2 - chartH / 2;
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+        const stepX = chartW / visibleBars.length;
+
+        const x1 = padding.left + start.barIndex * stepX + stepX / 2;
+        const y1 = chartTop + (1 - (start.price - minPrice) / priceRange) * chartH;
+        const x2 = padding.left + end.barIndex * stepX + stepX / 2;
+        const y2 = chartTop + (1 - (end.price - minPrice) / priceRange) * chartH;
+
+        const group = document.createElementNS(ns, 'g');
+        group.setAttribute('class', 'trendline-final');
+
+        // Line
+        const line = document.createElementNS(ns, 'line');
+        line.setAttribute('x1', x1);
+        line.setAttribute('y1', y1);
+        line.setAttribute('x2', x2);
+        line.setAttribute('y2', y2);
+        line.setAttribute('stroke', '#6366f1');
+        line.setAttribute('stroke-width', '2');
+        group.appendChild(line);
+
+        // Angle
+        const angle = Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI;
+        const isHorizontal = Math.abs(angle) < 15 || Math.abs(angle) > 165;
+        const priceLevel = start.price; // for horizontal line
+
+        // Count touches of this level
+        let touches = 0;
+        let aboveCount = 0;
+        let belowCount = 0;
+        visibleBars.forEach(bar => {
+            const tolerance = priceRange * 0.01; // 1% of range
+            if (Math.abs(bar.close - priceLevel) < tolerance || Math.abs(bar.high - priceLevel) < tolerance || Math.abs(bar.low - priceLevel) < tolerance) {
+                touches++;
+            }
+            if (bar.close > priceLevel) aboveCount++;
+            if (bar.close < priceLevel) belowCount++;
+        });
+
+        const totalBars = visibleBars.length;
+        const abovePct = totalBars > 0 ? (aboveCount / totalBars) * 100 : 50;
+        const belowPct = totalBars > 0 ? (belowCount / totalBars) * 100 : 50;
+
+        // Current position relative to line
+        const currentPrice = visibleBars[visibleBars.length - 1].close;
+        const position = currentPrice > priceLevel ? 'above' : currentPrice < priceLevel ? 'below' : 'at';
+
+        // Confidence based on touch count
+        let confidence = 'LOW';
+        if (touches >= 5) confidence = 'HIGH';
+        else if (touches >= 3) confidence = 'MEDIUM';
+
+        // Render analysis in panel below chart
+        renderTrendlineAnalysisPanel({
+            angle, priceLevel, touches, aboveCount, belowCount,
+            abovePct, belowPct, totalBars, position, confidence,
+            start, end, isHorizontal
+        });
+
+        svg.appendChild(group);
+    }
+
+    // ── Pattern Detection ─────────────────────────────────────────────
+    function detectPatterns() {
+        if (!visibleBars.length || visibleBars.length < 20) return null;
+
+        const bars = visibleBars;
+        const current = bars[bars.length - 1];
+        const lookback = Math.min(20, bars.length - 1);
+        const recent = bars.slice(-lookback);
+
+        // Find swing highs and lows
+        const swingHighs = [];
+        const swingLows = [];
+        for (let i = 2; i < recent.length - 2; i++) {
+            if (recent[i].high > recent[i-1].high && recent[i].high > recent[i-2].high &&
+                recent[i].high > recent[i+1].high && recent[i].high > recent[i+2].high) {
+                swingHighs.push({ price: recent[i].high, index: i, date: recent[i].date });
+            }
+            if (recent[i].low < recent[i-1].low && recent[i].low < recent[i-2].low &&
+                recent[i].low < recent[i+1].low && recent[i].low < recent[i+2].low) {
+                swingLows.push({ price: recent[i].low, index: i, date: recent[i].date });
+            }
+        }
+
+        const patterns = [];
+
+        // Check breakout above resistance
+        if (swingHighs.length >= 2) {
+            const lastResistance = swingHighs[swingHighs.length - 1].price;
+            const prevResistance = swingHighs.length >= 2 ? swingHighs[swingHighs.length - 2].price : lastResistance;
+
+            // Did price just cross above resistance?
+            if (current.close > lastResistance && bars[bars.length - 2].close <= lastResistance) {
+                // Count historical outcomes after similar breakouts
+                let upCount = 0;
+                let totalSimilar = 0;
+                for (let i = 10; i < bars.length - 5; i++) {
+                    const bar = bars[i];
+                    const prevBar = bars[i-1];
+                    const resistance = swingHighs.find(sh => Math.abs(sh.index - i) < 5);
+                    if (resistance && bar.close > resistance.price && prevBar.close <= resistance.price) {
+                        totalSimilar++;
+                        const outcome = bars[i + 5] ? bars[i + 5].close - bar.close : 0;
+                        if (outcome > 0) upCount++;
+                    }
+                }
+
+                if (totalSimilar > 0) {
+                    const probUp = (upCount / totalSimilar) * 100;
+                    const atr = computeATRFromBars(bars);
+                    const sl = lastResistance - (atr * 1);
+                    const target = current.close + (atr * 2);
+                    patterns.push({
+                        type: 'breakout_up',
+                        level: lastResistance,
+                        probability: probUp,
+                        direction: 'up',
+                        sl: sl,
+                        target: target,
+                        confidence: totalSimilar >= 3 ? 'high' : 'medium',
+                    });
+                }
+            }
+
+            // Check retest of resistance (support formed)
+            const lastHigh = swingHighs[swingHighs.length - 1].price;
+            if (current.close >= lastHigh * 0.98 && current.close <= lastHigh * 1.02 &&
+                bars[bars.length - 2].low <= lastHigh && current.close > bars[bars.length - 2].close) {
+                let upCount = 0;
+                let totalSimilar = 0;
+                for (let i = 5; i < bars.length - 5; i++) {
+                    const bar = bars[i];
+                    const refHigh = swingHighs.find(sh => Math.abs(sh.price - lastHigh) / lastHigh < 0.02);
+                    if (refHigh && Math.abs(bar.low - refHigh.price) / refHigh.price < 0.02) {
+                        totalSimilar++;
+                        const outcome = bars[i + 5] ? bars[i + 5].close - bar.close : 0;
+                        if (outcome > 0) upCount++;
+                    }
+                }
+
+                if (totalSimilar > 0) {
+                    const probUp = (upCount / totalSimilar) * 100;
+                    const atr = computeATRFromBars(bars);
+                    patterns.push({
+                        type: 'retest_resistance',
+                        level: lastHigh,
+                        probability: probUp,
+                        direction: 'up',
+                        sl: lastHigh - atr,
+                        target: lastHigh + (atr * 2),
+                        confidence: totalSimilar >= 3 ? 'high' : 'medium',
+                    });
+                }
+            }
+        }
+
+        // Check breakdown below support
+        if (swingLows.length >= 2) {
+            const lastSupport = swingLows[swingLows.length - 1].price;
+            const prevSupport = swingLows.length >= 2 ? swingLows[swingLows.length - 2].price : lastSupport;
+
+            if (current.close < lastSupport && bars[bars.length - 2].close >= lastSupport) {
+                let downCount = 0;
+                let totalSimilar = 0;
+                for (let i = 10; i < bars.length - 5; i++) {
+                    const bar = bars[i];
+                    const prevBar = bars[i-1];
+                    const support = swingLows.find(sl => Math.abs(sl.index - i) < 5);
+                    if (support && bar.close < support.price && prevBar.close >= support.price) {
+                        totalSimilar++;
+                        const outcome = bars[i + 5] ? bars[i + 5].close - bar.close : 0;
+                        if (outcome < 0) downCount++;
+                    }
+                }
+
+                if (totalSimilar > 0) {
+                    const probDown = (downCount / totalSimilar) * 100;
+                    const atr = computeATRFromBars(bars);
+                    const sl = lastSupport + (atr * 1);
+                    const target = current.close - (atr * 2);
+                    patterns.push({
+                        type: 'breakdown',
+                        level: lastSupport,
+                        probability: probDown,
+                        direction: 'down',
+                        sl: sl,
+                        target: target,
+                        confidence: totalSimilar >= 3 ? 'high' : 'medium',
+                    });
+                }
+            }
+        }
+
+        // Return strongest pattern
+        if (patterns.length > 0) {
+            patterns.sort((a, b) => b.probability - a.probability);
+            return patterns[0];
+        }
+
+        return null;
+    }
+
+    function computeATRFromBars(bars) {
+        if (!bars || bars.length < 15) return (bars[bars.length-1].high - bars[bars.length-1].low);
+
+        const trValues = [];
+        for (let i = 1; i < bars.length; i++) {
+            const high = bars[i].high;
+            const low = bars[i].low;
+            const prevClose = bars[i-1].close;
+            const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+            trValues.push(tr);
+        }
+
+        // Wilder's RMA
+        const period = 14;
+        let rma = trValues.slice(0, period).reduce((a, b) => a + b, 0) / period;
+        for (let i = period; i < trValues.length; i++) {
+            rma = (rma * (period - 1) + trValues[i]) / period;
+        }
+
+        return rma;
+    }
+
+    function renderPatternAnalysis(pattern) {
+        if (!pattern) return;
+
+        const svg = document.getElementById('candleChart');
+        const ns = 'http://www.w3.org/2000/svg';
+        const wrapper = document.getElementById('chartWrapper');
+        const rect = wrapper.getBoundingClientRect();
+        const W = rect.width;
+        const H = wrapper.clientHeight || 420;
+        const padding = { top: 30, right: 80, bottom: 35, left: 10 };
+        const chartW = W - padding.left - padding.right;
+        const chartH = (H - padding.top - padding.bottom) * chartState.priceScale;
+        const chartTop = padding.top + (H - padding.top - padding.bottom) / 2 - chartH / 2;
+        const allHighs = visibleBars.map(b => b.high);
+        const allLows = visibleBars.map(b => b.low);
+        const minPrice = Math.min(...allLows);
+        const maxPrice = Math.max(...allHighs);
+        const priceRange = maxPrice - minPrice || 1;
+        const stepX = chartW / visibleBars.length;
+
+        const group = document.createElementNS(ns, 'g');
+        group.setAttribute('class', 'pattern-analysis');
+
+        const isUp = pattern.direction === 'up';
+        const levelY = chartTop + (1 - (pattern.level - minPrice) / priceRange) * chartH;
+        const slY = chartTop + (1 - (pattern.sl - minPrice) / priceRange) * chartH;
+        const targetY = chartTop + (1 - (pattern.target - minPrice) / priceRange) * chartH;
+        const currentPrice = visibleBars[visibleBars.length - 1].close;
+        const currentY = chartTop + (1 - (currentPrice - minPrice) / priceRange) * chartH;
+
+        // Pattern level line (thick)
+        const levelLine = document.createElementNS(ns, 'line');
+        levelLine.setAttribute('x1', padding.left);
+        levelLine.setAttribute('y1', levelY);
+        levelLine.setAttribute('x2', W - padding.right);
+        levelLine.setAttribute('y2', levelY);
+        levelLine.setAttribute('stroke', isUp ? '#00C805' : '#FF3B30');
+        levelLine.setAttribute('stroke-width', '2');
+        levelLine.setAttribute('stroke-dasharray', 'none');
+        levelLine.setAttribute('opacity', '0.7');
+        group.appendChild(levelLine);
+
+        // Level label
+        const levelLabel = document.createElementNS(ns, 'text');
+        levelLabel.setAttribute('x', W - padding.right + 5);
+        levelLabel.setAttribute('y', levelY + 4);
+        levelLabel.setAttribute('font-family', 'Inter, sans-serif');
+        levelLabel.setAttribute('font-size', '10');
+        levelLabel.setAttribute('font-weight', '700');
+        levelLabel.setAttribute('fill', isUp ? '#00C805' : '#FF3B30');
+        levelLabel.textContent = `${pattern.type.replace(/_/g, ' ').toUpperCase()} $${pattern.level.toFixed(2)}`;
+        group.appendChild(levelLabel);
+
+        // SL line (red)
+        const slLine = document.createElementNS(ns, 'line');
+        slLine.setAttribute('x1', padding.left);
+        slLine.setAttribute('y1', slY);
+        slLine.setAttribute('x2', W - padding.right);
+        slLine.setAttribute('y2', slY);
+        slLine.setAttribute('stroke', '#FF3B30');
+        slLine.setAttribute('stroke-width', '1.5');
+        slLine.setAttribute('stroke-dasharray', '6 3');
+        group.appendChild(slLine);
+
+        const slLabel = document.createElementNS(ns, 'text');
+        slLabel.setAttribute('x', padding.left + 5);
+        slLabel.setAttribute('y', slY - 5);
+        slLabel.setAttribute('font-family', 'Inter, sans-serif');
+        slLabel.setAttribute('font-size', '10');
+        slLabel.setAttribute('font-weight', '700');
+        slLabel.setAttribute('fill', '#FF3B30');
+        slLabel.textContent = `SL $${pattern.sl.toFixed(2)}`;
+        group.appendChild(slLabel);
+
+        // Target line (green)
+        const targetLine = document.createElementNS(ns, 'line');
+        targetLine.setAttribute('x1', padding.left);
+        targetLine.setAttribute('y1', targetY);
+        targetLine.setAttribute('x2', W - padding.right);
+        targetLine.setAttribute('y2', targetY);
+        targetLine.setAttribute('stroke', '#00C805');
+        targetLine.setAttribute('stroke-width', '1.5');
+        targetLine.setAttribute('stroke-dasharray', '6 3');
+        group.appendChild(targetLine);
+
+        const targetLabel = document.createElementNS(ns, 'text');
+        targetLabel.setAttribute('x', padding.left + 5);
+        targetLabel.setAttribute('y', targetY - 5);
+        targetLabel.setAttribute('font-family', 'Inter, sans-serif');
+        targetLabel.setAttribute('font-size', '10');
+        targetLabel.setAttribute('font-weight', '700');
+        targetLabel.setAttribute('fill', '#00C805');
+        targetLabel.textContent = `TGT $${pattern.target.toFixed(2)}`;
+        group.appendChild(targetLabel);
+
+        // Probability badge
+        const badgeX = W - padding.right - 60;
+        const badgeY = levelY - 15;
+        const badge = document.createElementNS(ns, 'rect');
+        badge.setAttribute('x', badgeX);
+        badge.setAttribute('y', badgeY);
+        badge.setAttribute('width', 55);
+        badge.setAttribute('height', 18);
+        badge.setAttribute('rx', '4');
+        badge.setAttribute('fill', isUp ? 'rgba(0,200,5,0.15)' : 'rgba(255,59,48,0.15)');
+        group.appendChild(badge);
+
+        const probText = document.createElementNS(ns, 'text');
+        probText.setAttribute('x', badgeX + 27);
+        probText.setAttribute('y', badgeY + 13);
+        probText.setAttribute('font-family', 'Inter, sans-serif');
+        probText.setAttribute('font-size', '11');
+        probText.setAttribute('font-weight', '700');
+        probText.setAttribute('fill', isUp ? '#00C805' : '#FF3B30');
+        probText.setAttribute('text-anchor', 'middle');
+        probText.textContent = `${pattern.probability.toFixed(0)}%`;
+        group.appendChild(probText);
+
+        svg.appendChild(group);
+    }
+
+    function showPatternAnalysis(pattern) {
+        if (!pattern) return;
+
+        document.getElementById('positionInfo').classList.add('active');
+        const isUp = pattern.direction === 'up';
+        const rrRatio = Math.abs(pattern.target - pattern.level) / Math.abs(pattern.level - pattern.sl);
+        const rrClass = rrRatio >= 2 ? 'good' : rrRatio >= 1 ? 'good' : 'poor';
+
+        document.getElementById('positionRow').innerHTML = `
+            <div class="position-item"><strong>Pattern:</strong> ${pattern.type.replace(/_/g, ' ').toUpperCase()}</div>
+            <div class="position-item"><strong>Level:</strong> $${pattern.level.toFixed(2)}</div>
+            <div class="position-item"><strong>Direction:</strong> ${isUp ? '▲ BULLISH' : '▼ BEARISH'}</div>
+            <div class="position-item"><strong>Probability:</strong> ${pattern.probability.toFixed(0)}%</div>
+            <div class="position-item"><strong>Confidence:</strong> ${pattern.confidence.toUpperCase()}</div>
+            <div class="position-item"><strong>SL:</strong> $${pattern.sl.toFixed(2)}</div>
+            <div class="position-item"><strong>Target:</strong> $${pattern.target.toFixed(2)}</div>
+            <span class="position-rr ${rrClass}">R:R = ${rrRatio.toFixed(2)}</span>
+        `;
+        document.getElementById('positionInstructions').textContent =
+            `Pattern detected: ${pattern.type.replace(/_/g, ' ')} | ${pattern.probability.toFixed(0)}% historical win rate | ${pattern.confidence} confidence`;
+    }
+
+    function runPatternDetection() {
+        const btn = document.getElementById('btnPattern');
+        btn.classList.toggle('active');
+
+        if (btn.classList.contains('active')) {
+            const pattern = detectPatterns();
+            if (pattern) {
+                renderPatternAnalysis(pattern);
+                showPatternAnalysis(pattern);
+            } else {
+                document.getElementById('positionInfo').classList.add('active');
+                document.getElementById('positionInstructions').textContent = 'No significant pattern detected in current timeframe';
+                document.getElementById('positionRow').innerHTML = '';
+            }
+            drawChart();
+        } else {
+            // Remove pattern elements
+            const existing = document.querySelector('.pattern-analysis');
+            if (existing) existing.remove();
+            document.getElementById('positionInfo').classList.remove('active');
+            drawChart();
+        }
+    }
+
+    // ── Mouse Wheel Zoom ──────────────────────────────────────────────
+    document.addEventListener('wheel', (e) => {
+        const wrapper = document.getElementById('chartWrapper');
+        if (!wrapper) return;
+        const rect = wrapper.getBoundingClientRect();
+        if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) return;
+        e.preventDefault();
+        const delta = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        chartState.barWidth = Math.min(30, Math.max(1, chartState.barWidth * delta));
+        chartState.candleGap = Math.min(10, Math.max(0.5, chartState.candleGap * delta));
+        chartState.priceScale = Math.min(3, Math.max(0.5, chartState.priceScale * (e.deltaY < 0 ? 1.1 : 0.9)));
+        drawChart();
+    }, { passive: false });
+
+    // ── Mouse Drag (Pan) ──────────────────────────────────────────────
+    // Use wrapper-bound listeners + document for reliable pan
+    document.addEventListener('mousedown', (e) => {
+        const wrapper = document.getElementById('chartWrapper');
+        if (!wrapper) return;
+        if (e.target.closest('.chart-controls')) return;
+
+        // Handle drawing mode clicks
+        if (chartState.drawingMode === 'position') {
+            handleDrawClick(e);
+            return;
+        }
+
+        if (chartState.drawingMode === 'trendline') {
+            const priceData = getPriceFromMouse(e);
+            if (priceData) {
+                chartState.isDragging = true;
+                chartState.dragStartX = e.clientX;
+                chartState.trendlineStart = priceData;
+                wrapper.style.cursor = 'crosshair';
+                // Bind move/up to document for reliable tracking outside wrapper
+                const onMove = (ev) => {
+                    const previewData = getPriceFromMouse(ev);
+                    if (previewData && chartState.trendlineStart) {
+                        drawChart();
+                        renderTrendlinePreview(chartState.trendlineStart, previewData);
+                    }
+                };
+                const onUp = (ev) => {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    wrapper.style.cursor = 'crosshair';
+                    if (chartState.trendlineStart) {
+                        const priceData = getPriceFromMouse(ev);
+                        if (priceData) {
+                            chartState.drawings.push({
+                                type: 'trendline',
+                                start: chartState.trendlineStart,
+                                end: priceData,
+                            });
+                        }
+                    }
+                    chartState.isDragging = false;
+                    chartState.trendlineStart = null;
+                    chartState.drawingMode = null;
+                    document.getElementById('btnTrendline').classList.remove('active');
+                    // Redraw chart (will render saved trendline + analysis panel)
+                    drawChart();
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            }
+            return;
+        }
+
+        // Normal pan mode — must be inside chart wrapper
+        const rect = wrapper.getBoundingClientRect();
+        if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) return;
+
+        chartState.isDragging = true;
+        chartState.dragStartX = e.clientX;
+        chartState.dragStartOffset = chartState.offset;
+        wrapper.style.cursor = 'grabbing';
+        wrapper.style.userSelect = 'none';
+
+        const onMove = (ev) => {
+            if (!chartState.isDragging) return;
+            const dx = ev.clientX - chartState.dragStartX;
+            const barWidth = chartState.barWidth + chartState.candleGap;
+            const barsDragged = Math.round(dx / barWidth);
+            const newOffset = Math.max(0, Math.min(visibleBars.length - 10, chartState.dragStartOffset - barsDragged));
+
+            // Only redraw if offset actually changed
+            if (newOffset !== chartState.offset) {
+                chartState.offset = newOffset;
+
+                // Load older bars if needed
+                if (chartState.offset > visibleBars.length - 30 && allBars.length < totalBarsAvailable) {
+                    loadOlderBars();
+                }
+                drawChart();
+            }
+        };
+
+        const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            chartState.isDragging = false;
+            wrapper.style.cursor = 'crosshair';
+            wrapper.style.userSelect = '';
+        };
+
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+
+    // ── Touch Support ─────────────────────────────────────────────────
+    let touchStartX = 0;
+    let touchStartOffset = 0;
+    let initialPinchDistance = 0;
+    let initialPriceScale = 1;
+
+    function getPinchDistance(touches) {
+        const dx = touches[0].clientX - touches[1].clientX;
+        const dy = touches[0].clientY - touches[1].clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    document.addEventListener('touchstart', (e) => {
+        const wrapper = document.getElementById('chartWrapper');
+        if (!wrapper) return;
+        const rect = wrapper.getBoundingClientRect();
+        const touch = e.touches[0];
+        if (touch.clientX < rect.left || touch.clientX > rect.right || touch.clientY < rect.top || touch.clientY > rect.bottom) return;
+        if (e.target.closest('.chart-controls')) return;
+
+        if (e.touches.length === 2) {
+            // Pinch start
+            initialPinchDistance = getPinchDistance(e.touches);
+            initialPriceScale = chartState.priceScale;
+        } else if (e.touches.length === 1) {
+            // Single touch - pan
+            touchStartX = e.touches[0].clientX;
+            touchStartOffset = chartState.offset;
+            chartState.isDragging = true;
+        }
+    }, { passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+        const chart = document.getElementById('candleChart');
+        if (!chart) return;
+
+        if (e.touches.length === 2) {
+            // Pinch zoom - scales both time and price
+            const currentDistance = getPinchDistance(e.touches);
+            const scale = currentDistance / initialPinchDistance;
+            chartState.priceScale = Math.max(0.5, Math.min(3, initialPriceScale * scale));
+            chartState.barWidth = Math.max(1, Math.min(30, 8 * scale));
+            drawChart();
+        } else if (chartState.isDragging && e.touches.length === 1) {
+            const dx = e.touches[0].clientX - touchStartX;
+            const barWidth = chartState.barWidth + chartState.candleGap;
+            const barsDragged = Math.round(dx / barWidth);
+            chartState.offset = Math.max(0, Math.min(visibleBars.length - 10, touchStartOffset - barsDragged));
+            if (chartState.offset > visibleBars.length - 30 && allBars.length < totalBarsAvailable) {
+                loadOlderBars();
+            }
+            drawChart();
+        }
+    }, { passive: true });
+
+    document.addEventListener('touchend', () => {
+        chartState.isDragging = false;
+    });
+
+    // ── Load Older Bars ───────────────────────────────────────────────
+    async function loadOlderBars() {
+        if (chartState.loadedOlder.has('all')) return;
+        const key = allBars.length;
+        if (chartState.loadedOlder.has(key)) return;
+        chartState.loadedOlder.add(key);
+
+        try {
+            const res = await fetch(`/api/stock/${currentSymbol}/bars?offset=${allBars.length}&limit=200&dir=older`);
+            const data = await res.json();
+            if (data.bars && data.bars.length > 0) {
+                allBars = [...data.bars, ...allBars];
+                updateChartData();
+                drawChart();
+            } else {
+                chartState.loadedOlder.add('all');
+            }
+        } catch (e) {
+            console.error('Failed to load older bars:', e);
+        }
+    }
+
+    // ── News & Sentiment ──────────────────────────────────────────────
+    async function openNews() {
+        const section = document.getElementById('newsSection');
+        const body = document.getElementById('newsBody');
+        section.style.display = 'block';
+        body.innerHTML = '<div class="loading-cell">Analyzing news & social media...</div>';
+
+        try {
+            const res = await fetch(`/api/stock/${currentSymbol}`);
+            const data = await res.json();
+            const symbol = data.symbol;
+            const name = data.name;
+
+            // Search web for recent news
+            const newsRes = await fetch(`/api/news-search?symbol=${symbol}&name=${encodeURIComponent(name)}`);
+            const newsData = await newsRes.json();
+
+            let html = '';
+
+            // Summary
+            html += `<div class="news-summary">
+                <h4>Sentiment Overview</h4>
+                <div class="sentiment-tags">
+                    <span class="sentiment-tag bullish">Recent Activity</span>
+                    <span class="sentiment-tag neutral">Mixed Signals</span>
+                </div>
+            </div>`;
+
+            // News items
+            if (newsData.articles && newsData.articles.length > 0) {
+                html += '<div class="news-section"><h4>Recent News</h4><div class="news-list">';
+                newsData.articles.forEach(a => {
+                    html += `<div class="news-item">
+                        <div class="news-headline"><a href="${a.url}" target="_blank" rel="noopener">${escapeHtml(a.title)}</a></div>
+                        <div class="news-meta">${a.source} · ${a.timeAgo}</div>
+                    </div>`;
+                });
+                html += '</div></div>';
+            }
+
+            // Social sentiment
+            html += `<div class="news-section"><h4>Social Media Pulse</h4>
+                <div class="social-pulse">
+                    <div class="pulse-item">
+                        <span class="pulse-platform">Reddit</span>
+                        <span class="pulse-status">Active discussion</span>
+                    </div>
+                    <div class="pulse-item">
+                        <span class="pulse-platform">X / Twitter</span>
+                        <span class="pulse-status">Recent mentions</span>
+                    </div>
+                    <div class="pulse-item">
+                        <span class="pulse-platform">Stock Forums</span>
+                        <span class="pulse-status">Community interest</span>
+                    </div>
+                </div>
+                <p class="social-note">Click a source above to explore real-time discussions about ${symbol}.</p>
+            </div>`;
+
+            body.innerHTML = html;
+        } catch (e) {
+            body.innerHTML = '<div class="empty-cell">Could not load news data</div>';
+        }
+    }
+
+    function closeNews() {
+        document.getElementById('newsSection').style.display = 'none';
+    }
+
+    function toggleSection(id) {
+        const section = document.getElementById(id);
+        if (section) {
+            section.style.display = section.style.display === 'none' ? 'block' : 'none';
+        }
+    }
+
+    // ── AI Analysis ──────────────────────────────────────────────────
+    function openAnalysis() {
+        const section = document.getElementById('analysisSection');
+        const body = document.getElementById('analysisBody');
+        section.style.display = 'block';
+        body.innerHTML = '<div class="loading-cell">Running AI analysis...</div>';
+        loadAnalysis();
+    }
+
+    function closeAnalysis() {
+        document.getElementById('analysisSection').style.display = 'none';
+    }
+
+    async function loadAnalysis() {
+        const body = document.getElementById('analysisBody');
+        try {
+            const res = await fetch(`/api/stock/${currentSymbol}/analysis`);
+            const data = await res.json();
+            renderAnalysis(data);
+        } catch (e) {
+            body.innerHTML = '<div class="empty-cell">Could not load analysis</div>';
+        }
+    }
+
+    function renderAnalysis(data) {
+        const body = document.getElementById('analysisBody');
+        const biasColor = data.bias === 'bullish' ? 'var(--green)' : data.bias === 'bearish' ? 'var(--red)' : 'var(--text-secondary)';
+        const biasBg = data.bias === 'bullish' ? 'var(--green-bg)' : data.bias === 'bearish' ? 'var(--red-bg)' : 'rgba(0,0,0,0.05)';
+        const scoreColor = data.overall_score >= 65 ? 'var(--green)' : data.overall_score <= 35 ? 'var(--red)' : 'var(--text-secondary)';
+        const cachedTag = data.cached ? '<span style="font-size:11px;color:var(--text-tertiary);margin-left:8px">(cached)</span>' : '';
+
+        // Score ring SVG
+        const radius = 52;
+        const circumference = 2 * Math.PI * radius;
+        const offset = circumference - (data.overall_score / 100) * circumference;
+        const dashColor = data.overall_score >= 65 ? '#00C805' : data.overall_score <= 35 ? '#FF3B30' : '#6E6E73';
+
+        body.innerHTML = `
+            <div class="analysis-container">
+                <!-- Overall Score Ring -->
+                <div class="analysis-score-ring">
+                    <svg width="130" height="130" viewBox="0 0 130 130">
+                        <circle cx="65" cy="65" r="${radius}" fill="none" stroke="rgba(0,0,0,0.06)" stroke-width="10"/>
+                        <circle cx="65" cy="65" r="${radius}" fill="none" stroke="${dashColor}" stroke-width="10"
+                            stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                            stroke-linecap="round" transform="rotate(-90 65 65)"
+                            style="transition: stroke-dashoffset 0.8s ease"/>
+                        <text x="65" y="60" text-anchor="middle" font-family="Outfit, sans-serif" font-size="28" font-weight="800" fill="${dashColor}">${data.overall_score.toFixed(0)}</text>
+                        <text x="65" y="78" text-anchor="middle" font-family="Inter, sans-serif" font-size="11" fill="var(--text-secondary)">/ 100</text>
+                    </svg>
+                    <div class="analysis-badge" style="background:${biasBg};color:${biasColor}">${data.bias.toUpperCase()}</div>
+                </div>
+
+                <!-- Platform Scores -->
+                <div class="analysis-platforms">
+                    <div class="platform-card">
+                        <div class="platform-header">
+                            <span class="platform-name">Technical</span>
+                            <span class="platform-score" style="color:${data.tech_score >= 60 ? 'var(--green)' : data.tech_score <= 40 ? 'var(--red)' : 'var(--text)'}">${data.tech_score.toFixed(0)}</span>
+                        </div>
+                        <div class="platform-bar"><div class="platform-bar-fill" style="width:${data.tech_score}%;background:${data.tech_score >= 60 ? 'var(--green)' : data.tech_score <= 40 ? 'var(--red)' : 'var(--text-secondary)'}"></div></div>
+                    </div>
+                    <div class="platform-card">
+                        <div class="platform-header">
+                            <span class="platform-name">Momentum</span>
+                            <span class="platform-score" style="color:${data.momentum_score >= 60 ? 'var(--green)' : data.momentum_score <= 40 ? 'var(--red)' : 'var(--text)'}">${data.momentum_score.toFixed(0)}</span>
+                        </div>
+                        <div class="platform-bar"><div class="platform-bar-fill" style="width:${data.momentum_score}%;background:${data.momentum_score >= 60 ? 'var(--green)' : data.momentum_score <= 40 ? 'var(--red)' : 'var(--text-secondary)'}"></div></div>
+                    </div>
+                    <div class="platform-card">
+                        <div class="platform-header">
+                            <span class="platform-name">Volume</span>
+                            <span class="platform-score" style="color:${data.volume_score >= 60 ? 'var(--green)' : data.volume_score <= 40 ? 'var(--red)' : 'var(--text)'}">${data.volume_score.toFixed(0)}</span>
+                        </div>
+                        <div class="platform-bar"><div class="platform-bar-fill" style="width:${data.volume_score}%;background:${data.volume_score >= 60 ? 'var(--green)' : data.volume_score <= 40 ? 'var(--red)' : 'var(--text-secondary)'}"></div></div>
+                    </div>
+                    <div class="platform-card">
+                        <div class="platform-header">
+                            <span class="platform-name">Events</span>
+                            <span class="platform-score" style="color:${data.events_score >= 60 ? 'var(--green)' : data.events_score <= 40 ? 'var(--red)' : 'var(--text)'}">${data.events_score.toFixed(0)}</span>
+                        </div>
+                        <div class="platform-bar"><div class="platform-bar-fill" style="width:${data.events_score}%;background:${data.events_score >= 60 ? 'var(--green)' : data.events_score <= 40 ? 'var(--red)' : 'var(--text-secondary)'}"></div></div>
+                    </div>
+                </div>
+
+                <!-- Signals -->
+                <div class="analysis-signals">
+                    <h4>Key Signals</h4>
+                    <ul>
+                        ${(data.signals || []).map(s => `<li>${escapeHtml(s)}</li>`).join('')}
+                    </ul>
+                </div>
+            </div>
+        `;
+    }
+
+    // ── Oldest Data Formatter ─────────────────────────────────────────
+    function formatOldestData(dateStr) {
+        if (!dateStr) return '—';
+        try {
+            const d = new Date(dateStr);
+            const now = new Date();
+            const months = (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
+            const years = Math.floor(months / 12);
+            const remMonths = months % 12;
+            if (years > 0 && remMonths > 0) return `${years}y ${remMonths}m`;
+            if (years > 0) return `${years}y`;
+            return `${remMonths}m`;
+        } catch {
+            return dateStr;
+        }
+    }
+
+    // ── Utility Functions ──────────────────────────────────────────────
+    function formatPrice(p) {
+        if (p == null || isNaN(p)) return '—';
+        if (p >= 1000) return p.toFixed(0);
+        if (p >= 1) return p.toFixed(2);
+        return p.toFixed(4);
+    }
+
+    function formatVolume(v) {
+        if (!v || isNaN(v)) return '—';
+        return v.toLocaleString('en-US');
+    }
+
+    function formatProfitStatus(status) {
+        const map = {
+            'profitable': 'Profitable',
+            'loss_making': 'Loss Making',
+            'growing': 'Growing',
+            'declining': 'Declining',
+        };
+        return map[status] || status || 'N/A';
+    }
+
+    async function loadOptions() {
+        const container = document.getElementById('optionsContainer');
+        const btn = document.getElementById('btnOptions');
+        if (container.style.display !== 'none') {
+            container.style.display = 'none';
+            btn.textContent = '&#9662; Options Chain';
+            return;
+        }
+        container.style.display = 'block';
+        container.innerHTML = '<div class="loading-cell">Loading options...</div>';
+        btn.textContent = '&#9652; Options Chain';
+        try {
+            const res = await fetch('/api/options/' + currentSymbol);
+            const data = await res.json();
+            if (data.status !== 'ok' || !data.chains || data.chains.length === 0) {
+                container.innerHTML = '<div style="padding:1rem;text-align:center;color:var(--text-tertiary);font-size:0.85rem">' + (data.message || 'No options data available') + '</div>';
+                return;
+            }
+            let html = '<div style="font-size:0.75rem;color:var(--text-tertiary);margin-bottom:0.5rem">Nearest expirations — click to expand</div>';
+            data.chains.forEach(ch => {
+                const expDate = new Date(ch.expiration + 'T00:00:00');
+                const label = (expDate.getMonth()+1)+'/'+expDate.getDate()+'/'+expDate.getFullYear();
+                html += '<div style="border:1px solid var(--border);border-radius:6px;margin-bottom:0.5rem;overflow:hidden">';
+                html += '<div style="padding:0.4rem 0.7rem;background:var(--surface);font-weight:600;font-size:0.75rem;cursor:pointer" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'\':\'none\'">' + label + '</div>';
+                html += '<div style="display:none;overflow-x:auto">';
+                html += '<table style="width:100%;border-collapse:collapse;font-size:0.7rem"><thead><tr>';
+                html += '<th style="padding:0.3rem;text-align:center;background:var(--card-bg)">Calls</th>';
+                html += '<th style="padding:0.3rem;text-align:center;background:var(--card-bg)">Strike</th>';
+                html += '<th style="padding:0.3rem;text-align:center;background:var(--card-bg)">Puts</th>';
+                html += '</tr></thead><tbody>';
+                // Merge calls and puts by strike
+                const allStrikes = new Set();
+                ch.calls.forEach(c => allStrikes.add(c.strike));
+                ch.puts.forEach(p => allStrikes.add(p.strike));
+                const strikes = Array.from(allStrikes).sort((a,b)=>a-b);
+                const callMap = {}, putMap = {};
+                ch.calls.forEach(c => callMap[c.strike] = c);
+                ch.puts.forEach(p => putMap[p.strike] = p);
+                strikes.forEach(s => {
+                    const call = callMap[s];
+                    const put = putMap[s];
+                    html += '<tr>';
+                    html += '<td style="padding:0.2rem 0.3rem;text-align:center">' + (call ? '$' + call.bid + '/' + call.ask + ' <span style="color:var(--text-tertiary)">' + (call.volume||'—') + '</span>' : '') + '</td>';
+                    html += '<td style="padding:0.2rem 0.3rem;text-align:center;font-weight:600">$' + s.toFixed(2) + '</td>';
+                    html += '<td style="padding:0.2rem 0.3rem;text-align:center">' + (put ? '$' + put.bid + '/' + put.ask + ' <span style="color:var(--text-tertiary)">' + (put.volume||'—') + '</span>' : '') + '</td>';
+                    html += '</tr>';
+                });
+                html += '</tbody></table></div></div>';
+            });
+            container.innerHTML = html;
+        } catch(e) {
+            container.innerHTML = '<div style="padding:1rem;text-align:center;color:var(--text-tertiary)">Error loading options: ' + e.message + '</div>';
+        }
+    }
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // Resize handler
+    window.addEventListener('resize', () => drawChart());
+
+
+
+    // Load
+    loadStock(currentSymbol);
+    </script>
+</body>
+</html>

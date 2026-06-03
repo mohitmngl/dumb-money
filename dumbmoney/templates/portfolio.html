@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DumbMoney — Portfolio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        * { box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text); margin: 0; }
+        .portfolio-page { max-width: 1300px; margin: 0 auto; padding: 1.5rem 2rem; }
+        .pflayout { display: flex; gap: 1.5rem; }
+        .pfsb { width: 240px; flex-shrink: 0; }
+        .pfmain { flex: 1; min-width: 0; }
+        .pf-list { display: flex; flex-direction: column; gap: 0.25rem; }
+        .pf-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border-radius: 8px; cursor: pointer; font-size: 0.875rem; color: var(--text-secondary); transition: all 0.15s; border: 1px solid transparent; }
+        .pf-item:hover { background: var(--card-bg); }
+        .pf-item.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .pf-item .pf-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .pf-item .pf-del { opacity: 0; background: none; border: none; color: var(--red); cursor: pointer; font-size: 1rem; padding: 0; line-height: 1; }
+        .pf-item:hover .pf-del { opacity: 0.5; }
+        .pf-item:hover .pf-del:hover { opacity: 1; }
+        .pf-new-btn { padding: 0.5rem 0.75rem; border: 1px dashed var(--border); border-radius: 8px; background: none; color: var(--text-tertiary); cursor: pointer; font-size: 0.8rem; text-align: center; }
+        .pf-new-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .pf-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+        .pf-header h2 { margin: 0; font-family: 'Outfit', sans-serif; font-size: 1.5rem; }
+        .pf-actions { display: flex; gap: 0.5rem; align-items: center; }
+        .pf-summary { display: flex; gap: 1.5rem; margin-bottom: 1rem; padding: 0.75rem 1.25rem; background: var(--surface); border-radius: 10px; border: 1px solid var(--border); }
+        .pf-stat { }
+        .pf-stat-label { font-size: 0.65rem; text-transform: uppercase; color: var(--text-tertiary); letter-spacing: 0.05em; }
+        .pf-stat-value { font-size: 1.2rem; font-weight: 700; }
+        .pf-table { width: 100%; border-collapse: collapse; }
+        .pf-table th, .pf-table td { padding: 0.5rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
+        .pf-table th { font-weight: 600; color: var(--text-tertiary); text-transform: uppercase; font-size: 0.65rem; letter-spacing: 0.05em; white-space: nowrap; }
+        .pf-table .sym a { color: var(--accent); text-decoration: none; font-weight: 600; }
+        .pf-table .sym a:hover { text-decoration: underline; }
+        .change-up { color: var(--green); }
+        .change-down { color: var(--red); }
+        .pf-empty { text-align: center; padding: 3rem; color: var(--text-tertiary); }
+        .pf-empty p { margin: 0.5rem 0; }
+        .pf-input-row { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+        .pf-input-row textarea { flex: 1; min-width: 200px; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 0.8rem; resize: vertical; min-height: 38px; font-family: inherit; }
+        .pf-input-row input[type="number"] { width: 80px; padding: 0.5rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 0.8rem; }
+        .btn { padding: 0.45rem 1rem; border: none; border-radius: 6px; cursor: pointer; font-size: 0.8rem; font-weight: 500; white-space: nowrap; }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-primary:hover { opacity: 0.9; }
+        .btn-danger { background: var(--red); color: #fff; }
+        .btn-danger:hover { opacity: 0.9; }
+        .btn-outline { background: var(--card-bg); color: var(--text-secondary); border: 1px solid var(--border); }
+        .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+        .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; }
+        .preview-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+        .preview-modal { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto; }
+        .preview-modal h3 { margin: 0 0 1rem; }
+        .preview-table { width: 100%; border-collapse: collapse; }
+        .preview-table th, .preview-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); font-size: 0.8rem; text-align: left; }
+        .preview-table th { color: var(--text-tertiary); text-transform: uppercase; font-size: 0.65rem; }
+        .preview-table input[type="number"] { width: 80px; padding: 0.25rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 0.8rem; }
+        .preview-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+        .pf-edit-inline { width: 70px; padding: 0.2rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); font-size: 0.8rem; }
+        .small { font-size: 0.7rem; color: var(--text-tertiary); }
+        .date-added { font-size: 0.7rem; color: var(--text-tertiary); white-space: nowrap; }
+        .header { margin-bottom: 1rem; }
+        @media (max-width: 768px) { .pflayout { flex-direction: column; } .pfsb { width: 100%; } }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-icon">&#9632;</span>
+                <span class="logo-text">DumbMoney</span>
+            </div>
+            <div class="header-actions">
+                <a href="/" class="btn-back-home">&#8592; Screener</a>
+            </div>
+        </div>
+    </header>
+
+    <main class="portfolio-page">
+        <div class="pflayout">
+            <!-- Sidebar: Portfolio list -->
+            <aside class="pfsb">
+                <h3 style="font-family:'Outfit',sans-serif;margin:0 0 0.75rem;font-size:1rem">Portfolios</h3>
+                <div class="pf-list" id="pfList"></div>
+                <button class="pf-new-btn" onclick="createPortfolio()" style="width:100%;margin-top:0.5rem">+ New Portfolio</button>
+            </aside>
+
+            <!-- Main content -->
+            <div class="pfmain">
+                <div class="pf-header">
+                    <h2 id="pfTitle">Select a portfolio</h2>
+                    <div class="pf-actions">
+                        <button class="btn btn-outline btn-sm" onclick="toggleAddMode()" id="btnShowAdd">+ Add Symbols</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteCurrentPortfolio()" id="btnDelPf" style="display:none">Delete</button>
+                    </div>
+                </div>
+
+                <!-- Add symbols panel (hidden by default) -->
+                <div id="addPanel" style="display:none;margin-bottom:1rem;padding:1rem;background:var(--surface);border-radius:10px;border:1px solid var(--border)">
+                    <div style="font-size:0.85rem;font-weight:600;margin-bottom:0.5rem">Add Symbols</div>
+                    <div class="pf-input-row">
+                        <textarea id="pfSymbolInput" rows="2" placeholder="Paste symbols or type e.g. AAPL 10 NVDA 5 MSFT&#10;or just symbols: AAPL, NVDA, MSFT"></textarea>
+                    </div>
+                    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.5rem">
+                        <label style="font-size:0.75rem;color:var(--text-secondary)">Default Qty:</label>
+                        <input type="number" id="pfDefaultQty" value="0" style="width:70px;padding:0.3rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);font-size:0.8rem">
+                        <label style="font-size:0.75rem;color:var(--text-secondary)">Default Price:</label>
+                        <input type="number" id="pfDefaultPrice" step="0.01" style="width:90px;padding:0.3rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);color:var(--text);font-size:0.8rem">
+                    </div>
+                    <div style="display:flex;gap:0.5rem">
+                        <button class="btn btn-primary" onclick="parseAndPreview()">Parse &amp; Preview</button>
+                        <button class="btn btn-outline" onclick="toggleAddMode()">Cancel</button>
+                    </div>
+                    <div class="small" style="margin-top:0.5rem">You can enter as "AAPL 10" (symbol + qty) or just "AAPL", or paste a comma-separated list. Qty and price will be editable in the preview.</div>
+                </div>
+
+                <!-- Portfolio summary -->
+                <div id="pfSummary"></div>
+
+                <!-- Symbol table -->
+                <div id="pfSymbols">
+                    <div class="pf-empty"><p>No portfolio selected.</p></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Preview modal -->
+    <div id="previewOverlay" class="preview-overlay" style="display:none" onclick="if(event.target===this)closePreview()">
+        <div class="preview-modal" onclick="event.stopPropagation()">
+            <h3>Confirm Symbols</h3>
+            <p class="small" style="margin:0 0 0.75rem">Review and edit quantities/price before adding.</p>
+            <div style="overflow-x:auto">
+                <table class="preview-table">
+                    <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Price</th><th>Value</th></tr></thead>
+                    <tbody id="previewBody"></tbody>
+                </table>
+            </div>
+            <div class="preview-actions">
+                <button class="btn btn-outline" onclick="closePreview()">Cancel</button>
+                <button class="btn btn-primary" onclick="confirmAdd()">Confirm Add</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    let currentPortfolioId = null;
+    let portfolios = [];
+    let pendingEntries = [];
+
+    function usDate(d) {
+        if (!d) return '—';
+        const dt = new Date(d + (d.includes('T') ? '' : 'T00:00:00'));
+        if (isNaN(dt.getTime())) return d;
+        const mo = String(dt.getMonth() + 1).padStart(2, '0');
+        const da = String(dt.getDate()).padStart(2, '0');
+        const yr = dt.getFullYear();
+        return `${mo}/${da}/${yr}`;
+    }
+
+    async function loadPortfolios() {
+        const res = await fetch('/api/portfolios');
+        portfolios = await res.json();
+        renderSidebar();
+        if (portfolios.length > 0 && !currentPortfolioId) {
+            selectPortfolio(portfolios[0].id);
+        } else if (portfolios.length === 0) {
+            document.getElementById('pfTitle').textContent = 'No portfolios yet';
+            document.getElementById('pfSummary').innerHTML = '';
+            document.getElementById('pfSymbols').innerHTML = '<div class="pf-empty"><p>Create a portfolio to get started.</p></div>';
+        }
+    }
+
+    function renderSidebar() {
+        const el = document.getElementById('pfList');
+        if (portfolios.length === 0) {
+            el.innerHTML = '<div class="small" style="padding:0.5rem">No portfolios</div>';
+            return;
+        }
+        el.innerHTML = portfolios.map(p => `
+            <div class="pf-item ${p.id === currentPortfolioId ? 'active' : ''}" onclick="selectPortfolio(${p.id})">
+                <span class="pf-name">${escapeHtml(p.name)}</span>
+                <span class="small">(${p.sym_count || 0})</span>
+                <button class="pf-del" onclick="event.stopPropagation();deletePortfolio(${p.id})" title="Delete">&#10005;</button>
+            </div>
+        `).join('');
+    }
+
+    async function selectPortfolio(id) {
+        currentPortfolioId = id;
+        document.getElementById('btnShowAdd').style.display = '';
+        document.getElementById('addPanel').style.display = 'none';
+        renderSidebar();
+        const r2 = await fetch('/api/portfolios/' + id);
+        const data = await r2.json();
+        renderPortfolio(data);
+    }
+
+    function renderPortfolio(data) {
+        const pf = data.portfolio || {};
+        const syms = data.symbols || [];
+        const stats = data.stats || {};
+        document.getElementById('pfTitle').textContent = escapeHtml(pf.name || 'Portfolio');
+
+        let totalValue = 0, totalCost = 0, totalPL = 0, totalPLPct = 0, count = 0;
+        let rows = syms.map(s => {
+            const st = stats[s.symbol] || {};
+            const price = st.price || 0;
+            const qty = s.qty || 0;
+            const avg = s.avg_price;
+            const value = price * qty;
+            const cost = avg ? avg * qty : 0;
+            const pl = avg ? (price - avg) * qty : 0;
+            const plPct = avg && avg > 0 ? ((price - avg) / avg * 100) : 0;
+            if (qty > 0) { totalValue += value; totalCost += cost; totalPL += pl; count++; }
+            return `<tr>
+                <td><button class="btn btn-danger btn-sm" onclick="removeSymbol('${s.symbol}')" style="padding:0.1rem 0.3rem;font-size:0.7rem">&#10005;</button></td>
+                <td class="sym"><a href="/stock/${s.symbol}" target="_blank">${s.symbol}</a></td>
+                <td><input class="pf-edit-inline" type="number" step="any" value="${qty}" id="qty_${s.symbol}" onchange="updateSymbol('${s.symbol}','qty',this.value)"></td>
+                <td><input class="pf-edit-inline" type="number" step="0.01" value="${avg || ''}" id="pr_${s.symbol}" onchange="updateSymbol('${s.symbol}','avg_price',this.value || null)" placeholder="—"></td>
+                <td>${price ? '$' + price.toFixed(2) : '—'}</td>
+                <td class="${avg && price > avg ? 'change-up' : avg && price < avg ? 'change-down' : ''}">${avg ? (pl > 0 ? '+' : '') + pl.toFixed(2) : '—'}</td>
+                <td class="${plPct > 0 ? 'change-up' : plPct < 0 ? 'change-down' : ''}">${avg ? (plPct > 0 ? '+' : '') + plPct.toFixed(2) + '%' : '—'}</td>
+                <td>${st.change_pct != null ? (st.change_pct > 0 ? '+' : '') + st.change_pct.toFixed(2) + '%' : '—'}</td>
+                <td>${st.weighted_alpha != null ? (st.weighted_alpha > 0 ? '+' : '') + st.weighted_alpha.toFixed(1) + '%' : '—'}</td>
+                <td style="font-size:0.7rem">${st.profit_status || '—'}</td>
+                <td class="date-added">${usDate(s.created_at)}</td>
+            </tr>`;
+        }).join('');
+
+        const pnl = totalPL;
+        const pnlPct = totalCost > 0 ? (pnl / totalCost * 100) : 0;
+
+        document.getElementById('pfSummary').innerHTML = `
+            <div class="pf-summary">
+                <div class="pf-stat"><span class="pf-stat-label">Holdings</span><span class="pf-stat-value">${syms.length}</span></div>
+                <div class="pf-stat"><span class="pf-stat-label">Invested</span><span class="pf-stat-value">$${totalCost.toFixed(2)}</span></div>
+                <div class="pf-stat"><span class="pf-stat-label">Market Value</span><span class="pf-stat-value">$${totalValue.toFixed(2)}</span></div>
+                <div class="pf-stat"><span class="pf-stat-label">P&amp;L</span><span class="pf-stat-value ${pnl > 0 ? 'change-up' : pnl < 0 ? 'change-down' : ''}">${pnl > 0 ? '+' : ''}$${pnl.toFixed(2)}</span></div>
+                <div class="pf-stat"><span class="pf-stat-label">P&amp;L%</span><span class="pf-stat-value ${pnlPct > 0 ? 'change-up' : pnlPct < 0 ? 'change-down' : ''}">${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(2)}%</span></div>
+            </div>`;
+
+        document.getElementById('pfSymbols').innerHTML = syms.length === 0
+            ? '<div class="pf-empty"><p>No symbols yet. Click "Add Symbols" to build your watchlist.</p></div>'
+            : `<div style="overflow-x:auto"><table class="pf-table">
+                <thead><tr>
+                    <th style="width:32px"></th>
+                    <th>Symbol</th>
+                    <th>Qty</th>
+                    <th>Avg Price</th>
+                    <th>Price</th>
+                    <th>P&amp;L</th>
+                    <th>P&amp;L%</th>
+                    <th>Chg%</th>
+                    <th>Wtd Alpha</th>
+                    <th>Profit</th>
+                    <th>Added</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table></div>`;
+        document.getElementById('btnDelPf').style.display = '';
+    }
+
+    async function removeSymbol(sym) {
+        if (!currentPortfolioId) return;
+        await fetch(`/api/portfolios/${currentPortfolioId}/symbols/${sym}`, { method: 'DELETE' });
+        refreshCurrent();
+    }
+
+    async function updateSymbol(sym, field, value) {
+        if (!currentPortfolioId) return;
+        const body = {};
+        body[field] = value;
+        await fetch(`/api/portfolios/${currentPortfolioId}/symbols/${sym}`, {
+            method: 'PATCH',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(body)
+        });
+    }
+
+    function toggleAddMode() {
+        const panel = document.getElementById('addPanel');
+        panel.style.display = panel.style.display === 'none' ? '' : 'none';
+        if (panel.style.display !== 'none') document.getElementById('pfSymbolInput').focus();
+    }
+
+    function parseAndPreview() {
+        const raw = document.getElementById('pfSymbolInput').value.trim();
+        if (!raw) return;
+        const defaultQty = parseFloat(document.getElementById('pfDefaultQty').value) || 0;
+        const defaultPrice = parseFloat(document.getElementById('pfDefaultPrice').value) || null;
+
+        // Parse: support "AAPL 10 NVDA 5" or "AAPL, NVDA" or newlines
+        const tokens = raw.split(/[\s,;]+/).filter(t => t.length > 0);
+        const entries = [];
+        let i = 0;
+        while (i < tokens.length) {
+            // Check if next token looks like a number (qty)
+            if (i + 1 < tokens.length && /^\d+(\.\d+)?$/.test(tokens[i+1])) {
+                entries.push({ symbol: tokens[i].toUpperCase(), qty: parseFloat(tokens[i+1]), avg_price: defaultPrice });
+                i += 2;
+            } else if (/^\d+(\.\d+)?$/.test(tokens[i])) {
+                // Just a number without preceding symbol - skip
+                i++;
+            } else {
+                entries.push({ symbol: tokens[i].toUpperCase(), qty: defaultQty, avg_price: defaultPrice });
+                i++;
+            }
+        }
+
+        if (entries.length === 0) return;
+
+        pendingEntries = entries;
+        renderPreview(entries);
+        document.getElementById('previewOverlay').style.display = '';
+    }
+
+    function renderPreview(entries) {
+        const tbody = document.getElementById('previewBody');
+        tbody.innerHTML = entries.map((e, idx) => `
+            <tr>
+                <td><strong>${e.symbol}</strong></td>
+                <td><input type="number" step="any" value="${e.qty}" id="pvqty_${idx}" onchange="updatePreviewEntry(${idx},'qty',this.value)"></td>
+                <td><input type="number" step="0.01" value="${e.avg_price || ''}" id="pvpr_${idx}" onchange="updatePreviewEntry(${idx},'avg_price',this.value || null)" placeholder="—"></td>
+                <td>${e.qty && e.avg_price ? '$' + (e.qty * e.avg_price).toFixed(2) : '—'}</td>
+            </tr>
+        `).join('');
+    }
+
+    function updatePreviewEntry(idx, field, value) {
+        if (idx >= 0 && idx < pendingEntries.length) {
+            pendingEntries[idx][field] = value === '' || value === null ? null : parseFloat(value);
+        }
+    }
+
+    function closePreview() {
+        document.getElementById('previewOverlay').style.display = 'none';
+        pendingEntries = [];
+    }
+
+    async function confirmAdd() {
+        if (!currentPortfolioId || pendingEntries.length === 0) return;
+        // Collect final values from inputs
+        pendingEntries.forEach((e, idx) => {
+            const qtyInput = document.getElementById('pvqty_' + idx);
+            const prInput = document.getElementById('pvpr_' + idx);
+            if (qtyInput) e.qty = parseFloat(qtyInput.value) || 0;
+            if (prInput) e.avg_price = prInput.value ? parseFloat(prInput.value) : null;
+        });
+        await fetch(`/api/portfolios/${currentPortfolioId}/symbols`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({entries: pendingEntries})
+        });
+        closePreview();
+        document.getElementById('pfSymbolInput').value = '';
+        document.getElementById('addPanel').style.display = 'none';
+        refreshCurrent();
+    }
+
+    async function createPortfolio() {
+        const name = prompt('Portfolio name:');
+        if (!name) return;
+        await fetch('/api/portfolios', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) });
+        await loadPortfolios();
+        if (portfolios.length > 0) selectPortfolio(portfolios[0].id);
+    }
+
+    async function deletePortfolio(id) {
+        if (!confirm('Delete this portfolio and all its symbols?')) return;
+        await fetch(`/api/portfolios/${id}`, { method: 'DELETE' });
+        if (currentPortfolioId === id) currentPortfolioId = null;
+        await loadPortfolios();
+        if (portfolios.length > 0) selectPortfolio(portfolios[0].id);
+    }
+
+    async function deleteCurrentPortfolio() {
+        if (currentPortfolioId) await deletePortfolio(currentPortfolioId);
+    }
+
+    function refreshCurrent() {
+        if (currentPortfolioId) selectPortfolio(currentPortfolioId);
+    }
+
+    document.getElementById('pfSymbolInput').addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); parseAndPreview(); }
+    });
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    // Add symbol count to sidebar by fetching on load
+    async function enrichSidebar() {
+        for (const p of portfolios) {
+            try {
+                const r = await fetch('/api/portfolios/' + p.id);
+                const d = await r.json();
+                p.sym_count = (d.symbols || []).length;
+            } catch(e) { p.sym_count = 0; }
+        }
+        renderSidebar();
+    }
+
+    loadPortfolios().then(() => { if (portfolios.length > 0) enrichSidebar(); });
+    </script>
+</body>
+</html>
