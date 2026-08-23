@@ -397,6 +397,94 @@ def backfill_all_timeframes(symbols=None, progress_callback=None):
     return done, total * len(TIMEFRAMES)
 
 
+# Hard floor for deep history: API retention ends well before this (probed ~Jan 2024)
+HISTORY_FLOOR_TS = int(time.mktime(time.strptime("2018-01-01", "%Y-%m-%d")))
+BACKFILL_RESOLUTIONS = ("1d", "1w")
+
+
+def _backfill_symbol_history(symbol, resolutions=BACKFILL_RESOLUTIONS):
+    """Extend one symbol's candles BACKWARD past the original days_back cap.
+    Pages older-than-oldest-stored windows until the API returns nothing (its own
+    retention floor). Returns number of new bars inserted."""
+    from dumbmoney.db import get_db
+    conn = get_db("CRYPTO")
+    inserted = 0
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        for res in resolutions:
+            row = conn.execute(
+                "SELECT MIN(date) FROM crypto_bars WHERE symbol=? AND timeframe=?",
+                (symbol, res),
+            ).fetchone()
+            if not row or not row[0]:
+                continue  # no data yet; forward refresh seeds it first
+            oldest = row[0]
+            dt = (datetime.strptime(oldest, "%Y-%m-%d %H:%M:%S")
+                  if " " in oldest else datetime.strptime(oldest, "%Y-%m-%d"))
+            end_ts = int(dt.timestamp()) - 1
+            while end_ts > HISTORY_FLOOR_TS:
+                start_ts = max(HISTORY_FLOOR_TS, end_ts - 365 * 86400)
+                try:
+                    candles = _get("/v2/history/candles", params={
+                        "symbol": symbol, "resolution": res,
+                        "start": start_ts, "end": end_ts, "limit": 4000})
+                except Exception:
+                    break
+                if not candles:
+                    break
+                rows = []
+                for c in candles:
+                    ts = c.get("time", 0)
+                    if res in ("1d", "1w"):
+                        date_str = datetime.fromtimestamp(ts, tz=IST).strftime("%Y-%m-%d")
+                    else:
+                        date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    rows.append((symbol, res, date_str,
+                                 c.get("open"), c.get("high"), c.get("low"),
+                                 c.get("close"), c.get("volume", 0)))
+                conn.executemany(
+                    """INSERT OR REPLACE INTO crypto_bars
+                       (symbol, timeframe, date, open, high, low, close, volume)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+                conn.commit()
+                inserted += len(rows)
+                oldest_time = min(c.get("time", 0) for c in candles)
+                if len(candles) < 4000 or oldest_time <= start_ts + 60:
+                    break  # page not full -> reached the API's floor
+                end_ts = oldest_time - 1
+        return inserted
+    finally:
+        conn.close()
+
+
+def backfill_history(symbols=None, workers=6, progress_callback=None):
+    """Deep-backfill daily+weekly history to the API's floor for every symbol.
+    Threaded (each worker opens its own connection). Returns total bars added."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if symbols is None:
+        symbols = get_all_symbols()
+    if not symbols:
+        return 0
+    total_added = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_backfill_symbol_history, s): s for s in symbols}
+        for f in as_completed(futures):
+            done += 1
+            try:
+                total_added += f.result()
+            except Exception as e:
+                logger.warning(f"history backfill failed for {futures[f]}: {e}")
+            if progress_callback and done % 20 == 0:
+                progress_callback(done / len(symbols) * 100,
+                                  f"{done}/{len(symbols)} symbols (+{total_added} bars)")
+    if progress_callback:
+        progress_callback(100, f"history backfill: +{total_added} bars across {len(symbols)} symbols")
+    return total_added
+
+
 def get_chart_data(symbol, timeframe="1d", limit=500):
     """Return recent OHLC bars for charting."""
     from dumbmoney.db import get_db

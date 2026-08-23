@@ -1546,20 +1546,34 @@ def api_hs_dates():
     market = request.args.get("market", "US")
     conn = get_db(market)
     try:
-        # Recursive "loose index scan": one indexed MAX() seek per distinct date via
-        # idx_bars_tf_date instead of scanning the whole multi-million-row index
-        # (measured 410ms -> 38ms on US, 3.6s -> 26ms on India).
-        rows = conn.execute(
-            """
-            WITH RECURSIVE d(dt) AS (
-              SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day')
-              UNION ALL
-              SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day' AND date < d.dt)
-              FROM d WHERE d.dt IS NOT NULL LIMIT 366
-            )
-            SELECT dt AS date FROM d WHERE dt IS NOT NULL LIMIT 365
-            """
-        ).fetchall()
+        if market == "CRYPTO":
+            # crypto.db keeps candles in crypto_bars (daily timeframe is '1d')
+            rows = conn.execute(
+                """
+                WITH RECURSIVE d(dt) AS (
+                  SELECT (SELECT MAX(date) FROM crypto_bars WHERE timeframe='1d')
+                  UNION ALL
+                  SELECT (SELECT MAX(date) FROM crypto_bars WHERE timeframe='1d' AND date < d.dt)
+                  FROM d WHERE d.dt IS NOT NULL LIMIT 1461
+                )
+                SELECT dt AS date FROM d WHERE d.dt IS NOT NULL LIMIT 1460
+                """
+            ).fetchall()
+        else:
+            # Recursive "loose index scan": one indexed MAX() seek per distinct date via
+            # idx_bars_tf_date instead of scanning the whole multi-million-row index
+            # (measured 410ms -> 38ms on US, 3.6s -> 26ms on India).
+            rows = conn.execute(
+                """
+                WITH RECURSIVE d(dt) AS (
+                  SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day')
+                  UNION ALL
+                  SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day' AND date < d.dt)
+                  FROM d WHERE d.dt IS NOT NULL LIMIT 366
+                )
+                SELECT dt AS date FROM d WHERE d.dt IS NOT NULL LIMIT 365
+                """
+            ).fetchall()
         return jsonify([r["date"] for r in rows])
     finally:
         conn.close()
