@@ -1587,7 +1587,11 @@ def _compute_crypto_stats_batch(batch_args):
             ai_tl = float(ai["ai_trendline_score"].iloc[-1]) if len(ai) > 0 else 0
             ai_sent = float(ai["ai_sentiment_score"].iloc[-1]) if len(ai) > 0 else 0
             ai_conc = str(ai["ai_conclusion"].iloc[-1]) if len(ai) > 0 else "HOLD"
-            ai_mat = float(ai["ai_matrix"].iloc[-1]) if len(ai) > 0 and "ai_matrix" in ai.columns else 0
+            ai_mat = ai["ai_matrix"].iloc[-1] if len(ai) > 0 and "ai_matrix" in ai.columns else 0
+            try:
+                ai_mat = round(float(ai_mat), 2)
+            except (TypeError, ValueError):
+                ai_mat = str(ai_mat)  # composite code e.g. 'T87_V95_M98_S97'
 
             row = {
                 "symbol": sym, "price": float(last_close), "volume": _si(v.iloc[-1]),
@@ -1617,11 +1621,13 @@ def _compute_crypto_stats_batch(batch_args):
                 "ai_volume_score": round(ai_vol, 2), "ai_events_score": round(ai_evt, 2),
                 "ai_volume_profile_score": round(ai_vp, 2), "ai_trendline_score": round(ai_tl, 2),
                 "ai_sentiment_score": round(ai_sent, 2), "ai_conclusion": ai_conc,
-                "ai_matrix": round(ai_mat, 2) if isinstance(ai_mat, float) else ai_mat,
+                "ai_matrix": ai_mat,
             }
             row["confluence"] = _compute_confluence(row)
             results.append(row)
         except Exception:
+            import traceback as _tb
+            _tb.print_exc()
             continue
 
     return results
