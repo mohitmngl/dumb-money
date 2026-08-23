@@ -1394,6 +1394,30 @@ def update_signal_prob_matrix(market="US", progress_callback=None):
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# CRYPTO screener batch computation (mirrors USA vectorized_stats_pass)
+# ---------------------------------------------------------------------------
+
+CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
+    "symbol", "date", "price", "change_pct", "volume",
+    "weighted_alpha", "atrp", "streak", "atr_value", "atr_stop", "atr_signal",
+    "atr_crossed_above", "atr_crossed_below", "atr_streak",
+    "next_day_return", "prob_up_1d", "prob_up_5d", "prob_up_1w", "prob_up_1m",
+    "prob_up_st_cross",
+    "accel_a", "accel_base", "accel_signal", "accel_crossed_up", "accel_crossed_down",
+    "confluence",
+    "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
+    "atr_signal_w", "atr_stop_w", "atr_crossed_above_w", "atr_crossed_below_w", "atr_streak_w",
+    "atr_signal_m", "atr_stop_m", "atr_crossed_above_m", "atr_crossed_below_m", "atr_streak_m",
+    "ai_overall_score", "ai_bias", "ai_tech_score", "ai_momentum_score",
+    "ai_volume_score", "ai_events_score", "ai_volume_profile_score",
+    "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
+]
+
+# crypto-v2: ATR trailing stop multiplier 1.0 -> 2.0 (matches equities)
+CRYPTO_STATS_VERSION = "crypto-v2"
+
+
 def _compute_crypto_stats_batch(batch_args):
     """Worker for ProcessPoolExecutor. Computes all stats for a batch of crypto symbols.
     Each worker opens its own DB connection (WAL allows concurrent readers)."""
