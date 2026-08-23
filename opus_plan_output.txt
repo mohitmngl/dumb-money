@@ -1,0 +1,7 @@
+﻿agy : Error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h31m11s.
+At line:2 char:1
++ agy -p $prompt --model "Claude Opus 4.6 (Thinking)" --dangerously-ski ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Error: Individu...ts in 4h31m11s.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

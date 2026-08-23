@@ -1,0 +1,546 @@
+{% extends "base.html" %}
+{% block title %}Portfolio - {{ market }}{% endblock %}
+{% block content %}
+<style>
+  @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+  .str-card{position:relative;border-radius:16px;border:1px solid var(--border);background:var(--surface-solid);padding:20px;transition:all .3s;animation:fadeUp .5s ease both;cursor:pointer}
+  .str-card:hover{transform:translateY(-3px);box-shadow:0 8px 24px rgba(0,0,0,.12);border-color:var(--brand,#10b981)}
+  .str-card .close-tag{position:absolute;top:12px;right:12px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700}
+  .str-card .close-tag.running{background:rgba(16,185,129,.12);color:#10b981}
+  .str-card .close-tag.closed{background:rgba(239,68,68,.12);color:#ef4444}
+  .str-price{font-size:28px;font-weight:800;letter-spacing:-1px}
+  .str-name{font-size:13px;color:var(--text-muted);margin-top:2px}
+  .str-chg{font-size:14px;font-weight:700;margin-top:4px}
+  .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.65);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+  .modal-overlay.show{display:flex}
+  .modal-box{background:var(--surface-solid);border:1px solid var(--border);border-radius:16px;padding:0;width:560px;max-width:95vw;max-height:90vh;overflow-y:auto;animation:fadeUp .3s ease}
+  .modal-header{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+  .modal-body{padding:24px}
+  .modal-footer{padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+  .field-group{margin-bottom:14px}
+  .field-label{font-size:12px;color:var(--text-muted);margin-bottom:4px;display:block}
+  .field-input{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:14px}
+  .field-input:focus{outline:none;border-color:var(--brand,#10b981)}
+  .btn-primary{background:var(--brand,#10b981);color:#fff;border:none;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer}
+  .btn-primary:hover{opacity:.9}
+  .btn-ghost{background:transparent;color:var(--text-muted);border:1px solid var(--border);padding:8px 16px;border-radius:8px;cursor:pointer;font-size:12px}
+  .btn-ghost:hover{border-color:#666}
+  .pnl-up{color:#10b981}.pnl-down{color:#ef4444}
+  .reorder-btn{width:24px;height:24px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text-muted);cursor:pointer;font-size:12px;display:inline-flex;align-items:center;justify-content:center}
+  .reorder-btn:hover{border-color:var(--brand);color:var(--brand)}
+  .tf-btn{font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text-muted);cursor:pointer;transition:all .15s}
+  .tf-btn:hover{border-color:#666;color:var(--text)}
+  .tf-btn.active{background:var(--brand,#10b981);color:#fff;border-color:var(--brand,#10b981)}
+  .chart-toggle{font-size:11px;padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text-muted);cursor:pointer;transition:all .15s}
+  .chart-toggle.active{background:#3b82f6;color:#fff;border-color:#3b82f6}
+  .section-header{font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-muted);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:16px}
+  .stat-card{padding:12px;border-radius:12px;background:var(--surface-solid);border:1px solid var(--border)}
+  .stat-card .label{font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px}
+  .stat-card .value{font-size:16px;font-weight:700;margin-top:2px}
+  .closed-meta{font-size:11px;color:var(--text-muted);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
+  .closed-meta span{background:rgba(100,100,100,.1);padding:2px 6px;border-radius:4px}
+</style>
+
+<div class="page-header">
+  <div>
+    <h1 id="portName" style="font-size:28px;font-weight:800;letter-spacing:-1px;cursor:pointer" onclick="editPortName()">Portfolio</h1>
+    <div id="portMeta" style="font-size:13px;color:var(--text-muted);margin-top:4px"></div>
+  </div>
+  <div style="display:flex;gap:8px">
+    <a class="btn-ghost" href="/{{ 'india/' if market == 'INDIA' else '' }}portfolio">Back</a>
+    <button class="btn-primary" onclick="openAddString()">+ Add String</button>
+  </div>
+</div>
+
+<div id="statCards" class="stat-grid"></div>
+
+<div style="display:flex;gap:8px;margin-bottom:12px">
+  <button class="chart-toggle active" id="togStockChart" onclick="switchChart('stock')">Stock Chart</button>
+  <button class="chart-toggle" id="togEquityChart" onclick="switchChart('equity')">Equity Curve</button>
+</div>
+
+<div id="stockChartSection" class="card mb-16" style="overflow:hidden;border-radius:16px">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border)">
+    <div style="font-size:12px;font-weight:600;color:var(--text-muted)">Running Strings</div>
+    <div style="width:1px;height:20px;background:var(--border)"></div>
+    <div style="display:flex;gap:4px">
+      <button class="tf-btn active" data-tf="1D" onclick="setTF(this,'stock')">1D</button>
+      <button class="tf-btn" data-tf="1W" onclick="setTF(this,'stock')">1W</button>
+      <button class="tf-btn" data-tf="1M" onclick="setTF(this,'stock')">1M</button>
+    </div>
+    <div style="width:1px;height:20px;background:var(--border)"></div>
+    <button id="togST" class="btn-ghost active" style="font-size:11px" onclick="toggleST()"><span style="color:#10b981">&#9632;</span> ST</button>
+    <button id="togATR" class="btn-ghost active" style="font-size:11px" onclick="toggleATR()"><span style="color:#f59e0b">&#9632;</span> ATR</button>
+    <button id="togVol" class="btn-ghost active" style="font-size:11px" onclick="toggleVol()">Vol</button>
+    <div style="width:1px;height:20px;background:var(--border)"></div>
+    <label style="font-size:11px;color:var(--text-muted)">Period</label>
+    <input id="stPeriod" type="number" min="1" max="50" value="14" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+    <label style="font-size:11px;color:var(--text-muted)">Mult</label>
+    <input id="stMult" type="number" min="0.1" max="5" step="0.1" value="1.0" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+    <button class="btn-ghost" onclick="loadStockChart()" style="font-size:11px">Apply</button>
+    <div style="flex:1"></div>
+    <span style="font-size:11px;color:var(--text-muted)" id="barCount"></span>
+  </div>
+  <div style="position:relative;height:400px">
+    <div id="stockChartBox" style="width:100%;height:100%"></div>
+    <div id="stockTooltip" style="position:absolute;top:8px;left:12px;z-index:20;pointer-events:none;font-size:11px;font-family:monospace;padding:6px 10px;border-radius:6px;background:rgba(0,0,0,.82);color:#fff;display:none;white-space:nowrap"></div>
+  </div>
+</div>
+
+<div id="equityChartSection" class="card mb-16" style="overflow:hidden;border-radius:16px;display:none">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border)">
+    <div style="font-size:12px;font-weight:600;color:var(--text-muted)">Portfolio Equity</div>
+    <div style="width:1px;height:20px;background:var(--border)"></div>
+    <div style="display:flex;gap:4px">
+      <button class="tf-btn active" data-tf="1D" onclick="setTF(this,'equity')">1D</button>
+      <button class="tf-btn" data-tf="1W" onclick="setTF(this,'equity')">1W</button>
+      <button class="tf-btn" data-tf="1M" onclick="setTF(this,'equity')">1M</button>
+    </div>
+    <button id="togEqVol" class="btn-ghost active" style="font-size:11px" onclick="toggleEqVol()">Vol</button>
+    <div style="flex:1"></div>
+    <span style="font-size:11px;color:var(--text-muted)" id="eqBarCount"></span>
+  </div>
+  <div style="position:relative;height:400px">
+    <div id="equityChartBox" style="width:100%;height:100%"></div>
+    <div id="equityTooltip" style="position:absolute;top:8px;left:12px;z-index:20;pointer-events:none;font-size:11px;font-family:monospace;padding:6px 10px;border-radius:6px;background:rgba(0,0,0,.82);color:#fff;display:none;white-space:nowrap"></div>
+  </div>
+</div>
+
+<div class="section-header">Running Strings</div>
+<div id="runningGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:24px"></div>
+
+<div class="section-header" style="margin-top:8px">Closed Strings</div>
+<div id="closedGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:16px"></div>
+
+<div class="modal-overlay" id="addStringModal">
+  <div class="modal-box" style="width:620px">
+    <div class="modal-header"><h3 style="margin:0;font-size:18px">Add String</h3><button class="btn-ghost" onclick="hideModal('addString')" style="padding:4px 8px;font-size:18px">&times;</button></div>
+    <div class="modal-body">
+      <div class="field-group"><label class="field-label">String Name</label><input id="asStringName" class="field-input" placeholder="e.g. FAANG Long"></div>
+      <div class="field-group"><label class="field-label">Symbols (SYMBOL*qty+SYMBOL*qty)</label><input id="asStringRaw" class="field-input" placeholder="AAPL*10+MSFT*15" style="font-family:monospace"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="field-group"><label class="field-label">Entry Date *</label><input id="asStringEntryDate" type="date" class="field-input"></div>
+        <div class="field-group"><label class="field-label">Entry Price (blank=auto)</label><input id="asStringEntryPrice" type="number" step="0.01" class="field-input"></div>
+      </div>
+      <div id="asStringPreview"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="hideModal('addString')">Cancel</button>
+      <button class="btn-ghost" onclick="previewAddString()">Preview</button>
+      <button class="btn-primary" onclick="confirmAddString()">Add</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="editStringModal">
+  <div class="modal-box" style="width:620px">
+    <div class="modal-header"><h3 style="margin:0;font-size:18px">Edit String</h3><button class="btn-ghost" onclick="hideModal('editString')" style="padding:4px 8px;font-size:18px">&times;</button></div>
+    <div class="modal-body">
+      <input id="editStringId" type="hidden">
+      <div class="field-group"><label class="field-label">String Name</label><input id="editStringName" class="field-input"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="field-group"><label class="field-label">Entry Date</label><input id="editStringEntryDate" type="date" class="field-input"></div>
+        <div class="field-group"><label class="field-label">Entry Price</label><input id="editStringEntryPrice" type="number" step="0.01" class="field-input"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="field-group"><label class="field-label">Exit Date</label><input id="editStringExitDate" type="date" class="field-input"></div>
+        <div class="field-group"><label class="field-label">Exit Price</label><input id="editStringExitPrice" type="number" step="0.01" class="field-input"></div>
+      </div>
+      <div class="field-group"><label class="field-label">Status</label><select id="editStringStatus" class="field-input"><option value="running">Running</option><option value="closed">Closed</option></select></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="hideModal('editString')">Cancel</button>
+      <button class="btn-primary" onclick="saveEditString()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="editPortModal">
+  <div class="modal-box" style="width:400px">
+    <div class="modal-header"><h3 style="margin:0;font-size:18px">Rename Portfolio</h3><button class="btn-ghost" onclick="hideModal('editPort')" style="padding:4px 8px;font-size:18px">&times;</button></div>
+    <div class="modal-body">
+      <div class="field-group"><label class="field-label">Name</label><input id="editPortName" class="field-input"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="hideModal('editPort')">Cancel</button>
+      <button class="btn-primary" onclick="savePortName()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="closeStringModal">
+  <div class="modal-box" style="width:400px">
+    <div class="modal-header"><h3 style="margin:0;font-size:18px">Close String</h3><button class="btn-ghost" onclick="hideModal('closeString')" style="padding:4px 8px;font-size:18px">&times;</button></div>
+    <div class="modal-body">
+      <div class="field-group"><label class="field-label">Exit Date</label><input id="closeExitDate" type="date" class="field-input"></div>
+      <div class="field-group"><label class="field-label">Exit Price (total)</label><input id="closeExitPrice" type="number" step="0.01" class="field-input" placeholder="Total exit value"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-ghost" onclick="hideModal('closeString')">Cancel</button>
+      <button class="btn-primary" onclick="confirmClose()">Close String</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const PID={{ pid }};
+const{createChart,CandlestickSeries,LineSeries,HistogramSeries}=LightweightCharts;
+let portData=null,stockChart=null,equityChart=null;
+let showST=true,showATR=true,showVol=true,showEqVol=true;
+let stockTF='1D',equityTF='1D';
+let activeChartType='stock';
+function fmt(n,d){d=d||2;return(n==null||n==='')?'-':Number(n).toFixed(d)}
+function signedPct(n){n=Number(n);if(!Number.isFinite(n))return'-';return(n>=0?'+':'')+n.toFixed(2)+'%'}
+function cur(){return MARKET==='INDIA'?'\u20B9':'$'}
+function showModal(n){document.getElementById(n+'Modal').classList.add('show')}
+function hideModal(n){document.getElementById(n+'Modal').classList.remove('show')}
+
+function switchChart(type){
+  activeChartType=type;
+  document.getElementById('stockChartSection').style.display=type==='stock'?'block':'none';
+  document.getElementById('equityChartSection').style.display=type==='equity'?'block':'none';
+  document.getElementById('togStockChart').classList.toggle('active',type==='stock');
+  document.getElementById('togEquityChart').classList.toggle('active',type==='equity');
+  if(type==='equity') loadEquityChart();
+  else loadStockChart();
+}
+
+function setTF(btn,chartType){
+  const tf=btn.dataset.tf;
+  btn.parentElement.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(chartType==='stock'){stockTF=tf;loadStockChart()}
+  else{equityTF=tf;loadEquityChart()}
+}
+
+function toggleST(){showST=!showST;document.getElementById('togST').classList.toggle('active');loadStockChart()}
+function toggleATR(){showATR=!showATR;document.getElementById('togATR').classList.toggle('active');loadStockChart()}
+function toggleVol(){showVol=!showVol;document.getElementById('togVol').classList.toggle('active');loadStockChart()}
+function toggleEqVol(){showEqVol=!showEqVol;document.getElementById('togEqVol').classList.toggle('active');loadEquityChart()}
+
+function loadPortfolio(){
+  fetch('/api/portfolio/'+PID+'/detail?market='+MARKET).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('portName').textContent='Not found';return}
+    portData=d;
+    document.getElementById('portName').textContent=d.name;
+    const running=d.running_strings||0,closed=d.closed_strings||0;
+    document.getElementById('portMeta').textContent=running+' running, '+closed+' closed | '+cur()+(d.total_value||0).toLocaleString(undefined,{minimumFractionDigits:2});
+
+    const booked=d.booked_profit||0;
+    const unrealised=d.total_unrealised_pnl||0;
+    const totalPnl=d.total_pnl||0;
+    const dayChg=d.change_pct||0;
+    const dayChgAbs=d.day_change||0;
+    const invested=d.total_invested||0;
+    const runningVal=d.running_value||0;
+    const winRate=d.win_rate||0;
+    const sharpe=d.sharpe_ratio||0;
+    const avgRet=d.avg_return_pct||0;
+
+    document.getElementById('statCards').innerHTML=[
+      ['Total Value',cur()+(d.total_value||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}),''],
+      ['Running Value',cur()+runningVal.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}),''],
+      ['Booked Profit',(booked>=0?'+':'')+cur()+Math.abs(booked).toFixed(2),booked>=0?'pnl-up':'pnl-down'],
+      ['Unrealised P&L',(unrealised>=0?'+':'')+cur()+Math.abs(unrealised).toFixed(2),unrealised>=0?'pnl-up':'pnl-down'],
+      ['Total P&L',(totalPnl>=0?'+':'')+cur()+Math.abs(totalPnl).toFixed(2),totalPnl>=0?'pnl-up':'pnl-down'],
+      ['Today',signedPct(dayChg)+' ('+(dayChgAbs>=0?'+':'')+cur()+Math.abs(dayChgAbs).toFixed(2)+')',dayChg>=0?'pnl-up':'pnl-down'],
+      ['Invested',cur()+invested.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}),''],
+      ['Win Rate',winRate.toFixed(1)+'%',''],
+      ['Sharpe',sharpe.toFixed(2),''],
+      ['Avg Return',signedPct(avgRet),''],
+    ].map(c=>'<div class="stat-card"><div class="label">'+c[0]+'</div><div class="value '+c[2]+'">'+c[1]+'</div></div>').join('');
+
+    renderStrings(d.strings||[]);
+  });
+}
+
+function daysBetween(d1,d2){
+  if(!d1||!d2)return'-';
+  const a=new Date(d1),b=new Date(d2);
+  const diff=Math.round((b-a)/(1000*60*60*24));
+  if(diff<0)return'-';
+  if(diff<30)return diff+'d';
+  if(diff<365)return (diff/30).toFixed(1)+'mo';
+  return (diff/365).toFixed(1)+'y';
+}
+
+function renderStrings(strings){
+  const running=strings.filter(s=>s.status!=='closed');
+  const closed=strings.filter(s=>s.status==='closed');
+
+  const rg=document.getElementById('runningGrid');
+  if(!running.length){rg.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-muted)">No running strings</div>'}
+  else{
+    let html='';
+    running.forEach((s,i)=>{
+      const pnl=(s.realised_pnl||0)+(s.unrealised_pnl||0);
+      const pc=pnl>=0?'pnl-up':'pnl-down';
+      html+=`<div class="str-card" style="animation-delay:${i*0.06}s" onclick="window.location.href='/${MARKET==='INDIA'?'india/':''}portfolio/${PID}/string/${s.id}'">
+        <span class="close-tag running">running</span>
+        <div style="display:flex;gap:4px;margin-bottom:8px">
+          <button class="reorder-btn" onclick="event.stopPropagation();moveString(${s.id},-1)" title="Move up">&uarr;</button>
+          <button class="reorder-btn" onclick="event.stopPropagation();moveString(${s.id},1)" title="Move down">&darr;</button>
+        </div>
+        <div class="str-name">${s.name||'String #'+s.id}</div>
+        <div class="str-price ${pc}">${s.current_value!=null?cur()+Number(s.current_value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}):s.entry_price?cur()+Number(s.entry_price).toFixed(2):'-'}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${s.entry_date||'-'} &middot; ${s.num_stocks||0} stocks &middot; P(Up) ${(s.prob_1up||0).toFixed(0)}%</div>
+        <div style="display:flex;gap:12px;margin-top:4px">
+          <div class="str-chg ${pc}">${signedPct(s.pnl_pct||0)} &middot; ${pnl>=0?'+':''}${cur()}${Math.abs(pnl).toFixed(2)}</div>
+          <div class="str-chg ${(s.change_pct||0)>=0?'pnl-up':'pnl-down'}" style="font-size:12px">Day ${signedPct(s.change_pct||0)}</div>
+        </div>
+        <div style="display:flex;gap:4px;margin-top:8px">
+          <button class="btn-ghost" style="font-size:11px;padding:4px 8px" onclick="event.stopPropagation();editString(${s.id})">Edit</button>
+          <button class="btn-ghost" style="font-size:11px;padding:4px 8px;color:#ef4444" onclick="event.stopPropagation();closeString(${s.id})">Close</button>
+        </div>
+      </div>`;
+    });
+    rg.innerHTML=html;
+  }
+
+  const cg=document.getElementById('closedGrid');
+  if(!closed.length){cg.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:20px;color:var(--text-muted)">No closed strings</div>'}
+  else{
+    let html='';
+    closed.forEach((s,i)=>{
+      const pnl=(s.realised_pnl||0);
+      const pc=pnl>=0?'pnl-up':'pnl-down';
+      const retPct=s.pnl_pct||0;
+      html+=`<div class="str-card" style="animation-delay:${i*0.06}s;opacity:.85" onclick="window.location.href='/${MARKET==='INDIA'?'india/':''}portfolio/${PID}/string/${s.id}'">
+        <span class="close-tag closed">closed</span>
+        <div class="str-name">${s.name||'String #'+s.id}</div>
+        <div class="str-price ${pc}">${pnl>=0?'+':''}${cur()}${Math.abs(pnl).toFixed(2)} <span style="font-size:14px;font-weight:600">(${signedPct(retPct)})</span></div>
+        <div class="closed-meta">
+          <span>Entry: ${s.entry_date||'-'}</span>
+          <span>Exit: ${s.exit_date||'-'}</span>
+          <span>Held: ${daysBetween(s.entry_date,s.exit_date)}</span>
+          <span>In: ${cur()}${Number(s.entry_price||0).toFixed(2)}</span>
+          <span>Out: ${cur()}${Number(s.exit_price||0).toFixed(2)}</span>
+        </div>
+        <div style="display:flex;gap:4px;margin-top:8px">
+          <button class="btn-ghost" style="font-size:11px;padding:4px 8px" onclick="event.stopPropagation();editString(${s.id})">Edit</button>
+        </div>
+      </div>`;
+    });
+    cg.innerHTML=html;
+  }
+}
+
+function moveString(psid,dir){
+  const strings=portData?portData.strings:[];
+  const idx=strings.findIndex(s=>s.id===psid);
+  if(idx<0)return;
+  const newIdx=idx+dir;
+  if(newIdx<0||newIdx>=strings.length)return;
+  [strings[idx],strings[newIdx]]=[strings[newIdx],strings[idx]];
+  renderStrings(strings);
+  const order=strings.map(s=>s.id);
+  fetch('/api/portfolio/'+PID+'/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET,order})});
+}
+
+function editPortName(){
+  document.getElementById('editPortName').value=portData?portData.name:'';
+  showModal('editPort');
+}
+function savePortName(){
+  const name=document.getElementById('editPortName').value.trim();
+  if(!name)return;
+  fetch('/api/portfolio/'+PID+'/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET,name})})
+  .then(()=>{hideModal('editPort');loadPortfolio()});
+}
+
+function openAddString(){
+  document.getElementById('asStringName').value='';
+  document.getElementById('asStringRaw').value='';
+  document.getElementById('asStringEntryDate').value=new Date().toISOString().slice(0,10);
+  document.getElementById('asStringEntryPrice').value='';
+  document.getElementById('asStringPreview').innerHTML='';
+  showModal('addString');
+}
+
+let addSyms=[];
+function previewAddString(){
+  const raw=document.getElementById('asStringRaw').value;
+  if(!raw.trim())return;
+  fetch('/api/portfolio/string/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET,symbols:raw})})
+  .then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('asStringPreview').innerHTML='<span style="color:#ef4444">'+d.error+'</span>';return}
+    addSyms=d.symbols;
+    let h='<table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:8px"><tr style="color:var(--text-muted)"><th style="text-align:left">Symbol</th><th style="text-align:right">Price</th><th style="text-align:right">Qty</th><th style="text-align:right">Value</th></tr>';
+    d.symbols.forEach(s=>{h+='<tr><td style="font-weight:600">'+s.symbol+'</td><td style="text-align:right">'+cur()+s.price.toFixed(2)+'</td><td style="text-align:right">'+s.qty+'</td><td style="text-align:right">'+cur()+(s.price*s.qty).toFixed(2)+'</td></tr>'});
+    h+='<tr style="font-weight:700;border-top:1px solid var(--border)"><td>Total</td><td></td><td></td><td style="text-align:right">'+cur()+d.total_value.toFixed(2)+'</td></tr></table>';
+    document.getElementById('asStringPreview').innerHTML=h;
+  });
+}
+function confirmAddString(){
+  if(!addSyms.length){previewAddString();return}
+  const ed=document.getElementById('asStringEntryDate').value;
+  if(!ed){alert('Entry date required');return}
+  const ep=document.getElementById('asStringEntryPrice').value;
+  const price=ep?Number(ep):addSyms.reduce((a,s)=>a+s.price*s.qty,0);
+  fetch('/api/portfolio/string/add',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({market:MARKET,portfolio_id:PID,name:document.getElementById('asStringName').value.trim(),entry_date:ed,entry_price:price,fractional:0,symbols:addSyms})
+  }).then(r=>r.json()).then(d=>{if(d.ok){hideModal('addString');addSyms=[];loadPortfolio();loadStockChart()}});
+}
+
+function editString(psid){
+  fetch('/api/portfolio/string/'+psid+'/detail?market='+MARKET).then(r=>r.json()).then(d=>{
+    document.getElementById('editStringId').value=psid;
+    document.getElementById('editStringName').value=d.name||'';
+    document.getElementById('editStringEntryDate').value=d.entry_date||'';
+    document.getElementById('editStringEntryPrice').value=d.entry_price||'';
+    document.getElementById('editStringExitDate').value=d.exit_date||'';
+    document.getElementById('editStringExitPrice').value=d.exit_price||'';
+    document.getElementById('editStringStatus').value=d.status||'running';
+    showModal('editString');
+  });
+}
+function saveEditString(){
+  const psid=Number(document.getElementById('editStringId').value);
+  fetch('/api/portfolio/string/edit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({market:MARKET,portfolio_string_id:psid,name:document.getElementById('editStringName').value,entry_date:document.getElementById('editStringEntryDate').value||null,entry_price:document.getElementById('editStringEntryPrice').value?Number(document.getElementById('editStringEntryPrice').value):null,exit_date:document.getElementById('editStringExitDate').value||null,exit_price:document.getElementById('editStringExitPrice').value?Number(document.getElementById('editStringExitPrice').value):null,status:document.getElementById('editStringStatus').value})
+  }).then(()=>{hideModal('editString');loadPortfolio()});
+}
+
+function closeString(psid){
+  closeStringId=psid;
+  document.getElementById('closeExitPrice').value='';
+  document.getElementById('closeExitDate').value=new Date().toISOString().slice(0,10);
+  showModal('closeString');
+}
+let closeStringId=0;
+function confirmClose(){
+  const xp=document.getElementById('closeExitPrice').value;
+  if(!xp){alert('Exit price required');return}
+  fetch('/api/portfolio/string/close',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({market:MARKET,portfolio_string_id:closeStringId,exit_date:document.getElementById('closeExitDate').value,exit_price:Number(xp)})
+  }).then(()=>{hideModal('closeString');loadPortfolio()});
+}
+
+function loadStockChart(){
+  const stP=document.getElementById('stPeriod').value||14;
+  const stM=document.getElementById('stMult').value||1.0;
+  const box=document.getElementById('stockChartBox');
+  box.innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading chart...</div>';
+  Promise.all([
+    fetch('/api/portfolio/'+PID+'/ohlc?market='+MARKET+'&limit=500&timeframe='+stockTF).then(r=>r.json()),
+    fetch('/api/portfolio/'+PID+'/supertrend?market='+MARKET+'&period='+stP+'&multiplier='+stM+'&timeframe='+stockTF).then(r=>r.json()),
+  ]).then(([ohlc,stData])=>{
+    box.innerHTML='';
+    document.getElementById('barCount').textContent=(ohlc?ohlc.length:0)+' bars';
+    renderStockChart(ohlc,stData);
+  }).catch(err=>{console.error('CHART ERR:',err);box.innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">No data</div>'});
+}
+
+function getTC(){const d=document.documentElement.getAttribute('data-theme')==='dark';return{bg:d?'#131722':'#ffffff',txt:d?'#d1d4dc':'#333',grid:d?'rgba(42,46,57,.6)':'rgba(0,0,0,.06)'}}
+
+function renderStockChart(ohlc,stData){
+  if(!ohlc||!ohlc.length){document.getElementById('stockChartBox').innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">No data</div>';return}
+  if(stockChart){stockChart.remove();stockChart=null}
+  const tc=getTC(),box=document.getElementById('stockChartBox'),tip=document.getElementById('stockTooltip');
+  stockChart=createChart(box,{width:box.clientWidth,height:400,autoSize:true,layout:{background:{type:'solid',color:tc.bg},textStyle:{color:tc.txt,fontFamily:'system-ui'}},grid:{vertLines:{color:tc.grid},horzLines:{color:tc.grid}},crosshair:{mode:0},rightPriceScale:{borderVisible:false,autoScale:true,scaleMargins:{top:.08,bottom:.18}},timeScale:{timeVisible:false,secondsVisible:false,borderVisible:false}});
+  const cs=stockChart.addSeries(CandlestickSeries,{upColor:'#10b981',downColor:'#ef4444',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#ef4444'});
+  cs.setData(ohlc.map(d=>({time:d.time,open:d.open,high:d.high,low:d.low,close:d.close})));
+  const vs=stockChart.addSeries(HistogramSeries,{priceFormat:{type:'volume'},priceScaleId:'vol'});
+  stockChart.priceScale('vol').applyOptions({scaleMargins:{top:.85,bottom:0}});
+  vs.setData(ohlc.map(d=>({time:d.time,value:d.volume||0,color:d.close>=d.open?'rgba(16,185,129,.3)':'rgba(239,68,68,.3)'})));
+
+  const stDaily=stData.daily||stData||[];
+  const stWeekly=stData.weekly||[];
+  const stMonthly=stData.monthly||[];
+
+  function drawSTLines(stArr){
+    if(!stArr||!stArr.length)return;
+    const od={};ohlc.forEach(d=>od[d.time]=1);
+    const sf=stArr.filter(d=>d.value!=null&&od[d.time]);
+    if(!sf.length)return;
+    let segs=[],cur=[sf[0]];
+    for(let i=1;i<sf.length;i++){
+      if(sf[i].signal!==cur[cur.length-1].signal){segs.push(cur);cur=[cur[cur.length-1],sf[i]]}
+      else cur.push(sf[i]);
+    }
+    if(cur.length)segs.push(cur);
+    segs.forEach(seg=>{
+      const color=seg[0].signal===1?'#10b981':'#ef4444';
+      const ls=stockChart.addSeries(LineSeries,{color:color,lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+      ls.setData(seg.map(d=>({time:d.time,value:d.value})));
+    });
+  }
+
+  function drawATRLine(stArr){
+    if(!stArr||!stArr.length)return;
+    const od={};ohlc.forEach(d=>od[d.time]=1);
+    const valid=stArr.filter(d=>d.atr_value!=null&&od[d.time]);
+    if(!valid.length)return;
+    const ls=stockChart.addSeries(LineSeries,{color:'#f59e0b',lineWidth:1,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,lineStyle:2});
+    ls.setData(valid.map(d=>({time:d.time,value:d.close!=null?d.close-d.atr_value:null})));
+  }
+
+  if(showST){
+    if(stockTF==='1D') drawSTLines(stDaily);
+    else if(stockTF==='1W') drawSTLines(stWeekly);
+    else if(stockTF==='1M') drawSTLines(stMonthly);
+  }
+
+  if(showATR){
+    const activeST=stockTF==='1D'?stDaily:stockTF==='1W'?stWeekly:stMonthly;
+    drawATRLine(activeST);
+  }
+
+  const li=Math.max(0,ohlc.length-60);
+  setTimeout(()=>{try{stockChart.timeScale().setVisibleLogicalRange({from:li,to:ohlc.length-1})}catch(e){}},200);
+  const om={};ohlc.forEach((d,i)=>om[d.time]=ohlc[i]);
+  const activeST=stockTF==='1D'?stDaily:stockTF==='1W'?stWeekly:stMonthly;
+  const sm={};if(activeST)activeST.forEach(d=>sm[d.time]=d);
+  stockChart.subscribeCrosshairMove(p=>{
+    if(!p||!p.time){tip.style.display='none';return}
+    const b=om[p.time];if(!b){tip.style.display='none';return}
+    const i=ohlc.indexOf(b);
+    const chg=i>0?((b.close/ohlc[i-1].close-1)*100):0;
+    const si=sm[b.time];
+    const sl=si&&si.value!=null?' | ST: '+si.value.toFixed(2):'';
+    const atr=si&&si.atr_value!=null?' | ATR: '+si.atr_value.toFixed(2):'';
+    const c=b.close>=b.open?'#10b981':'#ef4444';
+    tip.innerHTML=`<span style="color:${c};font-weight:700">${b.time}</span> O:${b.open.toFixed(2)} H:${b.high.toFixed(2)} L:${b.low.toFixed(2)} C:<b>${b.close.toFixed(2)}</b> ${chg>=0?'+':''}${chg.toFixed(2)}%${sl}${atr}`;
+    tip.style.display='block';
+  });
+  if(!showVol)vs.applyOptions({visible:false});
+}
+
+function loadEquityChart(){
+  const box=document.getElementById('equityChartBox');
+  box.innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading equity curve...</div>';
+  fetch('/api/portfolio/'+PID+'/equity_ohlc?market='+MARKET+'&limit=1000&timeframe='+equityTF).then(r=>r.json()).then(ohlc=>{
+    box.innerHTML='';
+    document.getElementById('eqBarCount').textContent=(ohlc?ohlc.length:0)+' bars';
+    renderEquityChart(ohlc);
+  }).catch(err=>{console.error('EQUITY ERR:',err);box.innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">No data</div>'});
+}
+
+function renderEquityChart(ohlc){
+  if(!ohlc||!ohlc.length){document.getElementById('equityChartBox').innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">No equity data yet. Close a string to see the equity curve.</div>';return}
+  if(equityChart){equityChart.remove();equityChart=null}
+  const tc=getTC(),box=document.getElementById('equityChartBox'),tip=document.getElementById('equityTooltip');
+  equityChart=createChart(box,{width:box.clientWidth,height:400,autoSize:true,layout:{background:{type:'solid',color:tc.bg},textStyle:{color:tc.txt,fontFamily:'system-ui'}},grid:{vertLines:{color:tc.grid},horzLines:{color:tc.grid}},crosshair:{mode:0},rightPriceScale:{borderVisible:false,autoScale:true,scaleMargins:{top:.08,bottom:.08}},timeScale:{timeVisible:false,secondsVisible:false,borderVisible:false}});
+  const cs=equityChart.addSeries(CandlestickSeries,{upColor:'#10b981',downColor:'#ef4444',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#ef4444'});
+  cs.setData(ohlc.map(d=>({time:d.time,open:d.open,high:d.high,low:d.low,close:d.close})));
+  const li=Math.max(0,ohlc.length-60);
+  setTimeout(()=>{try{equityChart.timeScale().setVisibleLogicalRange({from:li,to:ohlc.length-1})}catch(e){}},200);
+  const om={};ohlc.forEach((d,i)=>om[d.time]=ohlc[i]);
+  equityChart.subscribeCrosshairMove(p=>{
+    if(!p||!p.time){tip.style.display='none';return}
+    const b=om[p.time];if(!b){tip.style.display='none';return}
+    const i=ohlc.indexOf(b);
+    const chg=i>0?((b.close/ohlc[i-1].close-1)*100):0;
+    const c=b.close>=b.open?'#10b981':'#ef4444';
+    tip.innerHTML=`<span style="color:${c};font-weight:700">${b.time}</span> O:${b.open.toFixed(2)} H:${b.high.toFixed(2)} L:${b.low.toFixed(2)} C:<b>${b.close.toFixed(2)}</b> ${chg>=0?'+':''}${chg.toFixed(2)}%`;
+    tip.style.display='block';
+  });
+}
+
+document.querySelectorAll('.modal-overlay').forEach(m=>{m.addEventListener('click',function(e){if(e.target===this)this.classList.remove('show')})});
+loadPortfolio();loadStockChart();
+</script>
+{% endblock %}

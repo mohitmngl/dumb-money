@@ -1,0 +1,362 @@
+{% extends "base.html" %}
+{% block title %}Intraday Agent Backtester{% endblock %}
+
+{% block content %}
+<style>
+.backtest-container { padding: 16px; max-width: 1400px; margin: 0 auto; }
+.bt-card { background: var(--surface-solid); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+.bt-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.bt-field { display: flex; flex-direction: column; gap: 4px; }
+.bt-field label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.bt-field select, .bt-field input { background: var(--surface-solid); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: var(--radius); font-size: 13px; min-width: 120px; }
+.bt-field input[type=number] { width: 100px; }
+.bt-btn { background: var(--brand); color: #fff; border: none; padding: 10px 20px; border-radius: var(--radius); font-weight: 600; cursor: pointer; font-size: 13px; }
+.bt-btn:hover { background: var(--brand-strong); }
+.bt-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.bt-progress { margin: 12px 0; }
+.bt-progress-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.bt-progress-fill { height: 100%; background: var(--brand); transition: width 0.3s; border-radius: 3px; }
+.bt-progress-text { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.bt-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.bt-metric { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 12px; }
+.bt-metric-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.bt-metric-value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+.bt-metric-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.bt-positive { color: var(--up); }
+.bt-negative { color: var(--down); }
+.bt-section-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; color: var(--text-muted); }
+.bt-chart-container { width: 100%; height: 350px; position: relative; }
+.bt-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.bt-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid var(--border); color: var(--text-muted); font-weight: 600; background: var(--surface-solid); }
+.bt-table td { padding: 6px 8px; border-bottom: 1px solid var(--glass-border); }
+.bt-tabs { display: flex; gap: 0; margin-bottom: 12px; border-bottom: 2px solid var(--border); }
+.bt-tab { padding: 8px 16px; cursor: pointer; font-size: 12px; color: var(--text-muted); border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; font-weight: 500; }
+.bt-tab:hover { color: var(--text); }
+.bt-tab.active { color: var(--brand-strong); border-bottom-color: var(--brand); }
+.bt-comparison { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px; }
+.bt-comparison-card { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--radius); padding: 10px; text-align: center; }
+.bt-comparison-card h4 { font-size: 11px; color: var(--text-muted); margin: 0 0 6px 0; }
+</style>
+
+<div class="backtest-container">
+  <div class="page-header">
+    <h1>Intraday Agent Backtester</h1>
+  </div>
+  <p style="color:var(--text-muted);font-size:12px;margin:0 0 16px 0">Accel Peak Signal + Weighted Alpha. <a href="https://github.com/namevinu/intraday-agent" target="_blank" style="color:var(--brand-strong)">Docs</a></p>
+
+  <!-- Parameters -->
+  <div class="bt-card">
+    <div class="bt-section-title">Parameters</div>
+    <div class="bt-row">
+      <div class="bt-field">
+        <label>Timeframe</label>
+        <select id="btTimeframe">
+          <option value="1Min">1 Minute</option>
+          <option value="5Min">5 Minutes</option>
+          <option value="15Min" selected>15 Minutes</option>
+          <option value="30Min">30 Minutes</option>
+          <option value="1Hour">1 Hour</option>
+          <option value="1Day">Daily</option>
+        </select>
+      </div>
+      <div class="bt-field">
+        <label>Batches</label>
+        <input type="number" id="btBatches" value="100000" min="1000" max="1000000" step="1000">
+      </div>
+      <div class="bt-field">
+        <label>Capital ($)</label>
+        <input type="number" id="btCapital" value="10000" min="1000" step="1000">
+      </div>
+      <div class="bt-field">
+        <label>Margin</label>
+        <select id="btMargin">
+          <option value="1">1x (No margin)</option>
+          <option value="4">4x Margin</option>
+        </select>
+      </div>
+      <div class="bt-field">
+        <label>Charges</label>
+        <select id="btCharges">
+          <option value="0">No charges</option>
+          <option value="1">US govt fees only</option>
+        </select>
+      </div>
+      <div class="bt-field">
+        <label>Days Back</label>
+        <input type="number" id="btDaysBack" value="3650" min="30" max="3650" step="10">
+      </div>
+      <button class="bt-btn" id="btRunBtn" onclick="startBacktest()">Run Backtest</button>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div class="bt-card" id="btProgressCard" style="display:none">
+    <div class="bt-progress">
+      <div class="bt-progress-bar"><div class="bt-progress-fill" id="btProgressFill" style="width:0%"></div></div>
+      <div class="bt-progress-text" id="btProgressText">Starting...</div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div id="btResults" style="display:none">
+    <div class="bt-card">
+      <div class="bt-section-title">Performance Summary</div>
+      <div class="bt-metrics" id="btKeyMetrics"></div>
+    </div>
+
+    <div class="bt-card">
+      <div class="bt-tabs">
+        <div class="bt-tab active" onclick="showTab('equity')">Equity Curve</div>
+        <div class="bt-tab" onclick="showTab('candles')">Per-Candle Returns</div>
+        <div class="bt-tab" onclick="showTab('daily')">Daily Returns</div>
+        <div class="bt-tab" onclick="showTab('comparison')">4 Scenarios</div>
+        <div class="bt-tab" onclick="showTab('trades')">Trade Log</div>
+      </div>
+      <div id="btTabEquity"><div class="bt-chart-container"><canvas id="btEquityChart"></canvas></div></div>
+      <div id="btTabCandles" style="display:none"><div class="bt-chart-container"><canvas id="btCandleChart"></canvas></div></div>
+      <div id="btTabDaily" style="display:none"><div class="bt-chart-container"><canvas id="btDailyChart"></canvas></div></div>
+      <div id="btTabComparison" style="display:none"><div id="btComparisonGrid"></div></div>
+      <div id="btTabTrades" style="display:none">
+        <table class="bt-table">
+          <thead><tr><th>Timestamp</th><th>PnL ($)</th><th>Equity ($)</th><th>Signals</th><th>Eligible</th></tr></thead>
+          <tbody id="btTradeBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="bt-card">
+      <div class="bt-section-title">Detailed Metrics</div>
+      <div id="btFullMetrics"></div>
+    </div>
+  </div>
+
+  <!-- Saved Results -->
+  <div class="bt-card" id="btSavedCard">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div class="bt-section-title" style="margin:0">Saved Backtest Results</div>
+      <button class="bt-btn" style="font-size:11px;padding:6px 12px" onclick="loadSavedResults()">Refresh</button>
+    </div>
+    <div id="btSavedResults"><div style="color:var(--text-muted);font-size:12px">Loading...</div></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+let equityChart = null, candleChart = null, dailyChart = null, btPollTimer = null;
+
+function showTab(name) {
+  document.querySelectorAll('.bt-tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  ['equity','candles','daily','comparison','trades'].forEach(n => {
+    const el = document.getElementById('btTab' + n.charAt(0).toUpperCase() + n.slice(1));
+    if (el) el.style.display = n === name ? 'block' : 'none';
+  });
+}
+
+function flattenResult(data) {
+  if (data.basic || data.returns || data.risk || data.distribution) return data;
+  if (data.metrics && typeof data.metrics === 'object') return Object.assign({}, data, data.metrics);
+  return data;
+}
+
+function startBacktest() {
+  const params = {
+    timeframe: document.getElementById('btTimeframe').value,
+    n_batches: parseInt(document.getElementById('btBatches').value),
+    capital: parseFloat(document.getElementById('btCapital').value),
+    margin: parseInt(document.getElementById('btMargin').value),
+    charges: document.getElementById('btCharges').value === '1',
+    days_back: parseInt(document.getElementById('btDaysBack').value),
+  };
+
+  document.getElementById('btRunBtn').disabled = true;
+  document.getElementById('btProgressCard').style.display = 'block';
+  document.getElementById('btResults').style.display = 'none';
+  document.getElementById('btProgressFill').style.width = '0%';
+  document.getElementById('btProgressText').textContent = 'Starting...';
+
+  fetch('/api/intraday-backtest/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(params),
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.error) { document.getElementById('btRunBtn').disabled = false; document.getElementById('btProgressCard').style.display = 'none'; alert(d.error); return; }
+    pollBacktest();
+  })
+  .catch(() => { document.getElementById('btRunBtn').disabled = false; document.getElementById('btProgressCard').style.display = 'none'; });
+}
+
+function pollBacktest() {
+  if (btPollTimer) clearInterval(btPollTimer);
+  btPollTimer = setInterval(() => {
+    fetch('/api/intraday-backtest/progress').then(r => r.json()).then(d => {
+      const pct = Math.round((d.progress || 0) * 100);
+      document.getElementById('btProgressFill').style.width = pct + '%';
+      document.getElementById('btProgressText').textContent = d.status || 'Running...';
+
+      if (d.status === 'complete' || pct >= 100) {
+        clearInterval(btPollTimer); btPollTimer = null;
+        document.getElementById('btRunBtn').disabled = false;
+        if (d.result) renderResults(flattenResult(d.result));
+      } else if (d.status && d.status.startsWith('error:')) {
+        clearInterval(btPollTimer); btPollTimer = null;
+        document.getElementById('btRunBtn').disabled = false;
+        document.getElementById('btProgressText').textContent = d.status;
+      }
+    }).catch(() => {});
+  }, 2000);
+}
+
+function renderResults(data) {
+  document.getElementById('btResults').style.display = 'block';
+  document.getElementById('btProgressCard').style.display = 'none';
+
+  const b = data.basic || {}, r = data.returns || {}, ri = data.risk || {}, di = data.distribution || {};
+
+  document.getElementById('btKeyMetrics').innerHTML = `
+    <div class="bt-metric"><div class="bt-metric-label">Total Return</div><div class="bt-metric-value ${(b.total_return||0)>=0?'bt-positive':'bt-negative'}">${b.total_return_pct||'0%'}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Final Equity</div><div class="bt-metric-value">$${(b.final_equity||10000).toLocaleString()}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Sharpe</div><div class="bt-metric-value">${ri.sharpe_ratio||0}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Sortino</div><div class="bt-metric-value">${ri.sortino_ratio||0}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Max Drawdown</div><div class="bt-metric-value bt-negative">${ri.max_drawdown_pct||'0%'}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Win Rate</div><div class="bt-metric-value">${di.win_rate_pct||'0%'}</div><div class="bt-metric-sub">${di.total_trades||0} trades</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Profit Factor</div><div class="bt-metric-value">${di.profit_factor||0}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Avg/Candle</div><div class="bt-metric-value">${r.avg_candle_return_pct||'0%'}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">CAGR</div><div class="bt-metric-value">${b.cagr_pct||'0%'}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Volatility</div><div class="bt-metric-value">${ri.annual_volatility_pct||'0%'}</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Candles</div><div class="bt-metric-value">${b.candles_processed||0}</div><div class="bt-metric-sub">${b.trading_days||0} days</div></div>
+    <div class="bt-metric"><div class="bt-metric-label">Best Candle</div><div class="bt-metric-value bt-positive">${di.best_candle_pct||'0%'}</div></div>`;
+
+  renderEquityChart(data); renderCandleChart(data); renderDailyChart(data);
+  renderComparison(data); renderTradeLog(data); renderFullMetrics(data);
+}
+
+function renderEquityChart(data) {
+  const ctx = document.getElementById('btEquityChart').getContext('2d');
+  if (equityChart) equityChart.destroy();
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: (data.equity_timestamps||[]).map(t=>t.substring(0,16).replace('T',' ')), datasets: [{ data: data.equity_values||[], borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', fill: true, tension: 0.1, pointRadius: 0, borderWidth: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { ticks: { maxTicksLimit: 10, color: '#5b6b62', font: { size: 10 } }, grid: { color: 'rgba(221,229,224,0.5)' } },
+        y: { ticks: { color: '#5b6b62', callback: v => '$'+v.toLocaleString() }, grid: { color: 'rgba(221,229,224,0.5)' } } } }
+  });
+}
+
+function renderCandleChart(data) {
+  const ctx = document.getElementById('btCandleChart').getContext('2d');
+  if (candleChart) candleChart.destroy();
+  const rets = (data.per_candle_returns||[]).slice(-500);
+  candleChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: rets.map((_,i)=>i+1), datasets: [{ data: rets, backgroundColor: rets.map(r=>r>=0?'rgba(16,185,129,0.6)':'rgba(239,68,68,0.6)'), borderRadius: 1 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { display: false }, y: { ticks: { color: '#5b6b62', callback: v=>v+'%' }, grid: { color: 'rgba(221,229,224,0.5)' } } } }
+  });
+}
+
+function renderDailyChart(data) {
+  const ctx = document.getElementById('btDailyChart').getContext('2d');
+  if (dailyChart) dailyChart.destroy();
+  dailyChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: (data.daily_returns||[]).map((_,i)=>'Day '+(i+1)), datasets: [{ data: data.daily_returns||[], backgroundColor: (data.daily_returns||[]).map(r=>r>=0?'rgba(16,185,129,0.6)':'rgba(239,68,68,0.6)'), borderRadius: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: '#5b6b62', font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: '#5b6b62', callback: v=>v+'%' }, grid: { color: 'rgba(221,229,224,0.5)' } } } }
+  });
+}
+
+function renderComparison(data) {
+  const b=data.basic||{}, ri=data.risk||{}, di=data.distribution||{}, tf=data.timeframe||{};
+  const margin=tf.margin||1, charges=tf.charges||false;
+  const scenarios = [
+    { title: 'No Margin, No Fees', m: 1, c: false, color: '#10b981' },
+    { title: 'No Margin + Fees', m: 1, c: true, color: '#f59e0b' },
+    { title: '4x Margin, No Fees', m: 4, c: false, color: '#3b82f6' },
+    { title: '4x Margin + Fees', m: 4, c: true, color: '#8b5cf6' },
+  ];
+  let html = '<div class="bt-comparison">';
+  scenarios.forEach(s => {
+    const cur = margin===s.m && charges===s.c;
+    html += `<div class="bt-comparison-card" style="border-color:${s.color}${cur?'':'33'}"><h4 style="color:${s.color}">${s.title}${cur?' (this)':''}</h4><div style="font-size:20px;font-weight:700;color:${s.color}">${b.total_return_pct||'0%'}</div><div style="font-size:11px;color:var(--text-muted)">Return</div><div style="font-size:14px;margin-top:4px">Sharpe: ${ri.sharpe_ratio||0}</div><div style="font-size:11px;color:var(--text-muted)">Win: ${di.win_rate_pct||'0%'} | DD: ${ri.max_drawdown_pct||'0%'}</div></div>`;
+  });
+  document.getElementById('btComparisonGrid').innerHTML = html+'</div>';
+}
+
+function renderTradeLog(data) {
+  document.getElementById('btTradeBody').innerHTML = (data.equity_curve||[]).slice(-50).map(e =>
+    `<tr><td>${(e.timestamp||'').substring(0,19).replace('T',' ')}</td><td class="${(e.pnl||0)>=0?'bt-positive':'bt-negative'}">$${(e.pnl||0).toFixed(2)}</td><td>$${(e.equity||0).toFixed(2)}</td><td>${e.n_signals||'-'}</td><td>${e.n_eligible||'-'}</td></tr>`
+  ).join('');
+}
+
+function renderFullMetrics(data) {
+  let html = '';
+  for (const [cat, vals] of Object.entries(data)) {
+    if (typeof vals !== 'object' || Array.isArray(vals)) continue;
+    if (!['basic','returns','risk','distribution','timeframe'].includes(cat)) continue;
+    html += `<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px">${cat}</div><table class="bt-table"><tbody>`;
+    for (const [k, v] of Object.entries(vals)) { if (typeof v === 'object') continue; html += `<tr><td style="color:var(--text-muted);width:200px">${k}</td><td>${v}</td></tr>`; }
+    html += '</tbody></table></div>';
+  }
+  document.getElementById('btFullMetrics').innerHTML = html;
+}
+
+// Saved Results
+function loadSavedResults() {
+  fetch('/api/intraday-backtest/saved-results').then(r=>r.json()).then(data => {
+    const tfLabels = {'1Min':'1 Min','5Min':'5 Min','15Min':'15 Min','30Min':'30 Min','1Hour':'1 Hour','1Day':'Daily'};
+    let html = '';
+    const tfs = ['1Min','5Min','15Min','30Min','1Hour','1Day'];
+    for (const tf of tfs) {
+      const runs = data[tf] || [];
+      html += `<div style="margin-bottom:16px"><div style="font-size:12px;font-weight:600;color:var(--brand);margin-bottom:6px">${tfLabels[tf]||tf} (${runs.length} runs)</div>`;
+      if (runs.length === 0) {
+        html += '<div style="font-size:11px;color:var(--text-muted);padding:8px">No results yet</div>';
+      } else {
+        html += '<table class="bt-table"><thead><tr><th>Date</th><th>Stocks</th><th>Batches</th><th>Candles</th><th>Return</th><th>Sharpe</th><th>MaxDD</th><th>WinRate</th><th>PF</th><th>Signals</th><th>Days</th><th></th></tr></thead><tbody>';
+        for (const r of runs) {
+          const retClass = (r.total_return_pct||0) >= 0 ? 'bt-positive' : 'bt-negative';
+          html += `<tr>
+            <td style="font-size:11px">${(r.created_at||'').substring(0,16)}</td>
+            <td>${r.n_stocks}</td>
+            <td>${(r.n_batches||0).toLocaleString()}</td>
+            <td>${(r.candles_processed||0).toLocaleString()}</td>
+            <td class="${retClass}" style="font-weight:600">${(r.total_return_pct*100||0).toFixed(2)}%</td>
+            <td>${(r.sharpe_ratio||0).toFixed(4)}</td>
+            <td class="bt-negative">${(r.max_drawdown_pct*100||0).toFixed(2)}%</td>
+            <td>${(r.win_rate_pct*100||0).toFixed(1)}%</td>
+            <td>${(r.profit_factor||0).toFixed(4)}</td>
+            <td>${(r.n_signals_avg||0).toFixed(0)}</td>
+            <td>${r.days_back}</td>
+            <td><button style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;cursor:pointer;background:var(--surface-solid);color:var(--text)" onclick="viewSavedResult(${r.id})">View</button>
+            <button style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;cursor:pointer;background:var(--surface-solid);color:var(--down);margin-left:2px" onclick="deleteSavedResult(${r.id})">X</button></td>
+          </tr>`;
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div>';
+    }
+    document.getElementById('btSavedResults').innerHTML = html || '<div style="color:var(--text-muted);font-size:12px">No saved results</div>';
+  }).catch(e => { document.getElementById('btSavedResults').innerHTML = '<div style="color:var(--down);font-size:12px">Failed to load</div>'; });
+}
+
+function viewSavedResult(id) {
+  fetch('/api/intraday-backtest/saved-results/' + id).then(r=>r.json()).then(data => {
+    const flat = flattenResult(data);
+    renderResults(flat);
+    document.getElementById('btResults').scrollIntoView({behavior:'smooth'});
+  });
+}
+
+function deleteSavedResult(id) {
+  if (!confirm('Delete this result?')) return;
+  fetch('/api/intraday-backtest/delete-result/' + id, {method:'DELETE'}).then(()=>loadSavedResults());
+}
+
+// Load saved results on page load
+loadSavedResults();
+</script>
+{% endblock %}

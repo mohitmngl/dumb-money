@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Paper Trading - {{ market }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Paper Trading</h1>
+  <button class="btn btn-primary btn-sm" onclick="createStrategy()">+ New Strategy</button>
+</div>
+<div class="card mb-16"><h4 class="mb-8">Account</h4><div id="accountPanel"><div class="loading"><div class="spinner"></div></div></div></div>
+<div class="card mb-16"><h4 class="mb-8">Strategies</h4><div id="strategiesPanel"><div class="loading"><div class="spinner"></div></div></div></div>
+<div class="card mb-16"><h4 class="mb-8">Positions</h4><div id="positionsPanel"><div class="loading"><div class="spinner"></div></div></div></div>
+<div class="card"><h4 class="mb-8">Recent Trades</h4><div id="tradesPanel"><div class="loading"><div class="spinner"></div></div></div></div>
+<script>
+function loadPaper(){
+  fetch('/api/paper/strategies?market='+MARKET).then(r=>r.json()).then(strats=>{
+    if(!strats.length){document.getElementById('strategiesPanel').innerHTML='<p class="text-muted">No strategies. Create one to start paper trading.</p>';return;}
+    let html='<table><thead><tr><th>Name</th><th>Stocks</th><th>Active</th><th>Last Rebalanced</th><th></th></tr></thead><tbody>';
+    strats.forEach(s=>{
+      html+=`<tr><td>${s.name}</td><td class="numeric">${s.num_stocks}</td><td>${s.active?'<span class="badge badge-up">Active</span>':'<span class="badge badge-info">Paused</span>'}</td><td>${s.last_rebalanced||'Never'}</td>`;
+      html+=`<td><button class="btn btn-sm btn-primary" onclick="activateStrat(${s.id})">Activate</button> <button class="btn btn-sm" onclick="pauseStrat(${s.id})">Pause</button></td></tr>`;
+    });
+    html+='</tbody></table>';
+    document.getElementById('strategiesPanel').innerHTML=html;
+  });
+  fetch('/api/paper/positions').then(r=>r.json()).then(positions=>{
+    if(!positions.length){document.getElementById('positionsPanel').innerHTML='<p class="text-muted">No open positions.</p>';return;}
+    let html='<table><thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>P&L %</th></tr></thead><tbody>';
+    positions.forEach(p=>{
+      html+=`<tr><td><a href="/${MARKET==='INDIA'?'india/':''}stock/${p.symbol}">${p.symbol}</a></td><td class="numeric">${p.qty}</td><td class="numeric">$${p.avg_entry_price}</td><td class="numeric">$${p.current_price}</td><td class="numeric ${p.unrealized_pl>=0?'text-up':'text-down'}">$${p.unrealized_pl.toFixed(2)}</td><td class="numeric ${p.unrealized_plpc>=0?'text-up':'text-down'}">${(p.unrealized_plpc*100).toFixed(2)}%</td></tr>`;
+    });
+    html+='</tbody></table>';
+    document.getElementById('positionsPanel').innerHTML=html;
+  });
+  fetch('/api/paper/trades?market='+MARKET).then(r=>r.json()).then(trades=>{
+    if(!trades.length){document.getElementById('tradesPanel').innerHTML='<p class="text-muted">No trades yet.</p>';return;}
+    let html='<table><thead><tr><th>Date</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th></tr></thead><tbody>';
+    trades.slice(0,20).forEach(t=>{
+      html+=`<tr><td>${t.filled_at||''}</td><td>${t.symbol}</td><td><span class="badge ${t.side==='buy'?'badge-up':'badge-down'}">${t.side}</span></td><td class="numeric">${t.qty}</td><td class="numeric">$${t.price||0}</td></tr>`;
+    });
+    html+='</tbody></table>';
+    document.getElementById('tradesPanel').innerHTML=html;
+  });
+}
+function createStrategy(){
+  const name=prompt('Strategy name:');
+  if(!name)return;
+  const num=prompt('Number of stocks:','10');
+  fetch('/api/paper/strategies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET,name,rules:{},num_stocks:parseInt(num)||10})}).then(r=>r.json()).then(d=>{showToast('Created');loadPaper();});
+}
+function activateStrat(id){fetch(`/api/paper/strategies/${id}/activate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET})}).then(r=>r.json()).then(d=>{showToast('Activated');loadPaper();});}
+function pauseStrat(id){fetch(`/api/paper/strategies/${id}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET})}).then(()=>{showToast('Paused');loadPaper();});}
+loadPaper();
+</script>
+{% endblock %}

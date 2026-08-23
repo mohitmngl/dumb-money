@@ -1,0 +1,38 @@
+{
+  "model_name": "retest_v2_candidate",
+  "model_type": "CatBoost Multiclass",
+  "model_version": "v2_20260803",
+  "engine_version": "causal-v1",
+  "feature_version": "f29-v2",
+  "score_semantics_version": "new-entry-current-v1",
+  "git_commit": "feature/retest-model-v2",
+  "training_data_start": "1997-01-29",
+  "training_data_end": "2024-04-09",
+  "holdout_start": "2024-04-10",
+  "holdout_end": "2026-07-01",
+  "markets": [
+    "US",
+    "INDIA"
+  ],
+  "event_counts": {
+    "total": 94820,
+    "train": 52271,
+    "holdout": 42549
+  },
+  "class_distribution": {
+    "WIN": 15156,
+    "DEEP_DRAWDOWN": 35614,
+    "TIMEOUT": 1501
+  },
+  "feature_names": [
+    "departure_high_distance_atr",
+    "pullback_from_peak_atr",
+    "entry_distance_atr"
+  ],
+  "target_atr": 2.0,
+  "stop_atr": 0.75,
+  "timeout_bars": 20,
+  "entry_convention": "confirmation_close",
+  "creation_timestamp": "2026-08-03T22:33:20",
+  "random_seed": 42
+}

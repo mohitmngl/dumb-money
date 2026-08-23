@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Strategy Vault{% endblock %}
+{% block content %}
+<style>
+  .vault-header { margin-bottom: 32px; }
+  .vault-header h1 { font-size: 28px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+  .vault-header p { color: var(--text-secondary); font-size: 14px; }
+  .section-label {
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--accent); margin-bottom: 16px; padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+  }
+  .vault-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 20px; margin-bottom: 40px;
+  }
+  .vault-card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; cursor: pointer; transition: all 0.2s; position: relative; overflow: hidden;
+  }
+  .vault-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+  .vault-card.handpicked { border-left: 4px solid var(--accent); }
+  .vault-card .badge {
+    display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 1px; padding: 3px 10px; border-radius: 20px; margin-bottom: 12px;
+  }
+  .badge.gold { background: rgba(255,193,7,0.15); color: #ffc107; }
+  .badge.blue { background: rgba(33,150,243,0.15); color: #2196f3; }
+  .badge.green { background: rgba(76,175,80,0.15); color: #4caf50; }
+  .vault-card h3 { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+  .vault-card .formula {
+    font-family: 'Fira Code', monospace; font-size: 12px; color: var(--text-secondary);
+    background: var(--bg-secondary); padding: 6px 10px; border-radius: 6px;
+    margin-bottom: 16px; word-break: break-all;
+  }
+  .vault-card .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .metric { text-align: center; }
+  .metric .val { font-size: 18px; font-weight: 700; color: var(--text); }
+  .metric .lbl { font-size: 10px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+  .metric .val.positive { color: #4caf50; }
+  .metric .val.negative { color: #f44336; }
+  .vault-card .meta {
+    margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary);
+  }
+  .vault-card .arrow {
+    position: absolute; top: 24px; right: 24px; font-size: 20px; color: var(--text-secondary);
+    transition: all 0.2s;
+  }
+  .vault-card:hover .arrow { color: var(--accent); transform: translateX(4px); }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-secondary); }
+  .empty-state h2 { font-size: 20px; margin-bottom: 8px; color: var(--text); }
+</style>
+
+<div class="vault-header">
+  <h1>Strategy Vault</h1>
+  <p>Handpicked, battle-tested BTST strategies with full documentation. Zero look-ahead bias. Real returns on liquid US stocks.</p>
+</div>
+
+<div class="section-label">Handpicked — Top Performing Strategies</div>
+<div class="vault-grid">
+  {% for s in strategies %}
+  {% if s.category == "handpicked" %}
+  <a href="/{{ 'india/' if market == 'INDIA' else '' }}vault/{{ s.slug }}" style="text-decoration:none;color:inherit;">
+    <div class="vault-card handpicked">
+      <span class="arrow">&#8594;</span>
+      <span class="badge gold">{{ s.badge }}</span>
+      <h3>{{ s.title }}</h3>
+      <div class="formula">{{ s.short }}</div>
+      <div class="metrics">
+        <div class="metric"><div class="val positive">{{ s.sharpe }}</div><div class="lbl">Sharpe</div></div>
+        <div class="metric"><div class="val positive">{{ s.cagr }}</div><div class="lbl">CAGR</div></div>
+        <div class="metric"><div class="val negative">{{ s.mdd }}</div><div class="lbl">Max DD</div></div>
+      </div>
+      <div class="metrics" style="margin-top:10px;">
+        <div class="metric"><div class="val">{{ s.volatility }}</div><div class="lbl">Volatility</div></div>
+        <div class="metric"><div class="val positive">{{ s.win_rate }}</div><div class="lbl">Win Rate</div></div>
+        <div class="metric"><div class="val">{{ s.profit_factor }}</div><div class="lbl">PF</div></div>
+      </div>
+      <div class="meta">
+        <span>{{ s.n_dates }} days tested</span>
+        <span>{{ s.universe }}</span>
+      </div>
+    </div>
+  </a>
+  {% endif %}
+  {% endfor %}
+</div>
+
+{% set has_other = false %}
+{% for s in strategies %}{% if s.category != "handpicked" %}{% set has_other = true %}{% endif %}{% endfor %}
+{% if has_other %}
+<div class="section-label">All Strategies</div>
+<div class="vault-grid">
+  {% for s in strategies %}
+  {% if s.category != "handpicked" %}
+  <a href="/{{ 'india/' if market == 'INDIA' else '' }}vault/{{ s.slug }}" style="text-decoration:none;color:inherit;">
+    <div class="vault-card">
+      <span class="arrow">&#8594;</span>
+      <span class="badge blue">{{ s.category }}</span>
+      <h3>{{ s.title }}</h3>
+      <div class="formula">{{ s.short }}</div>
+      <div class="metrics">
+        <div class="metric"><div class="val positive">{{ s.sharpe }}</div><div class="lbl">Sharpe</div></div>
+        <div class="metric"><div class="val positive">{{ s.cagr }}</div><div class="lbl">CAGR</div></div>
+        <div class="metric"><div class="val negative">{{ s.mdd }}</div><div class="lbl">Max DD</div></div>
+      </div>
+      <div class="meta">
+        <span>{{ s.n_dates }} days</span>
+        <span>{{ s.market }}</span>
+      </div>
+    </div>
+  </a>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

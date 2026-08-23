@@ -1,0 +1,16 @@
+﻿
+BACKUP PATHS - Milestone 1 Safety Checkpoint
+=============================================
+Date: 2026-08-02
+Branch: fix/retest-current-score-persistence
+Starting Commit: 974d4f1
+
+Original Database Locations (DO NOT MODIFY):
+- C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\screener.db (39,420 MB)
+- C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\india.db (34,352 MB)
+
+Backup Strategy:
+- Historical_screener tables: NEVER modified in Milestone 1
+- Current stats tables: Updated with rollback CSV
+- Rollback data: RETEST_CURRENT_SCORE_ROLLBACK.csv
+

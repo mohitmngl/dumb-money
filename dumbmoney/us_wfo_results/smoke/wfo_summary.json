@@ -1,0 +1,173 @@
+{
+  "aggregate": {
+    "n_folds": 1,
+    "avg_win_rate": 0.42105263157894735,
+    "avg_return": -0.06807405185987259,
+    "avg_max_dd": 0.10638847635910628,
+    "avg_r_squared": 0.30841448687951656,
+    "avg_sharpe": -2.965049912478964,
+    "avg_profit_factor": 0.7458968145122217,
+    "total_trades": 38,
+    "min_win_rate": 0.42105263157894735,
+    "max_win_rate": 0.42105263157894735,
+    "fold_win_rates": [
+      0.42105263157894735
+    ],
+    "fold_returns": [
+      -0.06807405185987259
+    ]
+  },
+  "stability": {
+    "entry_type": {
+      "most_common": [
+        "st_bullish+high_alpha",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "min_weighted_alpha": {
+      "most_common": [
+        "0",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "min_prob_up_1d": {
+      "most_common": [
+        "55",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "min_confluence": {
+      "most_common": [
+        "20",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "sort_by": {
+      "most_common": [
+        "prob_up_1d",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "sort_ascending": {
+      "most_common": [
+        "False",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "top_n": {
+      "most_common": [
+        "15",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "min_atrp": {
+      "most_common": [
+        "0.5",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "max_atrp": {
+      "most_common": [
+        "8.0",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "min_volume_shares": {
+      "most_common": [
+        "1000000",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "streak_min": {
+      "most_common": [
+        "None",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "streak_max": {
+      "most_common": [
+        "None",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "stop_loss_pct": {
+      "most_common": [
+        "None",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    },
+    "take_profit_pct": {
+      "most_common": [
+        "None",
+        1
+      ],
+      "entropy": -0.0,
+      "stability_score": 1.0
+    }
+  },
+  "folds": [
+    {
+      "fold": 0,
+      "train_start": "2026-04-28",
+      "train_end": "2026-05-28",
+      "test_start": "2026-05-28",
+      "test_end": "2026-06-29",
+      "best_params": {
+        "entry_type": "st_bullish+high_alpha",
+        "min_weighted_alpha": 0,
+        "min_prob_up_1d": 55,
+        "min_confluence": 20,
+        "sort_by": "prob_up_1d",
+        "sort_ascending": false,
+        "top_n": 15,
+        "min_atrp": 0.5,
+        "max_atrp": 8.0,
+        "min_volume_shares": 1000000,
+        "streak_min": null,
+        "streak_max": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null
+      },
+      "train_metrics": {
+        "fitness": 3.619696490759293,
+        "valid": true,
+        "n_trades": 39,
+        "win_rate": 0.5897435897435898,
+        "total_return": 0.05940584304841945,
+        "annualized_return": 1.243226334806168,
+        "max_drawdown": 0.05191373592264736,
+        "r_squared": 0.17740954516913587,
+        "profit_factor": 1.9081752939349352,
+        "calmar": 23.947926549894298,
+        "sharpe": 3.062310574332893,
+        "daily_win_rate": 0.6111111111111112
+      }
+    }
+  ]
+}

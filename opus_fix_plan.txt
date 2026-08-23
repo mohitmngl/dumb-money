@@ -1,0 +1,276 @@
+DUMBMONEY FLASK STOCK SCREENER APP - FIX & OPTIMIZATION PLAN
+============================================================
+
+This document outlines the exact line numbers, code snippets, and replacement code required to fix the known bugs and implement the performance optimizations for the DumbMoney stock screening application.
+
+Target File Path: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\opus_fix_plan.txt
+
+============================================================
+PART 1: BUG FIXES
+============================================================
+
+BUG A: Stock screener historical_screener partially failing
+-----------------------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\engine.py
+* Line Numbers: 665 - 676
+* Description:
+  1. No try-except block exists around the per-symbol loop when processing historical metrics. If any single symbol has bad, empty, or unexpected data (e.g. division by zero, rolling exceptions on short listings), the entire historical refresh crashes and rolls back/aborts.
+  2. Incremental refresh uses only_symbols=updated_symbols, which means that after a crash, subsequent refreshes only process newly updated stocks, leaving all other stocks stale/missing.
+  3. Calculating indicators for the full history of 10+ years on every incremental pass is highly redundant and slow.
+* Current Code:
+            records = []
+            for _, grp in bars.groupby("symbol", sort=False):
+                if len(grp) < 2:
+                    continue
+                hist = _compute_historical_symbol_frame(grp)
+                sym = str(grp["symbol"].iloc[0])
+                last_hist_date = existing_map.get(sym)
+                if requested and last_hist_date and not version_mismatch and not force_rebuild:
+                    hist = hist[hist["date"] > last_hist_date]
+                    if hist.empty:
+                        continue
+                records.extend([tuple(r) for r in hist.itertuples(index=False, name=None)])
+* Replacement Code:
+            records = []
+            for _, grp in bars.groupby("symbol", sort=False):
+                if len(grp) < 2:
+                    continue
+                sym = str(grp["symbol"].iloc[0])
+                try:
+                    last_hist_date = existing_map.get(sym)
+                    if requested and last_hist_date and not version_mismatch and not force_rebuild:
+                        # Slice to compute only on the necessary window (lookback 252 for weighted_alpha)
+                        new_bars = grp[grp["date"] > last_hist_date]
+                        if new_bars.empty:
+                            continue
+                        num_new = len(new_bars)
+                        grp_sliced = grp.tail(num_new + 252).copy()
+                        hist = _compute_historical_symbol_frame(grp_sliced)
+                        hist = hist[hist["date"] > last_hist_date]
+                    else:
+                        hist = _compute_historical_symbol_frame(grp)
+                    
+                    if not hist.empty:
+                        records.extend([tuple(r) for r in hist.itertuples(index=False, name=None)])
+                except Exception as e:
+                    logger.warning(f"Error computing historical stats for {sym}: {e}")
+                    continue
+
+
+BUG B: Refresh step ordering wrong for string baskets
+------------------------------------------------------
+* Status: Already fixed in C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\refresh.py and app.py (build_close_pivot_cache runs before compute_current_metrics).
+
+
+BUG C: Historical string screener only_latest path bugs
+-------------------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\basket_screener.py
+* Line Numbers: 835, 873 - 875, 876, 882 - 885, 905 - 910
+* Description:
+  1. `insert_start` calculation loops over last chunk size of dates rather than a single latest date.
+  2. `_load_hist_metrics_chunk` loads the entire history of dates from the DB even if only_latest=True, causing massive unnecessary DB reads (9 million rows).
+  3. `all_wm` and derived metrics (ai_m_full, etc.) will have shape (n, 1) if we only load the latest date, causing IndexError when indexed by the global date index `di`.
+* Current Code (Lines 835):
+        all_wm = _load_hist_metrics_chunk(conn, market, sym_list, dates, W=None, Wn=None, indices=indices, weights=weights)
+* Replacement Code (Lines 835):
+        hist_dates_to_load = [dates[-1]] if only_latest else dates
+        all_wm = _load_hist_metrics_chunk(conn, market, sym_list, hist_dates_to_load, W=None, Wn=None, indices=indices, weights=weights)
+
+* Current Code (Lines 873-876):
+        # When only_latest=True, compute indicators on full history but only insert last date
+        insert_start = 0 if not only_latest else max(0, n_dates - chunk)
+
+        for d0 in range(insert_start, n_dates, chunk):
+* Replacement Code (Lines 873-876):
+        # When only_latest=True, compute indicators on full history but only insert last date
+        if only_latest:
+            loop_range = [n_dates - 1]
+        else:
+            loop_range = range(0, n_dates, chunk)
+
+        for d0 in loop_range:
+
+* Current Code (Lines 882-885):
+            def _col(name, _off=0):
+                return all_wm.get(name, np.zeros((n, n_dates), np.float32))[:, d0 + _off]
+            def _bcol(name, _off=0):
+                return basket_ind[name][:, d0 + _off] if basket_ind is not None else _col(name, _off)
+* Replacement Code (Lines 882-885):
+            def _col(name, _off=0):
+                if only_latest:
+                    return all_wm.get(name, np.zeros((n, 1), np.float32))[:, 0]
+                return all_wm.get(name, np.zeros((n, n_dates), np.float32))[:, d0 + _off]
+            def _bcol(name, _off=0):
+                return basket_ind[name][:, d0 + _off] if basket_ind is not None else _col(name, _off)
+
+* Current Code (Lines 905-910):
+                    ai_m_full[:, di].tolist(), ai_bias_full[:, di].tolist(),
+                    _col("ai_tech_score", di_off).tolist(), _col("ai_momentum_score", di_off).tolist(),
+                    _col("ai_volume_score", di_off).tolist(), _col("ai_events_score", di_off).tolist(),
+                    _col("ai_volume_profile_score", di_off).tolist(), _col("ai_trendline_score", di_off).tolist(),
+                    _col("ai_sentiment_score", di_off).tolist(), ai_concl_full[:, di].tolist(),
+                    ai_m_full[:, di].tolist(),
+* Replacement Code (Lines 905-910):
+                    ai_m_full[:, 0 if only_latest else di].tolist(), ai_bias_full[:, 0 if only_latest else di].tolist(),
+                    _col("ai_tech_score", di_off).tolist(), _col("ai_momentum_score", di_off).tolist(),
+                    _col("ai_volume_score", di_off).tolist(), _col("ai_events_score", di_off).tolist(),
+                    _col("ai_volume_profile_score", di_off).tolist(), _col("ai_trendline_score", di_off).tolist(),
+                    _col("ai_sentiment_score", di_off).tolist(), ai_concl_full[:, 0 if only_latest else di].tolist(),
+                    ai_m_full[:, 0 if only_latest else di].tolist(),
+
+
+============================================================
+PART 2: PERFORMANCE OPTIMIZATIONS
+============================================================
+
+1. vectorized_stats_pass Loop Parallelization
+---------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\engine.py
+* Line Numbers: 94 - 197
+* Explanation: Instead of running technical calculations on 10,000+ symbols sequentially, parallelize calculations using a ThreadPoolExecutor with 8 workers.
+* Benchmark Expectation: 3x - 5x speedup during full stats rebuild.
+* Code Changes:
+  Move the inner loop logic into a helper function:
+  `def _proc_one(sym, grp, snapshots, market):`
+  And execute using:
+  ```python
+  from concurrent.futures import ThreadPoolExecutor, as_completed
+  results = []
+  with ThreadPoolExecutor(max_workers=8) as executor:
+      futures = {executor.submit(_proc_one, sym, grp, snapshots, market): sym for sym, grp in groups}
+      for idx, f in enumerate(as_completed(futures)):
+          if progress_callback and idx % 50 == 0:
+              progress_callback(idx, total_groups)
+          res = f.result()
+          if res:
+              results.append(res)
+  ```
+
+2. update_historical_screener Date Slicing (Incremental)
+---------------------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\engine.py
+* Line Numbers: 665 - 676 (integrated with BUG A fix above)
+* Explanation: Slices `grp` DataFrame to `new_bars + 252` lookback days. This avoids executing indicator routines on 10 years of historical data for each symbol only to keep the last date.
+* Benchmark Expectation: 5x - 10x speedup on incremental history filling.
+
+3. _load_hist_metrics_chunk Range Query
+---------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\basket_screener.py
+* Line Numbers: 940 - 948
+* Explanation: Instead of using `date IN (?, ?, ?, ...)` with 500 placeholders in a loop, query using a contiguous range `date >= ? AND date <= ?` on the sorted date chunk.
+* Benchmark Expectation: 2x - 3x faster database retrieval for historical metrics chunk.
+* Code Changes:
+  Replace the batch loop with:
+  ```python
+  min_date = chunk_dates[0]
+  max_date = chunk_dates[-1]
+  q = (f"SELECT symbol, date, {cols_sql} FROM historical_screener "
+       f"WHERE date >= ? AND date <= ?")
+  rows = conn.execute(q, (min_date, max_date)).fetchall()
+  ```
+
+4. compute_current_metrics Date Limit Reduction
+-----------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\basket_screener.py
+* Line Numbers: 622, 650
+* Explanation: Change `date_limit` from 130 to 80 days. 80 days is more than enough for a 14-period SuperTrend and 28-period Accel calculation (needs 28 + ~30 warm-up days).
+* Benchmark Expectation: 30% - 40% reduction in load/execution times for current metrics pass.
+
+5. Chunk gather/einsum operations in basket_screener
+-----------------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\basket_screener.py
+* Line Numbers: 376 - 382, 434 - 441
+* Explanation: Doing `close_pivot[indices]` directly on 25000 strings and 4500 dates creates a massive 3D array (4.5 GB memory) which causes memory thrashing and slows down operations. Chunking the array gathering into batches of 2000 strings keeps memory footprint low (360 MB) and runs much faster.
+* Benchmark Expectation: Up to 15 GB RAM reduction in peak memory, eliminating paging and memory allocation overhead.
+* Code Changes:
+  Update `_gather_einsum` to process in chunks:
+  ```python
+  def _gather_einsum(close_pivot, indices, weights):
+      n_strings = indices.shape[0]
+      n_dates = close_pivot.shape[1]
+      result = np.zeros((n_strings, n_dates), dtype=np.float32)
+      chunk_size = 2000
+      for i in range(0, n_strings, chunk_size):
+          idx_chunk = indices[i:i+chunk_size]
+          w_chunk = weights[i:i+chunk_size]
+          result[i:i+chunk_size] = np.einsum('bi,bid->bd', w_chunk, close_pivot[idx_chunk])
+      return np.nan_to_num(result, nan=0.0)
+  ```
+  Update `_compute_basket_ohlc` in the same way.
+
+6. SQLite Indexes
+-----------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\db.py
+* Line Numbers: 165 - 188
+* Explanation: Keep existing indexes intact; they are already well-optimized for key tables.
+
+7. Parallel Download Batching
+-----------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\data_us.py
+* Line Numbers: 194 - 261, 43 - 59
+* Explanation: Run batch downloads in parallel using `ThreadPoolExecutor` with 5 workers. Add a thread lock to `RateLimiter` to make rate-limiting thread-safe.
+* Benchmark Expectation: 2x - 3x faster US bar downloads.
+* Code Changes:
+  ```python
+  # Add lock to RateLimiter in data_us.py:
+  class RateLimiter:
+      def __init__(self, max_requests=180, window=60):
+          self.max_requests = max_requests
+          self.window = window
+          self.timestamps = []
+          self.lock = threading.Lock()
+      def wait(self):
+          with self.lock:
+              # rate limit logic...
+  ```
+  And parallelize `download_bars` in `data_us.py` using `ThreadPoolExecutor` and a database lock.
+
+8. Progress Callback / DB Persist Throttling
+---------------------------------------------
+* Target File: C:\Users\Admin\Desktop\stock test\open code v5 claude prompt\dumbmoney\refresh.py
+* Line Numbers: 58 - 71
+* Explanation: Throttles database commits of refresh status to at most once per second (unless terminal state or forced).
+* Benchmark Expectation: Eliminates hundreds of redundant disk writes/commits during refresh steps.
+* Code Changes:
+  Use a thread lock and timestamps to rate limit `_persist_status`:
+  ```python
+  _last_persist_time = {}
+  _status_cache_lock = threading.Lock()
+
+  def _persist_status(status_dict, market=None, force=False):
+      market = _norm_market(market or status_dict.get("market") or _current_market())
+      status_dict["market"] = market
+      with _status_cache_lock:
+          now = time.time()
+          last_time = _last_persist_time.get(market, 0)
+          is_terminal = status_dict.get("status") in ("complete", "error", "cancelled", "idle")
+          if force or is_terminal or (now - last_time >= 1.0):
+              _last_persist_time[market] = now
+              # perform insert and commit...
+  ```
+
+============================================================
+PART 3: ARCHITECTURAL IMPROVEMENTS
+============================================================
+
+1. Separate Historical Rebuild Maintenance:
+   Disable implicit full rebuilds of `historical_screener` during normal refresh if `version_mismatch` is True.
+   Log a warning and perform only incremental updates, keeping the full rebuild decoupled under `/api/historical/rebuild`.
+   In `engine.py`, change:
+   `needs_rebuild = force_rebuild or (version_mismatch and only_symbols is None)`
+   to:
+   `needs_rebuild = force_rebuild`
+   And log a warning if version mismatch occurs during incremental runs.
+
+============================================================
+PART 4: VERIFICATION CHECKLIST
+============================================================
+
+[ ] Run full US refresh. Confirm the `Background` step completes successfully without crashing.
+[ ] Check `historical_screener` table in US database (`screener.db`) using:
+    `SELECT date, COUNT(*) FROM historical_screener GROUP BY date ORDER BY date DESC LIMIT 10`
+    Ensure all dates from Jul 9 to Jul 16 have full coverage (10,000+ rows each).
+[ ] Run full India refresh. Confirm it completes successfully.
+[ ] Verify that `only_latest=True` path in `update_historical_string_screener` inserts exactly one date (today's date) and runs in < 5 seconds.
+[ ] Check peak RAM usage of the server during `generate_string_universe` and `update_historical_string_screener`. Ensure it stays below 1 GB (due to batching in `_gather_einsum` and `_compute_basket_ohlc`).
+[ ] Test UI status page during active refreshes. Confirm progress bar updates in real-time.

@@ -1,12 +1,31 @@
-*.err
-*.log
-*.jsonl
+# Databases (large, regenerable)
+*.db
+*.db-wal
+*.db-shm
+
+# Models (trained artifacts, large binary)
+models/
+catboost_info/
+
+# Python
 __pycache__/
 *.pyc
+.ipynb_checkpoints/
+
+# Artifacts & backups
+retest_checkpoint_*/
+backups/
+retest_artifacts/
+*.csv.bak
+
+# Temp
+*.log
+
+# Added before clean push: caches, bulk data, secrets
 .env
-data/screener.db
-data/stocks-screener-*.csv
-attachments/
-long_responses/
-plans/
-session.jsonl
+batch_cache/
+strategy_results/
+*.parquet
+*.npy
+MILESTONE2_DELIVERABLES/RETEST_V2_FUNNEL.csv
+MILESTONE2_DELIVERABLES/RETEST_V2_REJECTED_EVENTS.csv

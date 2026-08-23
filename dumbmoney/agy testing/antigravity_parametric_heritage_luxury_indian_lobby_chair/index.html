@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Heritage Luxury Indian Lobby Chair - 3D Configurator</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="loading">
+        <div class="spinner"></div>
+        <p>Loading Luxury Experience...</p>
+    </div>
+    
+    <div id="ui-container">
+        <div class="glass-panel">
+            <h1>Heritage Indian Chair</h1>
+            <p class="subtitle">Parametric Luxury Configurator</p>
+            <p class="desc">A modern interpretation of Royal Rajasthani and Mughal design language, crafted for five-star hotel lobbies.</p>
+        </div>
+    </div>
+    
+    <!-- Use ES modules for Three.js and lil-gui -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <script type="module" src="app.js"></script>
+</body>
+</html>

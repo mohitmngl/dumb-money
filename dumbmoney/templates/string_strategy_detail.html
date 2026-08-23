@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}String Strategy Detail{% endblock %}
+{% block content %}
+<div class="page-header"><h1 id="stratName">Strategy</h1></div>
+<div class="stat-cards-row mb-16" id="statCards"></div>
+<div class="card chart-card mb-16"><div id="chartContainer" style="min-height:400px"><div class="loading"><div class="spinner"></div></div></div></div>
+<div class="card mb-16"><h4 class="mb-8">Current Basket</h4><div id="basketTable"></div></div>
+<div class="card"><h4 class="mb-8">Metrics</h4><div id="metricsPanel"></div></div>
+<script>
+const SID={{sid}};
+function loadStrategy(){
+  Promise.all([
+    fetch(`/api/string-screener/strategy/${SID}/data?market=${MARKET}`).then(r=>r.json()),
+    fetch(`/api/string-screener/strategy/${SID}/current?market=${MARKET}`).then(r=>r.json())
+  ]).then(([data,current])=>{
+    const s=data.strategy||{};
+    document.getElementById('stratName').textContent=s.name||'Strategy';
+    document.getElementById('statCards').innerHTML=`
+      <div class="stat-card"><div class="label">Sharpe</div><div class="value">${(s.sharpe_1d||0).toFixed(3)}</div></div>
+      <div class="stat-card"><div class="label">Win Rate</div><div class="value ${(s.win_rate||0)>=50?'up':'down'}">${(s.win_rate||0).toFixed(1)}%</div></div>
+      <div class="stat-card"><div class="label">Avg 1D</div><div class="value">${(s.avg_1d_return||0).toFixed(3)}%</div></div>
+      <div class="stat-card"><div class="label">P(Up) 1D</div><div class="value">${(s.prob_up_1d||0).toFixed(1)}%</div></div>
+      <div class="stat-card"><div class="label">Entries</div><div class="value">${s.total_entries||0}</div></div>
+      <div class="stat-card"><div class="label">Max Win</div><div class="value text-up">${(s.max_1d_gain||0).toFixed(2)}%</div></div>
+      <div class="stat-card"><div class="label">Max Loss</div><div class="value text-down">${(s.max_1d_loss||0).toFixed(2)}%</div></div>
+      <div class="stat-card"><div class="label">Max Cons Wins</div><div class="value">${s.max_consecutive_wins||0}</div></div>
+    `;
+    let mHtml='<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>';
+    ['prob_up_1pct','prob_up_2pct','prob_down_2pct','prob_up_after_st_cross','prob_up_after_wa_high','std_1d_return','median_1d_return'].forEach(k=>{
+      mHtml+=`<tr><td>${k}</td><td class="numeric">${(s[k]||0).toFixed(3)}</td></tr>`;
+    });
+    mHtml+='</tbody></table>';
+    document.getElementById('metricsPanel').innerHTML=mHtml;
+    if(current.length){
+      let bHtml='<table><thead><tr><th>Symbol</th><th>Price</th><th>Chg%</th><th>WA</th><th>ST Signal</th><th>P(Up)</th><th>Streak</th></tr></thead><tbody>';
+      current.forEach(r=>{
+        bHtml+=`<tr><td><a href="/${MARKET==='INDIA'?'india/':''}stock/${r.symbol}">${r.symbol}</a></td><td class="numeric">$${(r.price||0).toFixed(2)}</td><td class="numeric ${(r.change_pct||0)>=0?'text-up':'text-down'}">${(r.change_pct||0).toFixed(2)}%</td><td class="numeric">${(r.weighted_alpha||0).toFixed(2)}</td><td>${r.atr_signal===1?'<span class="badge badge-up">UP</span>':r.atr_signal===-1?'<span class="badge badge-down">DOWN</span>':'-'}</td><td class="numeric">${(r.prob_up_1d||0).toFixed(1)}%</td><td class="numeric">${r.streak||0}</td></tr>`;
+      });
+      bHtml+='</tbody></table>';
+      document.getElementById('basketTable').innerHTML=bHtml;
+    }
+    renderEntryChart(data.entries || []);
+  });
+}
+function renderEntryChart(entries){
+  if(!entries.length){
+    document.getElementById('chartContainer').innerHTML='<div class="empty-state"><h3>No historical entries yet</h3></div>';
+    return;
+  }
+  const rows=entries.filter(e=>e.next_day_return!==null&&e.next_day_return!==undefined);
+  if(!rows.length){
+    document.getElementById('chartContainer').innerHTML='<div class="empty-state"><h3>No return data yet</h3></div>';
+    return;
+  }
+  let equity=100;
+  const points=rows.map(e=>{equity*=1+(Number(e.next_day_return)||0)/100;return {...e,equity};});
+  const w=900,h=360,pad={t:20,r:60,b:42,l:48},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
+  const eqVals=points.map(p=>p.equity),retVals=points.map(p=>Number(p.next_day_return)||0);
+  let yMax=Math.max(...eqVals),yMin=Math.min(...eqVals);const yr0=yMax-yMin||1;yMax+=yr0*.08;yMin-=yr0*.08;const yr=yMax-yMin||1;
+  const xOf=i=>pad.l+(points.length<=1?0:i*cw/(points.length-1));
+  const yOf=v=>pad.t+(yMax-v)/yr*ch;
+  let svg=`<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;background:#fff">`;
+  for(let i=0;i<5;i++){const y=pad.t+ch*i/4,val=yMax-yr*i/4;svg+=`<line x1="${pad.l}" y1="${y}" x2="${w-pad.r}" y2="${y}" stroke="#e5e7eb" stroke-width=".7"/>`;svg+=`<text x="${w-pad.r+5}" y="${y+4}" fill="#6b7280" font-size="10">${val.toFixed(1)}</text>`;}
+  let path='';points.forEach((p,i)=>{path+=`${i?'L':'M'}${xOf(i).toFixed(2)},${yOf(p.equity).toFixed(2)}`;});
+  svg+=`<path d="${path}" fill="none" stroke="#2563eb" stroke-width="2"/>`;
+  points.forEach((p,i)=>{const ret=Number(p.next_day_return)||0;if(Math.abs(ret)>=2){svg+=`<circle cx="${xOf(i)}" cy="${yOf(p.equity)}" r="3" fill="${ret>=0?'#10b981':'#ef4444'}"/>`;}});
+  svg+=`<text x="${pad.l}" y="14" fill="#374151" font-size="11" font-weight="700">Strategy equity from next-day returns, start=100</text>`;
+  svg+=`<text x="${pad.l}" y="${h-10}" fill="#6b7280" font-size="10">${points[0].date||''}</text><text x="${w-pad.r}" y="${h-10}" text-anchor="end" fill="#6b7280" font-size="10">${points[points.length-1].date||''}</text>`;
+  svg+=`</svg>`;
+  document.getElementById('chartContainer').innerHTML=svg;
+}
+loadStrategy();
+</script>
+{% endblock %}

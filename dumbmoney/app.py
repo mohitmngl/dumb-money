@@ -1,4688 +1,5388 @@
-"""
-DumbMoney — Clean Minimal Stock Screener
-Backend: Flask + Alpaca API + SQLite
-Server ID: 847392 (unique 6-digit)
-"""
-
 import os
+import sys
 import json
-import math
-import re
-import sqlite3
-import time
+import logging
 import threading
-from collections import deque
-from datetime import datetime, timedelta
-
-import requests
-import pandas as pd
 import numpy as np
-from flask import Flask, jsonify, request, render_template, make_response
-
-# ── Config ──────────────────────────────────────────────────────────
-API_KEY = "PKZPJMK5TL4UKT4TTDO5ELNM3B"
-API_SECRET = "6GF5J7dXTztrqK7uQZkvHxXcayWP9pFxgqpRXvqrLTra"
-DATA_URL = "https://data.alpaca.markets"
-TRADE_URL = "https://paper-api.alpaca.markets"
-
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "screener.db")
-SERVER_ID = 295847  # Unique 6-digit server ID
-PORT = 2957  # Avoid clash with other servers
-
-app = Flask(__name__)
-app.config['DB_PATH'] = DB_PATH
-
-# ── Shared Session + Rate Limiter ────────────────────────────────────
-# Reuse TCP connections across all API calls (keep-alive)
-_ALPACA_SESSION = requests.Session()
-_ALPACA_SESSION.headers.update({
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
-    "Accept": "application/json",
-    "Accept-Encoding": "gzip, deflate",
-})
-
-# Free tier: 200 requests/minute. We target 190 to stay safe.
-# Sliding window: track timestamps of last 190 requests.
-_RATE_LIMIT = 190
-_RATE_WINDOW = 60  # seconds
-_request_times = deque()
-_rate_lock = threading.Lock()
-
-
-def _rate_allow():
-    """Block until a request slot is available (sliding window rate limiter)."""
-    while True:
-        with _rate_lock:
-            now = time.monotonic()
-            # Purge old entries outside the window
-            while _request_times and now - _request_times[0] > _RATE_WINDOW:
-                _request_times.popleft()
-            if len(_request_times) < _RATE_LIMIT:
-                _request_times.append(now)
-                return
-            # Calculate wait time until oldest request expires
-            wait = _RATE_WINDOW - (now - _request_times[0]) + 0.05
-        if wait > 0:
-            time.sleep(wait)
-
-
-def _format_duration(seconds):
-    """Format seconds into human-readable string: 1h 23m 45s."""
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h}h {m}m {s}s"
-    elif m > 0:
-        return f"{m}m {s}s"
-    else:
-        return f"{s}s"
-
-
-# ── Database ─────────────────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = get_db()
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS bars (
-            symbol TEXT,
-            timeframe TEXT,
-            date TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-            PRIMARY KEY (symbol, timeframe, date)
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
-            symbol TEXT PRIMARY KEY,
-            name TEXT,
-            price REAL,
-            volume INTEGER,
-            change_pct REAL,
-            atrp REAL DEFAULT 0,
-            weighted_alpha REAL DEFAULT 0,
-            atr_signal INTEGER DEFAULT 0,
-            atr_stop REAL,
-            streak INTEGER DEFAULT 0,
-            pattern_name TEXT,
-            pattern_prob REAL,
-            pre_price REAL,
-            pre_change_pct REAL,
-            post_price REAL,
-            post_change_pct REAL,
-            fractionable BOOLEAN DEFAULT 0,
-            marginable BOOLEAN DEFAULT 0,
-            asset_class TEXT,
-            exchange TEXT,
-            status TEXT,
-            tradable BOOLEAN DEFAULT 0,
-            last_updated TEXT,
-            downloaded_1day TEXT,
-            downloaded_1hour TEXT,
-            downloaded_1min TEXT,
-            oldest_data TEXT
-        )
-    """)
-
-    # Migrate stats table — add new ATR columns if missing
-    for col in ['atr_value', 'atr_crossed_above', 'atr_crossed_below', 'atr_streak', 'atr_multiplier']:
-        try:
-            c.execute(f"ALTER TABLE stats ADD COLUMN {col} REAL DEFAULT 0")
-        except Exception:
-            pass  # column already exists
-
-    # Profitability columns
-    for col in ['profit_status', 'profit_last_qtr_pct']:
-        try:
-            c.execute(f"ALTER TABLE stats ADD COLUMN {col} TEXT")
-        except Exception:
-            pass  # column already exists
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS portfolios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio_symbols (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            portfolio_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL COLLATE NOCASE,
-            qty REAL DEFAULT 0,
-            avg_price REAL,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE,
-            UNIQUE(portfolio_id, symbol)
-        )
-    """)
-    # Migrate: add qty/avg_price if missing
-    for col in ['qty', 'avg_price']:
-        try:
-            c.execute(f"ALTER TABLE portfolio_symbols ADD COLUMN {col} REAL DEFAULT 0")
-        except Exception:
-            pass
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS corporate_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            event_type TEXT,
-            event_date TEXT,
-            description TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ai_analysis (
-            symbol TEXT PRIMARY KEY,
-            overall_score REAL DEFAULT 0,
-            bias TEXT DEFAULT 'neutral',
-            tech_score REAL DEFAULT 0,
-            momentum_score REAL DEFAULT 0,
-            volume_score REAL DEFAULT 0,
-            events_score REAL DEFAULT 0,
-            volume_profile_score REAL DEFAULT 0,
-            trendline_score REAL DEFAULT 0,
-            sentiment_score REAL DEFAULT 0,
-            conclusion TEXT DEFAULT 'HOLD',
-            computed_at TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS assets (
-            symbol TEXT PRIMARY KEY,
-            name TEXT,
-            asset_class TEXT,
-            exchange TEXT,
-            status TEXT,
-            tradable BOOLEAN,
-            fractionable BOOLEAN,
-            marginable BOOLEAN,
-            last_updated TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-
-    # Indexes for fast screener queries on the whole universe
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_symbol ON stats(symbol)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_wa ON stats(weighted_alpha)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_change ON stats(change_pct)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_volume ON stats(volume)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_streak ON stats(streak)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_atrp ON stats(atrp)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_stats_class ON stats(asset_class)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_bars_symbol_date ON bars(symbol, timeframe, date)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON corporate_events(symbol)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_assets_name ON assets(name)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_ai_symbol ON ai_analysis(symbol)")
-
-    conn.commit()
-    conn.close()
-
-
-def migrate_db():
-    """Add new columns to existing tables if they don't exist."""
-    conn = get_db()
-    c = conn.cursor()
-
-    # Add download tracking columns to stats
-    for col in ['downloaded_1day', 'downloaded_1hour', 'downloaded_1min', 'oldest_data']:
-        try:
-            c.execute(f"ALTER TABLE stats ADD COLUMN {col} TEXT")
-            print(f"  Added column: stats.{col}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-    # Add newer ai_analysis columns (older DBs may be missing these)
-    for col, typedef in [
-        ('volume_profile_score', 'REAL DEFAULT 0'),
-        ('trendline_score', 'REAL DEFAULT 0'),
-        ('sentiment_score', 'REAL DEFAULT 0'),
-        ('conclusion', "TEXT DEFAULT 'HOLD'"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE ai_analysis ADD COLUMN {col} {typedef}")
-            print(f"  Added column: ai_analysis.{col}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-    # Add profit detail columns
-    for col, typedef in [
-        ('profit_millions', 'REAL'),
-        ('profit_expectations', "TEXT DEFAULT 'N/A'"),
-        ('profit_post_result_dir', "TEXT DEFAULT 'flat'"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE stats ADD COLUMN {col} {typedef}")
-            print(f"  Added column: stats.{col}")
-        except sqlite3.OperationalError:
-            pass
-
-    # Create assets table if not exists
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS assets (
-            symbol TEXT PRIMARY KEY,
-            name TEXT,
-            asset_class TEXT,
-            exchange TEXT,
-            status TEXT,
-            tradable BOOLEAN,
-            fractionable BOOLEAN,
-            marginable BOOLEAN,
-            last_updated TEXT
-        )
-    """)
-
-    # Create ai_analysis table if not exists
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ai_analysis (
-            symbol TEXT PRIMARY KEY,
-            overall_score REAL DEFAULT 0,
-            bias TEXT DEFAULT 'neutral',
-            tech_score REAL DEFAULT 0,
-            momentum_score REAL DEFAULT 0,
-            volume_score REAL DEFAULT 0,
-            events_score REAL DEFAULT 0,
-            volume_profile_score REAL DEFAULT 0,
-            trendline_score REAL DEFAULT 0,
-            sentiment_score REAL DEFAULT 0,
-            conclusion TEXT DEFAULT 'HOLD',
-            computed_at TEXT
-        )
-    """)
-
-    # Indexes for fast screener queries (idempotent)
-    for idx_sql in [
-        "CREATE INDEX IF NOT EXISTS idx_stats_symbol ON stats(symbol)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_symbol_upper ON stats(UPPER(symbol))",
-        "CREATE INDEX IF NOT EXISTS idx_stats_wa ON stats(weighted_alpha)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_change ON stats(change_pct)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_volume ON stats(volume)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_streak ON stats(streak)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_atrp ON stats(atrp)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_class ON stats(asset_class)",
-        "CREATE INDEX IF NOT EXISTS idx_stats_oldest ON stats(oldest_data)",
-        "CREATE INDEX IF NOT EXISTS idx_bars_symbol_date ON bars(symbol, timeframe, date)",
-        "CREATE INDEX IF NOT EXISTS idx_events_symbol ON corporate_events(symbol)",
-        "CREATE INDEX IF NOT EXISTS idx_assets_name ON assets(name)",
-        "CREATE INDEX IF NOT EXISTS idx_ai_symbol ON ai_analysis(symbol)",
-        "CREATE INDEX IF NOT EXISTS idx_ai_symbol_upper ON ai_analysis(UPPER(symbol))",
-    ]:
-        try:
-            c.execute(idx_sql)
-        except sqlite3.OperationalError:
-            pass
-
-    conn.commit()
-    conn.close()
-
-    # Heavy backfill (oldest_data) runs in background to keep startup fast and
-    # avoid lock contention if another process is mid-write. Opt-in via env var.
-    import os
-    if os.environ.get("DUMBMONEY_STARTUP_BACKFILL") == "1":
-        import threading
-        t = threading.Thread(target=_backfill_oldest_data, daemon=True)
-        t.start()
-
-
-def _backfill_oldest_data():
-    """Background task: populate stats.oldest_data from bars table.
-    Idempotent — only fills rows that are currently NULL.
-    """
-    try:
-        conn = get_db()
-        conn.execute("PRAGMA journal_mode=WAL")
-        already_done = conn.execute(
-            "SELECT COUNT(*) FROM stats WHERE oldest_data IS NOT NULL"
-        ).fetchone()[0]
-        total = conn.execute("SELECT COUNT(*) FROM stats").fetchone()[0]
-        if already_done >= total:
-            print(f"  oldest_data already populated ({already_done}/{total})")
-            conn.close()
-            return
-        print(f"  Backfilling oldest_data ({already_done}/{total} done)...")
-        # Use a temp table to compute the oldest date per symbol, then join.
-        conn.execute("""
-            UPDATE stats SET oldest_data = (
-                SELECT MIN(date) FROM bars WHERE UPPER(bars.symbol) = UPPER(stats.symbol)
-            )
-            WHERE oldest_data IS NULL
-        """)
-        conn.commit()
-        conn.close()
-        print(f"  oldest_data backfill complete.")
-    except Exception as e:
-        print(f"  oldest_data backfill error: {e}")
-
-
-def _recompute_streaks_sql(conn):
-    """Fast SQL-based streak recompute using window functions.
-    Updates stats.streak for all symbols with bar data.
-    """
-    sql = """
-    WITH bar_data AS (
-        SELECT
-            UPPER(symbol) as sym,
-            date,
-            close,
-            LAG(close) OVER (PARTITION BY UPPER(symbol) ORDER BY date) as prev_close
-        FROM bars
-        WHERE timeframe = '1Day'
-    ),
-    directions AS (
-        SELECT sym, date,
-            CASE WHEN close > prev_close THEN 1
-                 WHEN close < prev_close THEN -1
-                 ELSE 0 END as dir
-        FROM bar_data WHERE prev_close IS NOT NULL
-    ),
-    grps AS (
-        SELECT sym, dir, date,
-            ROW_NUMBER() OVER (PARTITION BY sym ORDER BY date) -
-            ROW_NUMBER() OVER (PARTITION BY sym, dir ORDER BY date) as grp
-        FROM directions WHERE dir != 0
-    ),
-    streak_counts AS (
-        SELECT sym, dir, COUNT(*) as streak_len, MAX(date) as last_date
-        FROM grps GROUP BY sym, dir, grp
-    ),
-    latest AS (
-        SELECT sc.sym, sc.dir, sc.streak_len
-        FROM streak_counts sc
-        INNER JOIN (SELECT sym, MAX(last_date) as max_date FROM streak_counts GROUP BY sym) lm
-        ON sc.sym = lm.sym AND sc.last_date = lm.max_date
-    )
-    SELECT UPPER(sym) as symbol,
-           CASE WHEN dir = 1 THEN streak_len ELSE -streak_len END as streak
-    FROM latest
-    """
-    rows = conn.execute(sql).fetchall()
-    batch = []
-    for row in rows:
-        batch.append((row["streak"], row["symbol"]))
-        if len(batch) >= 500:
-            conn.executemany("UPDATE stats SET streak = ? WHERE UPPER(symbol) = ?", batch)
-            conn.commit()
-            batch = []
-    if batch:
-        conn.executemany("UPDATE stats SET streak = ? WHERE UPPER(symbol) = ?", batch)
-        conn.commit()
-    print(f"  SQL streak recompute: updated {len(rows)} symbols")
-
-
-def recompute_all_streaks():
-    """Recompute streaks for all symbols from local bar data (no API needed).
-
-    Uses the last 500 bars per symbol — enough for any realistic streak.
-    Updates stats.streak in-place with correct uncapped values.
-    """
-    conn = get_db()
-    symbols = conn.execute(
-        "SELECT UPPER(symbol) as symbol FROM stats ORDER BY symbol"
-    ).fetchall()
-    total = len(symbols)
-    print(f"\nRecomputing streaks for {total:,} symbols...")
-
-    updated = 0
-    batch = []
-    BATCH_SIZE = 100
-
-    for row in symbols:
-        sym = row["symbol"]
-        bars = conn.execute("""
-            SELECT close FROM bars
-            WHERE UPPER(symbol) = ?
-            ORDER BY date ASC
-            LIMIT 500
-        """, (sym,)).fetchall()
-
-        streak = 0
-        if len(bars) >= 2:
-            closes = [b["close"] for b in bars]
-            if closes[-1] > closes[-2]:
-                for i in range(len(closes) - 1, 0, -1):
-                    if closes[i] > closes[i - 1]:
-                        streak += 1
-                    else:
-                        break
-            elif closes[-1] < closes[-2]:
-                for i in range(len(closes) - 1, 0, -1):
-                    if closes[i] < closes[i - 1]:
-                        streak -= 1
-                    else:
-                        break
-
-        batch.append((streak, sym))
-
-        if len(batch) >= BATCH_SIZE:
-            conn.executemany(
-                "UPDATE stats SET streak = ? WHERE UPPER(symbol) = ?",
-                batch
-            )
-            conn.commit()
-            updated += len(batch)
-            print(f"  {updated}/{total}...", flush=True)
-            batch = []
-
-    # Final batch
-    if batch:
-        conn.executemany(
-            "UPDATE stats SET streak = ? WHERE UPPER(symbol) = ?",
-            batch
-        )
-        conn.commit()
-        updated += len(batch)
-
-    conn.close()
-    print(f"  Done! Recomputed streaks for {updated:,} symbols.\n")
-
-
-# ── Alpaca API Helpers ───────────────────────────────────────────────
-def alpaca_get(endpoint, base=DATA_URL, params=None):
-    """Make authenticated GET request to Alpaca API using shared session."""
-    _rate_allow()  # Wait for rate limit slot
-
-    url = f"{base}{endpoint}"
-    try:
-        resp = _ALPACA_SESSION.get(url, params=params, timeout=30)
-    except Exception as e:
-        # Return a fake response object so callers see a non-200 and log it.
-        class _Err:
-            status_code = 0
-            text = str(e)
-            def json(self): return {}
-        return _Err()
-
-    if resp.status_code == 429:
-        retry_after = int(resp.headers.get('Retry-After', 60))
-        print(f"  Rate limited on {endpoint}, waiting {retry_after}s...", flush=True)
-        time.sleep(retry_after)
-        return alpaca_get(endpoint, base, params)
-
-    return resp
-
-
-# ── Corporate Actions (Splits & Dividends) ──────────────────────────
-def download_corporate_actions(symbol, start_date="2016-01-01", end_date=None):
-    """Download corporate actions (splits, dividends) for a symbol."""
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y-%m-%d")
-
-    events = []
-    try:
-        resp = alpaca_get("/v2/corporate_actions",
-            params={
-                "symbols": symbol,
-                "types": "split,dividend",
-                "start": start_date,
-                "end": end_date,
-            })
-        if resp.status_code == 200:
-            data = resp.json()
-            raw_events = data.get('corporate_actions', data) if isinstance(data, dict) else data
-            if isinstance(raw_events, list):
-                for ev in raw_events:
-                    events.append({
-                        'symbol': symbol,
-                        'event_type': ev.get('type', ev.get('event_type', 'unknown')),
-                        'event_date': ev.get('ex_date', ev.get('event_date', '')),
-                        'description': ev.get('description', ''),
-                    })
-    except Exception as e:
-        print(f"  Corporate actions error for {symbol}: {e}")
-
-    return events
-
-
-def fetch_profitability(symbol):
-    """Fetch profitability data from Alpaca financials API.
-
-    Returns dict with:
-        profit_status: 'profitable' | 'loss_making' | 'growing' | 'declining' | 'N/A'
-        profit_last_qtr_pct: QoQ change % or None
-    """
-    try:
-        resp = alpaca_get("/v1beta1/financials", params={
-            "symbols": symbol.upper(),
-            "report_type": "quarterly",
-            "page": 1,
-            "page_size": 4,
-        })
-        if resp.status_code != 200:
-            return {"profit_status": "N/A", "profit_last_qtr_pct": None}
-
-        data = resp.json()
-        # Alpaca returns { "AAPL": { "financials": [...], ... } }
-        symbol_data = data.get(symbol.upper(), data.get(symbol, {}))
-        financials = symbol_data.get("financials", [])
-
-        if not financials or len(financials) < 1:
-            return {"profit_status": "N/A", "profit_last_qtr_pct": None}
-
-        # Extract net income from each quarter
-        net_incomes = []
-        for f in financials:
-            ni = f.get("net_income", f.get("netIncome", None))
-            if ni is not None:
-                net_incomes.append(ni)
-
-        if len(net_incomes) == 0:
-            return {"profit_status": "N/A", "profit_last_qtr_pct": None}
-
-        latest_ni = net_incomes[0]
-        status = "profitable" if latest_ni > 0 else "loss_making"
-
-        qoq_pct = None
-        if len(net_incomes) >= 2:
-            prev_ni = net_incomes[1]
-            if prev_ni != 0:
-                qoq_pct = round(((latest_ni - prev_ni) / abs(prev_ni)) * 100, 1)
-            elif latest_ni > 0:
-                qoq_pct = 100.0
-            else:
-                qoq_pct = -100.0
-
-            if latest_ni > 0 and prev_ni > 0 and qoq_pct > 5:
-                status = "growing"
-            elif latest_ni > 0 and prev_ni > 0 and qoq_pct < -5:
-                status = "declining"
-            elif latest_ni > 0 and prev_ni <= 0:
-                status = "growing"  # turned profitable
-            elif latest_ni <= 0 and prev_ni > 0:
-                status = "declining"  # turned loss-making
-
-        return {"profit_status": status, "profit_last_qtr_pct": qoq_pct}
-
-    except Exception as e:
-        print(f"  Profitability fetch error for {symbol}: {e}")
-        return {"profit_status": "N/A", "profit_last_qtr_pct": None}
-
-
-def download_all_corporate_actions(symbols, start_date="2016-01-01"):
-    """Download corporate actions for all symbols."""
-    print(f"Downloading corporate actions for {len(symbols)} symbols...")
-    all_events = []
-    found = 0
-
-    for i, symbol in enumerate(symbols):
-        events = download_corporate_actions(symbol, start_date)
-        if events:
-            all_events.extend(events)
-            found += 1
-
-        if (i + 1) % 50 == 0:
-            print(f"  Corporate actions: {i+1}/{len(symbols)} symbols, {found} with events")
-        # Rate limiter in alpaca_get handles pacing
-
-    # Store in DB
-    if all_events:
-        db = get_db()
-        for ev in all_events:
-            db.execute("""
-                INSERT OR IGNORE INTO corporate_events (symbol, event_type, event_date, description)
-                VALUES (?, ?, ?, ?)
-            """, (ev['symbol'], ev['event_type'], ev['event_date'], ev['description']))
-        db.commit()
-        db.close()
-        print(f"Stored {len(all_events)} corporate events for {found} symbols")
-
-    return all_events
-
-
-# ── Asset Management ────────────────────────────────────────────────
-def download_all_assets():
-    """Download all tradeable assets from Alpaca trading API."""
-    print("Downloading all tradeable assets...")
-    assets = []
-    page_token = None
-    page = 0
-
-    while True:
-        page += 1
-        params = {"status": "active", "asset_class": "us_equity", "limit": 1000}
-        if page_token:
-            params["page_token"] = page_token
-
-        resp = alpaca_get("/v2/assets", base=TRADE_URL, params=params)
-
-        if resp.status_code != 200:
-            print(f"  Assets API returned {resp.status_code}: {resp.text[:200]}")
-            break
-
-        try:
-            data = resp.json()
-        except Exception as e:
-            print(f"  JSON parse error: {e}, response: {resp.text[:200]}")
-            break
-
-        if isinstance(data, list):
-            assets.extend(data)
-            print(f"  Page {page}: got {len(data)} assets (list format)")
-            break
-        elif isinstance(data, dict):
-            batch = data.get("assets", [])
-            assets.extend(batch)
-            print(f"  Page {page}: got {len(batch)} assets")
-            page_token = data.get("next_page_token")
-            if not page_token:
-                break
-        else:
-            print(f"  Unexpected response type: {type(data)}")
-            break
-
-    # Also fetch index assets (SPY, QQQ, etc.)
-    try:
-        resp = alpaca_get("/v2/assets", base=TRADE_URL, params={"status": "active", "asset_class": "index", "limit": 100})
-        if resp.status_code == 200:
-            data = resp.json()
-            idx_assets = data if isinstance(data, list) else data.get("assets", [])
-            if idx_assets:
-                assets.extend(idx_assets)
-                print(f"  Added {len(idx_assets)} index assets")
-    except Exception as e:
-        print(f"  Index assets error: {e}")
-
-    print(f"Total found: {len(assets)} assets")
-    return assets
-
-
-def store_assets(assets):
-    """Store assets in the database."""
-    if not assets:
-        return 0
-
-    conn = get_db()
-    count = 0
-    batch = []
-    for a in assets:
-        batch.append((
-            a.get("symbol", ""),
-            a.get("name", ""),
-            a.get("asset_class", ""),
-            a.get("exchange", ""),
-            a.get("status", ""),
-            1 if a.get("tradable", False) else 0,
-            1 if a.get("fractionable", False) else 0,
-            1 if a.get("marginable", False) else 0,
-            datetime.now().isoformat()
-        ))
-
-    if batch:
-        conn.executemany("""
-            INSERT OR IGNORE INTO assets (symbol, name, asset_class, exchange, status, tradable, fractionable, marginable, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, batch)
-        conn.commit()
-        count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-
-    conn.close()
-    print(f"  Assets in DB: {count}")
-    return count
-
-
-def download_snapshots(symbols):
-    """Download live snapshot data for symbols using batch endpoint."""
-    print(f"Downloading snapshots for {len(symbols)} symbols...")
-    snapshots = {}
-    batch_size = 1000  # Alpaca supports up to 2000, use 1000 for safety
-
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        params = {"symbols": ",".join(batch)}
-        try:
-            resp = alpaca_get("/v2/stocks/snapshots", params=params)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    snapshots.update(data)
-            elif resp.status_code == 422:
-                # Too many symbols, split further
-                print(f"  Batch too large ({len(batch)} symbols), splitting...")
-                for sub_i in range(0, len(batch), 500):
-                    sub_batch = batch[sub_i:sub_i + 500]
-                    sub_params = {"symbols": ",".join(sub_batch)}
-                    try:
-                        sub_resp = alpaca_get("/v2/stocks/snapshots", params=sub_params)
-                        if sub_resp.status_code == 200:
-                            sub_data = sub_resp.json()
-                            if isinstance(sub_data, dict):
-                                snapshots.update(sub_data)
-                        time.sleep(0.3)
-                    except Exception as e:
-                        print(f"  Sub-batch error: {e}")
-        except Exception as e:
-            print(f"Error fetching snapshots batch {i}: {e}")
-        time.sleep(0.3)
-
-    print(f"Got snapshots for {len(snapshots)}/{len(symbols)} symbols")
-    return snapshots
-
-
-# ── Weighted Alpha ───────────────────────────────────────────────────
-def calculate_weighted_alpha_from_snapshot(symbol, snapshot, conn=None):
-    """
-    Calculate Weighted Alpha using snapshot data.
-
-    Full formula (with historical bars): WA = ((price_N_days_ago - current) / price_N_days_ago) * 100
-    With optimal lookback search (60-500 days) to match Barchart reference.
-
-    Without historical bars, we use the available dailyBar + prevDailyBar
-    to compute a short-term momentum proxy.
-
-    Splits are NOT auto-adjusted — corporate_events are queried to skip lookback
-    windows that span a known split, and extreme values are clamped to ±10,000%
-    to flag obvious data issues (unadjusted reverse splits, etc).
-    """
-    owned = conn is None
-    if owned:
-        conn = get_db()
-    bars = conn.execute(
-        "SELECT date, open, high, low, close, volume FROM bars WHERE symbol = ? ORDER BY date ASC",
-        (symbol,)
-    ).fetchall()
-    # Fetch split event dates (if any) so we don't span them in our lookback window
-    split_dates = set()
-    if bars:
-        for ev in conn.execute(
-            "SELECT event_date FROM corporate_events WHERE UPPER(symbol) = UPPER(?) AND LOWER(event_type) LIKE '%split%'",
-            (symbol,)
-        ).fetchall():
-            split_dates.add(ev['event_date'])
-    if owned:
-        conn.close()
-
-    # Reference WA from Barchart CSV if available
-    ref_wa = _load_reference_wa(symbol)
-
-    def _clamp(wa):
-        """Cap at ±10,000% — anything beyond is almost certainly an unadjusted split."""
-        return max(-10000.0, min(10000.0, wa))
-
-    if bars and len(bars) >= 60:
-        current_price = bars[-1]['close']
-        # Build set of split bar indices
-        split_indices = set()
-        for i, b in enumerate(bars):
-            if b['date'] in split_dates:
-                split_indices.add(i)
-
-        def _spans_split(lookback):
-            """True if the lookback window crosses a known split."""
-            end_idx = len(bars) - 1
-            start_idx = end_idx - lookback
-            for s_idx in split_indices:
-                if start_idx < s_idx < end_idx:
-                    return True
-            return False
-
-        if ref_wa is not None:
-            # Brute-force optimal lookback search (60-500 days)
-            best_wa = current_price
-            best_lookback = 252
-            best_error = float('inf')
-
-            for lookback in range(60, min(501, len(bars))):
-                if _spans_split(lookback):
-                    continue
-                ago_price = bars[-lookback]['close']
-                if ago_price <= 0:
-                    continue
-                candidate_wa = ((current_price - ago_price) / ago_price) * 100
-                error_pct = abs(candidate_wa - ref_wa) / (abs(ref_wa) + 0.01) * 100
-                if error_pct < best_error:
-                    best_error = error_pct
-                    best_wa = candidate_wa
-                    best_lookback = lookback
-
-            return round(_clamp(best_wa), 1)
-        else:
-            # Fallback: 252-day simple return, prefer a window that doesn't span a split
-            for lookback in (252, 180, 120, 90, 60):
-                if lookback > len(bars) - 1:
-                    continue
-                if _spans_split(lookback):
-                    continue
-                ago_price = bars[-lookback]['close']
-                if ago_price <= 0:
-                    continue
-                wa = ((current_price - ago_price) / ago_price) * 100
-                return round(_clamp(wa), 1)
-            # All candidate lookbacks span a split — fall back to a short recent window
-            if len(bars) >= 2:
-                ago_price = bars[-2]['close']
-                if ago_price > 0:
-                    return round(_clamp(((current_price - ago_price) / ago_price) * 100), 1)
-            return 0.0
-
-    # No historical bars — compute from snapshot data
-    if snapshot:
-        daily_bar = snapshot.get('dailyBar', {})
-        prev_bar = snapshot.get('prevDailyBar', {})
-
-        if daily_bar and prev_bar:
-            open_price = daily_bar.get('o', 0)
-            prev_close = prev_bar.get('c', 0)
-
-            if open_price > 0 and prev_close > 0:
-                one_day_wa = ((open_price - prev_close) / prev_close) * 100
-
-                if ref_wa is not None:
-                    scaled = one_day_wa * 30
-                    return round(_clamp(min(max(scaled, ref_wa - 20), ref_wa + 20)), 1)
-
-                return round(_clamp(one_day_wa), 1)
-
-    return 0.0
-
-
-def _load_reference_wa(symbol):
-    """Load reference WA from Barchart CSV if available."""
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
-                            "stocks-screener-weighted-alpha-52-high-05-31-2026.csv")
-    if not os.path.exists(csv_path):
-        return None
-
-    try:
-        df = pd.read_csv(csv_path)
-        sym_col = None
-        wa_col = None
-        for col in df.columns:
-            cl = col.lower()
-            if 'symbol' in cl or 'ticker' in cl:
-                sym_col = col
-            if 'weighted' in cl or 'alpha' in cl:
-                wa_col = col
-
-        if sym_col and wa_col:
-            row = df[df[sym_col].astype(str).str.upper() == symbol.upper()]
-            if not row.empty:
-                return float(row.iloc[0][wa_col])
-    except Exception:
-        pass
-    return None
-
-
-def compute_stats_from_bars(symbol, conn=None):
-    """Compute stats for a symbol purely from stored bar data (no API needed)."""
-    owned = conn is None
-    if owned:
-        conn = get_db()
-    bars = conn.execute(
-        "SELECT date, open, high, low, close, volume FROM bars WHERE symbol = ? ORDER BY date ASC",
-        (symbol,)
-    ).fetchall()
-    asset = conn.execute(
-        "SELECT * FROM assets WHERE symbol = ?", (symbol,)
-    ).fetchone()
-
-    if not bars or len(bars) == 0:
-        if owned:
-            conn.close()
-        return None
-
-    latest = bars[-1]
-    price = latest['close']
-    volume = latest['volume']
-
-    # Change %: compare latest close to previous close
-    if len(bars) >= 2:
-        prev_close = bars[-2]['close']
-        if prev_close > 0:
-            change_pct = ((price - prev_close) / prev_close) * 100
-        else:
-            change_pct = 0.0
-    else:
-        change_pct = 0.0
-
-    # Weighted Alpha — pass shared conn to avoid lock
-    wa = calculate_weighted_alpha_from_snapshot(symbol, None, conn=conn)
-
-    # ATRP: average daily range as % of price
-    if len(bars) >= 20:
-        recent = bars[-20:]
-        daily_ranges = [(b['high'] - b['low']) / price * 100 for b in recent if price > 0 and b['high'] > b['low']]
-        atrp = sum(daily_ranges) / len(daily_ranges) if daily_ranges else 0.0
-    elif len(bars) >= 1:
-        atrp = ((latest['high'] - latest['low']) / price * 100) if price > 0 else 0.0
-    else:
-        atrp = 0.0
-
-    atr_data = compute_atr_for_screener(symbol, '1Day', 2)
-    atr_signal = atr_data['atr_signal'] if atr_data else (1 if change_pct > 0 else -1)
-    atr_stop = atr_data['atr_stop'] if atr_data else (price * 0.95 if price > 0 else None)
-
-    # Streak: count consecutive up/down days from the latest bar
-    streak = 0
-    if len(bars) >= 2:
-        # Determine direction from the most recent day
-        latest_close = bars[-1]['close']
-        prev_close = bars[-2]['close']
-        if latest_close > prev_close:
-            # Count consecutive up days going backwards
-            for i in range(len(bars) - 1, 0, -1):
-                if bars[i]['close'] > bars[i - 1]['close']:
-                    streak += 1
-                else:
-                    break
-        elif latest_close < prev_close:
-            # Count consecutive down days going backwards
-            for i in range(len(bars) - 1, 0, -1):
-                if bars[i]['close'] < bars[i - 1]['close']:
-                    streak -= 1
-                else:
-                    break
-
-    name = asset['name'] if asset else symbol
-    asset_class = asset['asset_class'] if asset else 'us_equity'
-    exchange = asset['exchange'] if asset else ''
-    status = asset['status'] if asset else 'active'
-    tradable = asset['tradable'] if asset else 1
-    fractionable = asset['fractionable'] if asset else 0
-    marginable = asset['marginable'] if asset else 0
-
-    return {
-        'symbol': symbol,
-        'name': name,
-        'price': price,
-        'volume': volume,
-        'change_pct': round(change_pct, 2),
-        'atrp': round(atrp, 2),
-        'weighted_alpha': wa,
-        'atr_signal': atr_signal,
-        'atr_stop': atr_stop,
-        'streak': streak,
-        'fractionable': fractionable,
-        'marginable': marginable,
-        'asset_class': asset_class,
-        'exchange': exchange,
-        'status': status,
-        'tradable': tradable,
-    }
-    if owned:
-        conn.close()
-    return result
-
-
-def aggregate_bars_to_tf(symbol, tf):
-    """Aggregate 1Day bars into 1Week or 1Month bars.
-
-    Returns list of aggregated bar dicts ordered by date ascending.
-    """
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT date, open, high, low, close, volume FROM bars WHERE symbol = ? AND timeframe = '1Day' ORDER BY date ASC",
-        (symbol,)
-    ).fetchall()
-    conn.close()
-
-    if not rows or len(rows) == 0:
-        return []
-
-    if tf == '1Day':
-        return [dict(r) for r in rows]
-
-    # Group format
-    if tf == '1Week':
-        group_fmt = '%Y-%W'
-    elif tf == '1Month':
-        group_fmt = '%Y-%m'
-    else:
-        return [dict(r) for r in rows]
-
-    from collections import defaultdict
-    groups = defaultdict(list)
-    for r in rows:
-        d = datetime.strptime(r['date'], '%Y-%m-%d')
-        period = d.strftime(group_fmt)
-        groups[period].append(dict(r))
-
-    result = []
-    for period in sorted(groups.keys()):
-        bars = groups[period]
-        agg = {
-            'date': bars[0]['date'],
-            'open': bars[0]['open'],
-            'high': max(b['high'] for b in bars),
-            'low': min(b['low'] for b in bars),
-            'close': bars[-1]['close'],
-            'volume': sum(b['volume'] for b in bars),
-        }
-        result.append(agg)
-
-    return result
-
-
-def compute_stats_from_bars_tf(symbol, tf='1Day'):
-    """Compute stats for a symbol at a given timeframe from aggregated 1Day bars.
-
-    Used for 1Week and 1Month screener views. Computes on-the-fly from DB.
-    """
-    bars = aggregate_bars_to_tf(symbol, tf)
-    if not bars or len(bars) == 0:
-        return None
-
-    conn = get_db()
-    asset = conn.execute(
-        "SELECT * FROM assets WHERE symbol = ?", (symbol,)
-    ).fetchone()
-    conn.close()
-
-    latest = bars[-1]
-    price = latest['close']
-    volume = latest['volume']
-
-    # Change %: compare latest close to previous close in this timeframe
-    if len(bars) >= 2:
-        prev_close = bars[-2]['close']
-        if prev_close > 0:
-            change_pct = ((price - prev_close) / prev_close) * 100
-        else:
-            change_pct = 0.0
-    else:
-        change_pct = 0.0
-
-    # Weighted Alpha — use reference WA scaled to timeframe
-    ref_wa = _load_reference_wa(symbol)
-    if tf == '1Week' and len(bars) >= 4:
-        weekly_changes = []
-        for i in range(max(0, len(bars) - 12), len(bars)):
-            if i > 0 and bars[i - 1]['close'] > 0:
-                wc = ((bars[i]['close'] - bars[i - 1]['close']) / bars[i - 1]['close']) * 100
-                weekly_changes.append(wc)
-        if weekly_changes:
-            avg_wc = sum(weekly_changes) / len(weekly_changes)
-            wa = avg_wc * 4  # Scale ~4 weeks per month
-            if ref_wa is not None:
-                wa = round(min(max(wa, ref_wa - 20), ref_wa + 20), 1)
-            else:
-                wa = round(wa, 1)
-        else:
-            wa = 0.0
-    elif tf == '1Month' and len(bars) >= 2:
-        monthly_changes = []
-        for i in range(max(0, len(bars) - 6), len(bars)):
-            if i > 0 and bars[i - 1]['close'] > 0:
-                mc = ((bars[i]['close'] - bars[i - 1]['close']) / bars[i - 1]['close']) * 100
-                monthly_changes.append(mc)
-        if monthly_changes:
-            avg_mc = sum(monthly_changes) / len(monthly_changes)
-            wa = avg_mc * 12  # Scale to annual
-            if ref_wa is not None:
-                wa = round(min(max(wa, ref_wa - 20), ref_wa + 20), 1)
-            else:
-                wa = round(wa, 1)
-        else:
-            wa = 0.0
-    else:
-        wa = 0.0
-
-    # ATRP: average period range as % of price
-    if tf == '1Week':
-        lookback = min(len(bars), 12)
-    elif tf == '1Month':
-        lookback = min(len(bars), 6)
-    else:
-        lookback = min(len(bars), 20)
-
-    if lookback >= 1:
-        recent = bars[-lookback:]
-        ranges = [(b['high'] - b['low']) / price * 100 for b in recent if price > 0 and b['high'] > b['low']]
-        atrp = sum(ranges) / len(ranges) if ranges else 0.0
-    else:
-        atrp = 0.0
-
-    atr_data = compute_atr_for_screener(symbol, tf, 2)
-    atr_signal = atr_data['atr_signal'] if atr_data else (1 if change_pct > 0 else -1)
-    atr_stop = atr_data['atr_stop'] if atr_data else (price * 0.95 if price > 0 else None)
-
-    # Streak for timeframe
-    streak = 0
-    if len(bars) >= 2:
-        latest_close = bars[-1]['close']
-        prev_close = bars[-2]['close']
-        if latest_close > prev_close:
-            for i in range(len(bars) - 1, 0, -1):
-                if bars[i]['close'] > bars[i - 1]['close']:
-                    streak += 1
-                else:
-                    break
-        elif latest_close < prev_close:
-            for i in range(len(bars) - 1, 0, -1):
-                if bars[i]['close'] < bars[i - 1]['close']:
-                    streak -= 1
-                else:
-                    break
-
-    name = asset['name'] if asset else symbol
-    asset_class = asset['asset_class'] if asset else 'us_equity'
-    exchange = asset['exchange'] if asset else ''
-    status = asset['status'] if asset else 'active'
-    tradable = asset['tradable'] if asset else 1
-    fractionable = asset['fractionable'] if asset else 0
-    marginable = asset['marginable'] if asset else 0
-
-    return {
-        'symbol': symbol,
-        'name': name,
-        'price': price,
-        'volume': volume,
-        'change_pct': round(change_pct, 2),
-        'atrp': round(atrp, 2),
-        'weighted_alpha': wa,
-        'atr_signal': atr_signal,
-        'atr_stop': atr_stop,
-        'streak': streak,
-        'fractionable': fractionable,
-        'marginable': marginable,
-        'asset_class': asset_class,
-        'exchange': exchange,
-        'status': status,
-        'tradable': tradable,
-    }
-
-
-def store_bar(symbol, bar_data, timeframe='1Day'):
-    """Store a single bar in the database."""
-    db = get_db()
-    t = bar_data.get('t', bar_data.get('SOD_time', ''))
-    if isinstance(t, str):
-        date_str = t[:10]
-    else:
-        try:
-            date_str = datetime.fromtimestamp(t / 1000 if t > 1e12 else t).strftime('%Y-%m-%d')
-        except Exception:
-            date_str = datetime.now().strftime('%Y-%m-%d')
-
-    db.execute("""
-        INSERT OR IGNORE INTO bars (symbol, timeframe, date, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        symbol, timeframe, date_str,
-        bar_data.get('o', 0), bar_data.get('h', 0),
-        bar_data.get('l', 0), bar_data.get('c', 0),
-        bar_data.get('v', 0)
-    ))
-    db.commit()
-    db.close()
-
-
-def store_bars_batch(symbol_bars):
-    """Store multiple bars efficiently."""
-    db = get_db()
-    for symbol, bars in symbol_bars.items():
-        for bar in bars:
-            t = bar.get('t', '')
-            if isinstance(t, str):
-                date_str = t[:10]
-            else:
-                try:
-                    date_str = datetime.fromtimestamp(t / 1000 if t > 1e12 else t).strftime('%Y-%m-%d')
-                except Exception:
-                    continue
-
-            db.execute("""
-                INSERT OR IGNORE INTO bars (symbol, timeframe, date, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol, '1Day', date_str,
-                bar.get('o', 0), bar.get('h', 0),
-                bar.get('l', 0), bar.get('c', 0),
-                bar.get('v', 0)
-            ))
-    db.commit()
-    db.close()
-
-
-# ── Data Download ────────────────────────────────────────────────────
-def download_bars_for_symbols(symbols):
-    """Attempt to download historical bars. Some may be null (not available on paper tier)."""
-    print(f"Attempting to download bars for {len(symbols)} symbols...")
-    all_bars = {}
-    found = 0
-
-    batch_size = 100
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        batch_bars = {}
-
-        for symbol in batch:
-            try:
-                resp = alpaca_get(f"/v2/stocks/{symbol}/bars",
-                    params={"timeframe": "1Day", "limit": 500, "adjustment": "split"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    bars = data.get('bars')
-                    if bars and isinstance(bars, list) and len(bars) > 0:
-                        batch_bars[symbol] = bars
-                        found += 1
-            except Exception:
-                pass
-
-        all_bars.update(batch_bars)
-        time.sleep(0.5)
-        if (i // batch_size) % 5 == 0:
-            print(f"  Bars: {min(i + batch_size, len(symbols))}/{len(symbols)} (found: {found})")
-
-    print(f"Found historical bars for {found}/{len(symbols)} symbols")
-    return all_bars
-
-
-# ── Data Processing ──────────────────────────────────────────────────
-def compute_and_store_stats(assets, snapshots):
-    """Compute stats for all assets and store in database."""
-    print("Computing and storing stats...")
-    conn = get_db()
-
-    # First, store all snapshot bars
-    print("  Storing snapshot bars...")
-    bar_data = {}
-    for symbol, snap in snapshots.items():
-        if not snap:
-            continue
-        daily_bar = snap.get('dailyBar')
-        prev_bar = snap.get('prevDailyBar')
-        if daily_bar:
-            bar_data[symbol] = [daily_bar]
-        if prev_bar:
-            if symbol not in bar_data:
-                bar_data[symbol] = []
-            bar_data[symbol].append(prev_bar)
-
-    for symbol, bars in bar_data.items():
-        for bar in bars:
-            t = bar.get('t', '')
-            if isinstance(t, str):
-                date_str = t[:10]
-            else:
-                date_str = datetime.now().strftime('%Y-%m-%d')
-
-            conn.execute("""
-                INSERT OR IGNORE INTO bars (symbol, timeframe, date, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol, '1Day', date_str,
-                bar.get('o', 0), bar.get('h', 0),
-                bar.get('l', 0), bar.get('c', 0),
-                bar.get('v', 0)
-            ))
-    conn.commit()
-    print(f"  Stored bars for {len(bar_data)} symbols")
-
-    # Now compute stats
-    count = 0
-    for asset in assets:
-        symbol = asset.get("symbol", "")
-        if not symbol or not asset.get("tradable", False):
-            continue
-
-        snapshot = snapshots.get(symbol)
-        if not snapshot:
-            continue
-
-        # Parse snapshot data
-        daily_bar = snapshot.get('dailyBar', {})
-        prev_bar = snapshot.get('prevDailyBar', {})
-        minute_bar = snapshot.get('minuteBar', {})
-
-        price = daily_bar.get('c', prev_bar.get('c', 0))
-        volume = daily_bar.get('v', minute_bar.get('v', 0))
-        prev_close = prev_bar.get('c', 0)
-
-        change_pct = 0.0
-        if prev_close and prev_close > 0 and price > 0:
-            change_pct = ((price - prev_close) / prev_close) * 100
-
-        # Weighted Alpha
-        wa = calculate_weighted_alpha_from_snapshot(symbol, snapshot)
-
-        # Pre/post market (not directly available in basic snapshot)
-        pre_price = None
-        pre_change_pct = None
-        post_price = None
-        post_change_pct = None
-
-        # ATR: use compute_atr_for_screener if available, else fallback
-        atr_data = compute_atr_for_screener(symbol, '1Day', 2)
-        atr_signal = atr_data['atr_signal'] if atr_data else (1 if change_pct > 0 else -1)
-        atr_stop = atr_data['atr_stop'] if atr_data else (price * 0.95 if price > 0 else None)
-        streak = 0
-
-        # Estimate profit_status from weighted_alpha
-        if wa > 20:
-            profit_status = "profitable"
-        elif wa > 5:
-            profit_status = "growing"
-        elif wa < -30:
-            profit_status = "loss_making"
-        elif wa < -10:
-            profit_status = "declining"
-        else:
-            profit_status = "neutral"
-
-        conn.execute("""
-            INSERT OR REPLACE INTO stats (
-                symbol, name, price, volume, change_pct, atrp, weighted_alpha,
-                atr_signal, atr_stop, streak, pre_price, pre_change_pct,
-                post_price, post_change_pct, fractionable, marginable,
-                asset_class, exchange, status, tradable, last_updated,
-                profit_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            asset.get("name", ""),
-            price,
-            volume,
-            round(change_pct, 2),
-            round(atrp, 2),
-            wa,
-            atr_signal,
-            atr_stop,
-            streak,
-            pre_price,
-            pre_change_pct,
-            post_price,
-            post_change_pct,
-            asset.get("fractionable", False),
-            asset.get("marginable", False),
-            asset.get("asset_class", ""),
-            asset.get("exchange", ""),
-            asset.get("status", ""),
-            asset.get("tradable", False),
-            datetime.now().isoformat(),
-            profit_status
-        ))
-        count += 1
-
-    conn.commit()
-    conn.close()
-    print(f"Stats computed and stored for {count} symbols.")
-
-
-# ── Popular Tickers (Fallback / Quick Start) ────────────────────────
-POPULAR_TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK.B", "LLY", "AVGO",
-    "JPM", "V", "WMT", "MA", "XOM", "UNH", "HD", "PG", "COST", "JNJ",
-    "NFLX", "AMD", "INTC", "PYPL", "DIS", "VZ", "KO", "PEP", "T", "ABT",
-    "CRM", "NKE", "MRK", "TXN", "QCOM", "HON", "UNP", "LOW", "UPS", "BLK",
-    "AXP", "GS", "SPGI", "CAT", "DE", "BA", "GE", "F", "GM", "LCID",
-    "RIVN", "PLTR", "SOFI", "HOOD", "COIN", "MARA", "RIOT", "MSTR", "SQ", "SHOP",
-    "UBER", "LYFT", "ABNB", "DASH", "PANW", "NET", "SNOW", "CRWD", "ZS", "OKTA",
-    "QQQ", "SPY", "IWM", "DIA", "VTI", "VOO", "TQQQ", "SQQQ", "ARKK", "TAN",
-    "ICLN", "PBW", "KWEB", "MCHI", "INDA", "EWJ", "EWG", "EWU", "EWC", "EWA",
-    "GLD", "SLV", "USO", "DBA", "TLT", "HYG", "LQD", "BND", "TIP", "MUB",
-    "O", "T", "VZ", "KO", "PEP", "WMT", "COST", "HD", "LOW", "TJX",
-    "MCD", "SBUX", "CMG", "YUM", "DPZ", "WEN", "QSR", "PZZA", "CAKE", "DRI",
-    "CVX", "COP", "SLB", "HAL", "OXY", "MRO", "DVN", "FANG", "MUR", "VLO",
-    "BA", "LMT", "RTX", "NOC", "GD", "TXT", "LHX", "AXL", "HWM", "CR",
-    "PFE", "ABBV", "MRK", "AMGN", "GILD", "REGN", "VRTX", "MRNA", "BNTX", "ILMN",
-    "ISRG", "MDT", "SYK", "BSX", "EW", "STE", "ZBH", "COO", "BAX", "PKI",
-    "BLK", "BX", "KKR", "APO", "CG", "TPG", "ARES", "OWL", "HLNE", "MC",
-    "SCHW", "CME", "ICE", "MCO", "SPGI", "MSCI", "FDS", "VRSK", "CMCSA", "CHTR",
-    "TMUS", "TEF", "ORAN", "KT", "SKT", "LUMN", "USM", "FITB", "USB", "PNC",
-    "TFC", "CFG", "KEY", "RF", "CMA", "ZION", "WAL", "SBNY", "FRC", "PACW",
+import pandas as pd
+from flask import Flask, render_template, request, jsonify, Blueprint, g
+
+from dumbmoney.config import FLASK_SECRET_KEY, FLASK_DEBUG, DB_PATHS
+from dumbmoney.db import init_all_dbs, get_db, ensure_schema, migrate_nulls
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+app.secret_key = FLASK_SECRET_KEY
+app.config["DEBUG"] = FLASK_DEBUG
+
+screener_bp = Blueprint("screener", __name__)
+stock_bp = Blueprint("stock", __name__)
+portfolio_bp = Blueprint("portfolio", __name__)
+string_bp = Blueprint("string", __name__)
+string_screener_bp = Blueprint("string_screener", __name__)
+ai_bp = Blueprint("ai", __name__)
+paper_bp = Blueprint("paper", __name__)
+api_bp = Blueprint("api", __name__)
+india_bp = Blueprint("india", __name__)
+crypto_bp = Blueprint("crypto", __name__)
+
+SCREENER_COLUMN_REFERENCE = [
+    {"key": "symbol", "label": "Symbol", "current": "stats.symbol", "historical": "historical_screener.symbol", "meaning": "Ticker identifier."},
+    {"key": "name", "label": "Name", "current": "stats.name", "historical": "assets.name", "meaning": "Asset name from the market universe."},
+    {"key": "exchange", "label": "Exchange", "current": "stats.exchange", "historical": "assets.exchange", "meaning": "Listing exchange."},
+    {"key": "asset_class", "label": "Type", "current": "stats.asset_class", "historical": "assets.asset_class", "meaning": "Asset class such as stock or ETF."},
+    {"key": "price", "label": "Price", "current": "stats.price", "historical": "historical_screener.price", "meaning": "Current mode latest close; date mode close on the selected trading date."},
+    {"key": "pre_change_pct", "label": "Pre %", "current": "stats.pre_change_pct", "historical": "NULL", "meaning": "Current US pre-market percent move when available; current-session only."},
+    {"key": "post_change_pct", "label": "Post %", "current": "stats.post_change_pct", "historical": "NULL", "meaning": "Current US post-market percent move when available; current-session only."},
+    {"key": "change_pct", "label": "Chg%", "current": "stats.change_pct", "historical": "historical_screener.change_pct", "meaning": "Close-to-previous-trading-close percent change for the row date."},
+    {"key": "next_day_return", "label": "Next Day %", "current": "stats.next_day_return", "historical": "historical_screener.next_day_return", "meaning": "Current mode latest completed one-day realized return; date mode next trading close vs selected close."},
+    {"key": "prob_up_1d", "label": "P(Up) 1D", "current": "stats.prob_up_1d", "historical": "historical_screener.prob_up_1d", "meaning": "Trailing probability that the next one-day close move was positive using data available as of the row date."},
+    {"key": "prob_up_5d", "label": "P(Up) 5D", "current": "stats.prob_up_5d", "historical": "historical_screener.prob_up_5d", "meaning": "Trailing probability that the next five-day close move was positive using data available as of the row date."},
+    {"key": "prob_up_1w", "label": "P(Up) 1W", "current": "stats.prob_up_1w", "historical": "historical_screener.prob_up_1w", "meaning": "Trailing probability that the next week (5 trading days) close move was positive using data available as of the row date."},
+    {"key": "prob_up_1m", "label": "P(Up) 1M", "current": "stats.prob_up_1m", "historical": "historical_screener.prob_up_1m", "meaning": "Trailing probability that the next month (22 trading days) close move was positive using data available as of the row date."},
+    {"key": "prob_up_st_cross", "label": "P(Up) ST Cross", "current": "stats.prob_up_st_cross", "historical": "historical_screener.prob_up_st_cross", "meaning": "Expanding-window probability that the next day closes higher after a 14d/1x SuperTrend bullish cross, using data available as of the row date."},
+    {"key": "weighted_alpha", "label": "Wtd Alpha", "current": "stats.weighted_alpha", "historical": "historical_screener.weighted_alpha", "meaning": "Weighted price performance computed only from bars available as of the row date."},
+    {"key": "volume", "label": "Volume", "current": "stats.volume", "historical": "historical_screener.volume", "meaning": "Daily bar volume for the row date; never signed."},
+    {"key": "streak", "label": "Streak", "current": "stats.streak", "historical": "historical_screener.streak", "meaning": "Consecutive up or down close streak as of the row date."},
+    {"key": "confluence", "label": "Confluence", "current": "stats.confluence", "historical": "historical_screener.confluence", "meaning": "Combined technical score computed from row-date indicator values."},
+    {"key": "ai_overall_score", "label": "AI Score", "current": "ai_analysis.overall_score", "historical": "historical_screener.ai_overall_score", "meaning": "Local vectorized score, not external generated text."},
+    {"key": "ai_volume_profile_score", "label": "VP Score", "current": "ai_analysis.volume_profile_score", "historical": "historical_screener.ai_volume_profile_score", "meaning": "Local volume-profile score computed from available bars."},
+    {"key": "ai_trendline_score", "label": "Trend Score", "current": "ai_analysis.trendline_score", "historical": "historical_screener.ai_trendline_score", "meaning": "Local trendline score computed from available bars."},
+    {"key": "ai_sentiment_score", "label": "Sentiment", "current": "ai_analysis.sentiment_score", "historical": "historical_screener.ai_sentiment_score", "meaning": "Local sentiment/proxy score; historical mode uses stored row-date value."},
+    {"key": "ai_conclusion", "label": "Conclusion", "current": "ai_analysis.conclusion", "historical": "historical_screener.ai_conclusion", "meaning": "BUY/HOLD/SELL label derived from local scores."},
+    {"key": "ai_matrix", "label": "AI Matrix", "current": "ai_analysis.ai_matrix", "historical": "historical_screener.ai_matrix", "meaning": "Sigmoid-based directional prediction score 0-100. Higher = more likely next-day up."},
+    {"key": "atr_signal", "label": "ATR Signal", "current": "stats.atr_signal", "historical": "historical_screener.atr_signal", "meaning": "ATR Trailing Stop direction: 1 above (bullish), -1 below (bearish), 0 neutral."},
+    {"key": "atr_crossed_above", "label": "Cross Up", "current": "stats.atr_crossed_above", "historical": "historical_screener.atr_crossed_above", "meaning": "ATR Trailing Stop crossed from bearish to bullish on the row date."},
+    {"key": "atr_crossed_below", "label": "Cross Down", "current": "stats.atr_crossed_below", "historical": "historical_screener.atr_crossed_below", "meaning": "ATR Trailing Stop crossed from bullish to bearish on the row date."},
+    {"key": "atr_stop", "label": "ATR Stop 14x1", "current": "stats.atr_stop", "historical": "historical_screener.atr_stop", "meaning": "ATR Trailing Stop line using the app's current 14 period, 1.0 multiplier setup."},
+    {"key": "atr_signal_w", "label": "ATR Signal W", "current": "stats.atr_signal_w", "historical": "historical_screener.atr_signal_w", "meaning": "Rolling weekly ATR Trailing Stop direction: 1 above, -1 below, 0 neutral."},
+    {"key": "atr_crossed_above_w", "label": "Cross Up W", "current": "stats.atr_crossed_above_w", "historical": "historical_screener.atr_crossed_above_w", "meaning": "Rolling weekly ATR Trailing Stop crossed from bearish to bullish."},
+    {"key": "atr_crossed_below_w", "label": "Cross Down W", "current": "stats.atr_crossed_below_w", "historical": "historical_screener.atr_crossed_below_w", "meaning": "Rolling weekly ATR Trailing Stop crossed from bullish to bearish."},
+    {"key": "atr_stop_w", "label": "ATR Stop W", "current": "stats.atr_stop_w", "historical": "historical_screener.atr_stop_w", "meaning": "Rolling weekly ATR Trailing Stop line."},
+    {"key": "atr_signal_m", "label": "ATR Signal M", "current": "stats.atr_signal_m", "historical": "historical_screener.atr_signal_m", "meaning": "Rolling monthly ATR Trailing Stop direction: 1 above, -1 below, 0 neutral."},
+    {"key": "atr_crossed_above_m", "label": "Cross Up M", "current": "stats.atr_crossed_above_m", "historical": "historical_screener.atr_crossed_above_m", "meaning": "Rolling monthly ATR Trailing Stop crossed from bearish to bullish."},
+    {"key": "atr_crossed_below_m", "label": "Cross Down M", "current": "stats.atr_crossed_below_m", "historical": "historical_screener.atr_crossed_below_m", "meaning": "Rolling monthly ATR Trailing Stop crossed from bullish to bearish."},
+    {"key": "atr_stop_m", "label": "ATR Stop M", "current": "stats.atr_stop_m", "historical": "historical_screener.atr_stop_m", "meaning": "Rolling monthly ATR Trailing Stop line."},
+    {"key": "atrp", "label": "ATR%", "current": "stats.atrp", "historical": "historical_screener.atrp", "meaning": "ATR percent as of the row date."},
+    {"key": "accel_signal", "label": "Accel", "current": "stats.accel_signal", "historical": "historical_screener.accel_signal", "meaning": "Accel trend state: 1 up, -1 down, 0 neutral."},
+    {"key": "accel_crossed_up", "label": "Accel Up", "current": "stats.accel_crossed_up", "historical": "historical_screener.accel_crossed_up", "meaning": "Accel crossed up on the row date."},
+    {"key": "accel_crossed_down", "label": "Accel Down", "current": "stats.accel_crossed_down", "historical": "historical_screener.accel_crossed_down", "meaning": "Accel crossed down on the row date."},
+    {"key": "st_bars_below", "label": "ATR Bars Below", "current": "stats.st_bars_below", "historical": "historical_screener.st_bars_below", "meaning": "Number of bars price stayed below ATR Trailing Stop before a cross-up."},
+    {"key": "st_bars_above", "label": "ATR Bars Above", "current": "stats.st_bars_above", "historical": "historical_screener.st_bars_above", "meaning": "Number of bars price stayed above ATR Trailing Stop before a cross-down."},
+    {"key": "accel_bars_below", "label": "Accel Bars Below", "current": "stats.accel_bars_below", "historical": "historical_screener.accel_bars_below", "meaning": "Number of bars price stayed below Accel before a cross-up."},
+    {"key": "accel_bars_above", "label": "Accel Bars Above", "current": "stats.accel_bars_above", "historical": "historical_screener.accel_bars_above", "meaning": "Number of bars price stayed above Accel before a cross-down."},
+    {"key": "marginable", "label": "Margin", "current": "stats.marginable", "historical": "assets.marginable", "meaning": "Can be traded on margin via Alpaca."},
+    {"key": "shortable", "label": "Shortable", "current": "assets.shortable", "historical": "assets.shortable", "meaning": "Can be shorted via Alpaca."},
+    {"key": "fractionable", "label": "Frac", "current": "stats.fractionable", "historical": "assets.fractionable", "meaning": "Broker/universe fractionable flag."},
+    {"key": "profit_status", "label": "Profit", "current": "stats.profit_status", "historical": "stats.profit_status", "meaning": "Current earnings/profit status until a historical fundamentals table exists."},
+    {"key": "last_updated", "label": "Updated", "current": "stats.last_updated", "historical": "historical_screener.date", "meaning": "Current mode stats update timestamp; date mode selected as-of date."},
 ]
 
-def _build_fallback_assets():
-    """Build asset dicts from popular tickers when API fails."""
-    assets = []
-    for sym in POPULAR_TICKERS:
-        assets.append({
-            "symbol": sym,
-            "name": sym,
-            "tradable": True,
-            "asset_class": "us_equity",
-            "exchange": "NYSE/NASDAQ",
-            "status": "active",
-            "fractionable": True,
-            "marginable": True,
-        })
-    return assets
 
+def _get_market():
+    if request.path.startswith("/india/"):
+        return "INDIA"
+    return request.path.split("/")[1] if len(request.path.split("/")) > 1 and request.path.split("/")[1] in ("US", "INDIA") else "US"
 
-# ── Data Refresh (Background) ────────────────────────────────────────
-refresh_lock = threading.Lock()
-refreshing = False
 
-def full_refresh():
-    """Delta-only refresh: fetch only new bars and update stats since last download.
+@app.context_processor
+def inject_market():
+    market = "US"
+    if request.path.startswith("/india"):
+        market = "INDIA"
+    elif request.path.startswith("/crypto"):
+        market = "CRYPTO"
+    other = "INDIA" if market == "US" else ("US" if market == "INDIA" else "CRYPTO")
+    return {"market": market, "other_market": other}
 
-    Instead of re-downloading everything, we:
-    1. Check downloaded_1day timestamp per symbol
-    2. Fetch only new bars (last 5 days to catch any missed)
-    3. Recompute stats only for symbols with new data
-    """
-    global refreshing
-    with refresh_lock:
-        if refreshing:
-            return
-        refreshing = True
 
-    # Track progress for frontend polling
-    with download_lock:
-        download_progress["status"] = "running"
-        download_progress["phase"] = "refresh"
-        download_progress["start_time"] = time.time()
-
-    try:
-        print("=" * 50)
-        print(f"Delta refresh started at {datetime.now()}")
-        print("=" * 50)
-
-        conn = get_db()
-
-        # Get symbols that already have stats
-        symbols_with_stats = [r['symbol'] for r in conn.execute(
-            "SELECT symbol FROM stats WHERE price > 0"
-        ).fetchall()]
-        conn.close()
-
-        if not symbols_with_stats:
-            print("No existing stats found. Use Download History for initial download.")
-            with download_lock:
-                download_progress["status"] = "error"
-                download_progress["phase"] = "refresh"
-                download_progress["message"] = "No data found. Use Download History first."
-            return
-
-        total_symbols = len(symbols_with_stats)
-        print(f"Refreshing {total_symbols} symbols with existing data")
-
-        with download_lock:
-            download_progress["symbols_total"] = total_symbols
-            download_progress["symbols_done"] = 0
-            download_progress["current_symbol"] = "Downloading snapshots..."
-
-        # Step 1: Download latest snapshots (fast, single API call per batch of 10)
-        print("Step 1: Downloading latest snapshots...")
-        snapshots = {}
-        snapshot_errors = []
-        batch_size = 10
-        for i in range(0, len(symbols_with_stats), batch_size):
-            batch = symbols_with_stats[i:i + batch_size]
-            symbols_param = ",".join(batch)
-            params = {"symbols": symbols_param}
-            resp = alpaca_get("/v2/stocks/snapshots", params=params)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Alpaca returns either {"snapshots": {sym: data}} or {sym: data} directly
-                if isinstance(data, dict) and "snapshots" in data and isinstance(data["snapshots"], dict):
-                    data = data["snapshots"]
-                for k, v in data.items():
-                    if v and isinstance(v, dict):
-                        snapshots[k] = v
-            else:
-                snapshot_errors.append(f"batch {i//batch_size + 1}: HTTP {resp.status_code}  body={resp.text[:120]}")
-                if len(snapshot_errors) <= 3:
-                    print(f"  Snapshot error: {snapshot_errors[-1]}", flush=True)
-
-            with download_lock:
-                download_progress["symbols_done"] = min(i + batch_size, total_symbols)
-                download_progress["current_symbol"] = f"Snapshot batch {i//batch_size + 1}"
-
-        if snapshot_errors:
-            print(f"  Total snapshot errors: {len(snapshot_errors)} (of {(len(symbols_with_stats) + batch_size - 1) // batch_size} batches)", flush=True)
-
-        print(f"  Got snapshots for {len(snapshots)} symbols")
-
-        if not snapshots:
-            print("No snapshot data received. Refresh complete.")
-            with download_lock:
-                download_progress["status"] = "complete"
-                download_progress["phase"] = "refresh"
-                download_progress["message"] = "Refresh complete (no new data)"
-            return
-
-        with download_lock:
-            download_progress["phase"] = "Updating stats..."
-            download_progress["current_symbol"] = "Computing stats..."
-
-        # Step 2: Compute and store stats from snapshots
-        print("Step 2: Updating stats...")
-        conn = get_db()
-        assets_for_stats = []
-        for sym in symbols_with_stats:
-            a = conn.execute("SELECT * FROM assets WHERE symbol = ?", (sym,)).fetchone()
-            if a:
-                assets_for_stats.append(dict(a))
-        conn.close()
-
-        compute_and_store_stats(assets_for_stats, snapshots)
-
-        # Step 3: Download only the last few days of new bars (in case any were missed)
-        with download_lock:
-            download_progress["phase"] = "Checking new bars..."
-            download_progress["current_symbol"] = "Scanning for new bars..."
-
-        print("Step 3: Checking for new bars...")
-        today = datetime.now().strftime("%Y-%m-%d")
-        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        new_bars_count = 0
-
-        for i in range(0, len(symbols_with_stats), 10):
-            batch = symbols_with_stats[i:i + 10]
-            batch_results = download_bars_batch(batch, "1Day", 5, week_ago, today)
-            conn = get_db()
-            batch_count = 0
-            for symbol in batch:
-                symbol_bars = batch_results.get(symbol, [])
-                if symbol_bars:
-                    _store_bars(symbol, "1Day", symbol_bars, conn=conn)
-                    new_bars_count += len(symbol_bars)
-                    batch_count += 1
-                    if batch_count >= 50:
-                        conn.commit()
-                        batch_count = 0
-                    _mark_downloaded(symbol, "1Day", conn=conn)
-                    _store_stats_for_symbol(symbol, conn=conn)
-            conn.commit()
-            conn.close()
-
-            with download_lock:
-                download_progress["symbols_done"] = min(i + 10, total_symbols)
-                download_progress["bars_found"] = new_bars_count
-                download_progress["current_symbol"] = f"Scanning bars batch {i//10 + 1}"
-
-        print(f"  New bars stored: {new_bars_count}")
-
-        # Step 4: Recompute ATR trailing stop for ALL symbols (from existing data)
-        with download_lock:
-            download_progress["phase"] = "Recomputing ATR..."
-            download_progress["current_symbol"] = "Computing ATR trailing stops..."
-
-        print("Step 4: Recomputing ATR trailing stops...")
-        conn = get_db()
-        atr_updated = 0
-        for idx, sym in enumerate(symbols_with_stats):
-            atr_data = compute_atr_for_screener(sym, '1Day', 2)
-            if atr_data:
-                conn.execute("""
-                    UPDATE stats SET
-                        atr_value = ?, atr_stop = ?, atr_signal = ?,
-                        atr_crossed_above = ?, atr_crossed_below = ?,
-                        atr_streak = ?, atr_multiplier = ?
-                    WHERE symbol = ?
-                """, (
-                    atr_data['atr_value'], atr_data['atr_stop'], atr_data['atr_signal'],
-                    atr_data['crossed_above'], atr_data['crossed_below'],
-                    atr_data['atr_streak'], atr_data['multiplier'],
-                    sym
-                ))
-                atr_updated += 1
-
-            if idx % 50 == 0:
-                with download_lock:
-                    download_progress["symbols_done"] = idx
-                    download_progress["current_symbol"] = f"ATR: {sym}"
-
-        conn.commit()
-        conn.close()
-        print(f"  ATR updated for {atr_updated}/{len(symbols_with_stats)} symbols")
-
-        with download_lock:
-            download_progress["symbols_done"] = total_symbols
-
-        profit_updated = 0
-        # Step 5: Update profitability data using yfinance (real financial statements)
-        with download_lock:
-            download_progress["phase"] = "Updating profitability..."
-            download_progress["current_symbol"] = "Fetching real financial data via yfinance..."
-
-        print("Step 5: Updating profitability data from yfinance...")
-        try:
-            import yfinance as yf
-            conn = get_db()
-            symbols = [r['symbol'] for r in conn.execute(
-                "SELECT symbol FROM stats WHERE price > 0 AND profit_status IN ('neutral','N/A') ORDER BY RANDOM() LIMIT 300"
-            ).fetchall()]
-            if symbols:
-                print(f"  Fetching financial data for {len(symbols)} symbols...")
-                for idx, sym in enumerate(symbols):
-                    try:
-                        tk = yf.Ticker(sym)
-                        financials = tk.financials
-                        if financials is not None and not financials.empty:
-                            if 'Net Income' in financials.index:
-                                ni = financials.loc['Net Income']
-                                latest_ni = ni.iloc[0] if not ni.empty else None
-                                prev_ni = ni.iloc[1] if len(ni) > 1 else None
-                                if latest_ni is not None:
-                                    if latest_ni > 0:
-                                        if prev_ni is not None and prev_ni > 0:
-                                            qoq = ((latest_ni - prev_ni) / abs(prev_ni)) * 100
-                                            ps = 'growing' if latest_ni > prev_ni else 'declining'
-                                        else:
-                                            ps = 'profitable' if latest_ni > 0 else 'loss_making'
-                                            qoq = None
-                                    else:
-                                        ps = 'loss_making'
-                                        qoq = None
-                                    profit_millions = round(latest_ni / 1000000, 2) if latest_ni else None
-                                    conn.execute("UPDATE stats SET profit_status = ?, profit_last_qtr_pct = ?, profit_millions = ? WHERE symbol = ?",
-                                                 (ps, qoq, profit_millions, sym))
-                                    profit_updated += 1
-                    except Exception:
-                        pass
-                    if idx % 50 == 0:
-                        conn.commit()
-                        with download_lock:
-                            download_progress["symbols_done"] = idx
-                            download_progress["current_symbol"] = f"Profit: {sym}"
-                conn.commit()
-                print(f"  Real profit data updated for {profit_updated} symbols")
-            conn.close()
-        except ImportError:
-            print("  yfinance not available, using weighted_alpha estimate")
-            profit_updated = conn.execute("SELECT COUNT(*) FROM stats WHERE price > 0").fetchone()[0]
-            conn = get_db()
-            conn.execute("""
-                UPDATE stats SET profit_status = CASE
-                    WHEN weighted_alpha > 20 THEN 'profitable'
-                    WHEN weighted_alpha > 5 THEN 'growing'
-                    WHEN weighted_alpha < -30 THEN 'loss_making'
-                    WHEN weighted_alpha < -10 THEN 'declining'
-                    ELSE 'neutral'
-                END WHERE price > 0
-            """)
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"  yfinance error: {e}, falling back to weighted_alpha")
-            profit_updated = conn.execute("SELECT COUNT(*) FROM stats WHERE price > 0").fetchone()[0]
-            try:
-                conn = get_db()
-                conn.execute("""
-                    UPDATE stats SET profit_status = CASE
-                        WHEN weighted_alpha > 20 THEN 'profitable'
-                        WHEN weighted_alpha > 5 THEN 'growing'
-                        WHEN weighted_alpha < -30 THEN 'loss_making'
-                        WHEN weighted_alpha < -10 THEN 'declining'
-                        ELSE 'neutral'
-                    END WHERE price > 0
-                """)
-                conn.commit()
-                conn.close()
-            except:
-                pass
-        print(f"  Profitability updated for {profit_updated}/{total_symbols} symbols")
-
-        # Step 6: Update pre/post market prices from trade snapshots
-        with download_lock:
-            download_progress["phase"] = "Updating pre/post..."
-            download_progress["current_symbol"] = "Fetching pre/post prices..."
-
-        print("Step 6: Updating pre/post market prices...")
-        conn = get_db()
-        prepost_updated = 0
-        batch_size = 10
-        for i in range(0, len(symbols_with_stats), batch_size):
-            batch = symbols_with_stats[i:i + batch_size]
-            symbols_param = ",".join(batch)
-            try:
-                resp = alpaca_get("/v2/stocks/snapshots", base=DATA_URL, params={"symbols": symbols_param})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and "snapshots" in data and isinstance(data["snapshots"], dict):
-                        data = data["snapshots"]
-                    for sym, snap in data.items():
-                        if not snap or not isinstance(snap, dict):
-                            continue
-                        latest_trade = snap.get('latestTrade', {})
-                        daily_bar = snap.get('dailyBar', {})
-                        prev_bar = snap.get('prevDailyBar', {})
-                        trade_price = latest_trade.get('p', 0)
-                        trade_ts = latest_trade.get('t', '')
-                        prev_close = prev_bar.get('c', 0) or daily_bar.get('o', 0)
-                        pre_price = post_price = pre_change_pct = post_change_pct = None
-                        if trade_price > 0 and prev_close > 0:
-                            if trade_ts:
-                                try:
-                                    dt = datetime.fromisoformat(trade_ts.replace('Z', '+00:00'))
-                                    hour = dt.hour
-                                    if hour < 13:
-                                        pre_price = trade_price
-                                        pre_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                    elif hour >= 20:
-                                        post_price = trade_price
-                                        post_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                    else:
-                                        pre_price = trade_price
-                                        pre_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                        post_price = trade_price
-                                        post_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                except Exception:
-                                    pass
-                            conn.execute("""
-                                UPDATE stats SET
-                                    pre_price = ?, pre_change_pct = ?,
-                                    post_price = ?, post_change_pct = ?,
-                                    last_updated = ?
-                                WHERE symbol = ?
-                            """, (pre_price, pre_change_pct, post_price, post_change_pct,
-                                  datetime.now().isoformat(), sym))
-                            prepost_updated += 1
-            except Exception as e:
-                print(f"  Pre/post batch error: {e}")
-            time.sleep(0.15)
-
-        conn.commit()
-        conn.close()
-        print(f"  Pre/post updated for {prepost_updated}/{total_symbols} symbols")
-
-        # Step 7: Batch AI analysis for symbols without recent scores
-        with download_lock:
-            download_progress["phase"] = "Computing AI scores..."
-            download_progress["current_symbol"] = "Running AI analysis..."
-
-        print("Step 7: Computing AI scores...")
-        ai_updated = 0
-        try:
-            conn = get_db()
-            # Get symbols needing AI update (no score or stale > 24h)
-            stale_cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
-            needs_ai = [r['symbol'] for r in conn.execute("""
-                SELECT s.symbol FROM stats s
-                LEFT JOIN ai_analysis ai ON UPPER(s.symbol) = UPPER(ai.symbol)
-                WHERE s.price > 0
-                AND (ai.overall_score IS NULL OR ai.computed_at < ?)
-                ORDER BY s.volume DESC
-            """, (stale_cutoff,)).fetchall()]
-            conn.close()
-
-            ai_updated = 0
-            for sym in needs_ai:
-                try:
-                    result = compute_ai_analysis(sym)
-                    conn = get_db()
-                    conn.execute("""
-                        INSERT OR REPLACE INTO ai_analysis
-                        (symbol, overall_score, bias, tech_score, momentum_score,
-                         volume_score, events_score, volume_profile_score,
-                         trendline_score, sentiment_score, conclusion, computed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        sym.upper(),
-                        result.get('overall_score', 0),
-                        result.get('bias', 'neutral'),
-                        result.get('tech_score', 0),
-                        result.get('momentum_score', 0),
-                        result.get('volume_score', 0),
-                        result.get('events_score', 0),
-                        result.get('volume_profile_score', 0),
-                        result.get('trendline_score', 0),
-                        result.get('sentiment_score', 0),
-                        result.get('conclusion', 'HOLD'),
-                        datetime.now().isoformat()
-                    ))
-                    conn.commit()
-                    conn.close()
-                    ai_updated += 1
-                except Exception as e:
-                    print(f"  AI error for {sym}: {e}")
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-
-            print(f"  AI scores computed for {ai_updated}/{len(needs_ai)} symbols")
-        except Exception as e:
-            print(f"  AI batch error: {e}")
-
-        # Step 8: Refresh corporate events for top symbols
-        with download_lock:
-            download_progress["phase"] = "Refreshing events..."
-            download_progress["current_symbol"] = "Downloading corporate events..."
-
-        print("Step 8: Refreshing corporate events...")
-        try:
-            conn = get_db()
-            top_by_volume = [r['symbol'] for r in conn.execute("""
-                SELECT symbol FROM stats WHERE price > 0 ORDER BY volume DESC LIMIT 500
-            """).fetchall()]
-            conn.close()
-            if top_by_volume:
-                download_all_corporate_actions(top_by_volume)
-                print(f"  Events refreshed for top {len(top_by_volume)} symbols")
-        except Exception as e:
-            print(f"  Events refresh error: {e}")
-
-        with download_lock:
-            download_progress["status"] = "complete"
-            download_progress["phase"] = "refresh"
-            download_progress["message"] = (
-                f"Refresh complete! {atr_updated} ATR, {profit_updated} fundamentals, "
-                f"{prepost_updated} pre/post, {ai_updated} AI scores updated."
-            )
-            download_progress["current_symbol"] = ""
-
-        print(f"Delta refresh complete at {datetime.now()}")
-
-    except Exception as e:
-        print(f"Refresh error: {e}")
-        import traceback
-        traceback.print_exc()
-        with download_lock:
-            download_progress["status"] = "error"
-            download_progress["phase"] = "refresh"
-            download_progress["message"] = f"Refresh failed: {str(e)}"
-    finally:
-        with refresh_lock:
-            refreshing = False
-
-
-# ── Full History Download ────────────────────────────────────────────
-download_lock = threading.Lock()
-downloading_history = False
-download_progress = {
-    "status": "idle",
-    "progress_type": "",     # "refresh", "prepost", "download", "reset"
-    "timeframe": "",
-    "phase": "",           # "assets", "corporate", "bars", "stats"
-    "symbols_total": 0,
-    "symbols_done": 0,
-    "bars_found": 0,
-    "current_symbol": "",
-    "start_date": "2016-01-01",
-    "end_date": datetime.now().strftime("%Y-%m-%d"),
-    "assets_total": 0,
-    "assets_fetched": 0,
-    "message": "",
-    "start_time": 0,
-    "eta": 0,
-    "speed": 0,
-}
-
-
-def _update_progress(**kwargs):
-    """Thread-safe progress update."""
-    global download_progress
-    with download_lock:
-        download_progress.update(kwargs)
-
-
-def _get_existing_symbols():
-    """Get list of all symbols that have any data in the DB."""
-    conn = get_db()
-    rows = conn.execute("SELECT symbol FROM stats WHERE price > 0").fetchall()
-    conn.close()
-    return [r['symbol'] for r in rows]
-
-
-def _count_bars_for_symbol(symbol):
-    """Count total bars stored for a symbol across all timeframes."""
-    conn = get_db()
-    count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM bars WHERE symbol = ?", (symbol,)
-    ).fetchone()['cnt']
-    conn.close()
-    return count
-
-
-def _get_all_asset_symbols():
-    """Get ALL tradable symbols from Alpaca API (full 12k+ list)."""
-    print("  Fetching complete asset list from Alpaca...")
-    assets = download_all_assets()
-    if assets:
-        store_assets(assets)
-        tradable = [a for a in assets if a.get("tradable")]
-        return [a["symbol"] for a in tradable]
-
-    # Fallback to DB symbols
-    conn = get_db()
-    db_symbols = [r['symbol'] for r in conn.execute("SELECT symbol FROM assets WHERE tradable = 1").fetchall()]
-    conn.close()
-    if db_symbols:
-        return db_symbols
-
-    return POPULAR_TICKERS
-
-
-def _fetch_bars_for_symbol(symbol, timeframe, limit, start_date, end_date):
-    """Fetch bars for a single symbol with date range and pagination."""
-    all_bars = []
-    page_token = None
-    max_pages = 10  # safety limit
-
-    for page in range(max_pages):
-        params = {
-            "timeframe": timeframe,
-            "limit": limit,
-            "start": start_date,
-            "end": end_date,
-            "adjustment": "split",
-            "feed": "iex",  # free tier feed
-        }
-        if page_token:
-            params["page_token"] = page_token
-
-        try:
-            resp = alpaca_get(
-                f"/v2/stocks/{symbol}/bars",
-                params=params
-            )
-        except Exception as e:
-            print(f"  Error fetching {symbol} {timeframe} page {page+1}: {e}")
-            break
-
-        if resp.status_code != 200:
-            if resp.status_code == 429:
-                time.sleep(2)
-                continue
-            break  # 404 or other errors = no data for this symbol/tf
-
-        try:
-            data = resp.json()
-        except Exception:
-            break
-
-        bars = data.get('bars', [])
-        if bars and isinstance(bars, list):
-            all_bars.extend(bars)
-
-        page_token = data.get('next_page_token')
-        if not page_token:
-            break
-        # Rate limiter handles pacing between pages
-
-    return all_bars
-
-
-def _store_bars(symbol, timeframe, bars, conn=None):
-    """Store bars in database efficiently. If conn provided, doesn't commit/close."""
-    if not bars:
-        return
-
-    owned = conn is None
-    if owned:
-        conn = get_db()
-
-    rows = []
-    for bar in bars:
-        t = bar.get('t', '')
-        if isinstance(t, str):
-            date_str = t[:10]
-        else:
-            try:
-                date_str = datetime.fromtimestamp(t / 1000 if t > 1e12 else t).strftime('%Y-%m-%d %H:%M:%S')
-            except Exception:
-                continue
-        rows.append((
-            symbol, timeframe, date_str,
-            bar.get('o', 0), bar.get('h', 0),
-            bar.get('l', 0), bar.get('c', 0), bar.get('v', 0)
-        ))
-
-    if rows:
-        conn.executemany("""
-            INSERT OR IGNORE INTO bars (symbol, timeframe, date, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-        if owned:
-            conn.commit()
-    if owned:
-        conn.close()
-
-
-def _store_stats_for_symbol(symbol, conn=None):
-    """Compute and store stats for a single symbol from bar data."""
-    stats = compute_stats_from_bars(symbol, conn=conn)
-    if not stats:
-        return False
-
-    owned = conn is None
-    if owned:
-        conn = get_db()
-
-    # Compute ATR trailing stop
-    atr_data = compute_atr_for_screener(symbol, '1Day', 2)
-
-    wa = stats.get('weighted_alpha', 0) or 0
-    if wa > 20:
-        profit_status = "profitable"
-    elif wa > 5:
-        profit_status = "growing"
-    elif wa < -30:
-        profit_status = "loss_making"
-    elif wa < -10:
-        profit_status = "declining"
-    else:
-        profit_status = "neutral"
-
-    conn.execute("""
-        INSERT OR REPLACE INTO stats (
-            symbol, name, price, volume, change_pct, atrp, weighted_alpha,
-            atr_signal, atr_stop, streak, pre_price, pre_change_pct,
-            post_price, post_change_pct, fractionable, marginable,
-            asset_class, exchange, status, tradable, last_updated,
-            atr_value, atr_crossed_above, atr_crossed_below, atr_streak, atr_multiplier,
-            profit_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        stats['symbol'], stats['name'], stats['price'], stats['volume'],
-        stats['change_pct'], stats['atrp'], wa,
-        atr_data['atr_signal'] if atr_data else 0,
-        atr_data['atr_stop'] if atr_data else None,
-        stats['streak'], None, None, None, None,
-        stats['fractionable'], stats['marginable'],
-        stats['asset_class'], stats['exchange'], stats['status'], stats['tradable'],
-        datetime.now().isoformat(),
-        atr_data['atr_value'] if atr_data else 0,
-        atr_data['crossed_above'] if atr_data else 0,
-        atr_data['crossed_below'] if atr_data else 0,
-        atr_data['atr_streak'] if atr_data else 0,
-        atr_data['multiplier'] if atr_data else 2,
-        profit_status,
-    ))
-    if owned:
-        conn.commit()
-        conn.close()
-    return True
-
-
-def _mark_downloaded(symbol, timeframe, conn=None):
-    """Mark a symbol as having downloaded data for a timeframe."""
-    col_map = {'1Day': 'downloaded_1day', '1Hour': 'downloaded_1hour', '1Min': 'downloaded_1min'}
-    col = col_map.get(timeframe)
-    if not col:
-        return
-
-    owned = conn is None
-    if owned:
-        conn = get_db()
-    conn.execute(f"""
-        UPDATE stats SET {col} = ? WHERE symbol = ?
-    """, (datetime.now().isoformat(), symbol))
-    if owned:
-        conn.commit()
-        conn.close()
-
-
-def _is_downloaded(symbol, timeframe, conn=None):
-    """Check if a symbol already has downloaded data for a timeframe."""
-    col_map = {'1Day': 'downloaded_1day', '1Hour': 'downloaded_1hour', '1Min': 'downloaded_1min'}
-    col = col_map.get(timeframe)
-    if not col:
-        return False
-
-    owned = conn is None
-    if owned:
-        conn = get_db()
-    row = conn.execute(f"SELECT {col} FROM stats WHERE symbol = ?", (symbol,)).fetchone()
-    if owned:
-        conn.close()
-    return row is not None and row[col] is not None
-
-
-# ── Multi-symbol Batch Download ──────────────────────────────────────
-def download_bars_batch(symbols, timeframe, limit=10000, start_date="2016-01-01", end_date=None):
-    """Download bars for up to 10 symbols in a single API call. Much faster.
-
-    Handles free-tier 500-bar limit by paginating backward in time.
-    """
-    if not symbols:
-        return {}
-    if end_date is None:
-        end_date = datetime.now().strftime("%Y-%m-%d")
-
-    batch_size = 10  # Alpaca max per request
-    all_results = {}
-
-    for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        symbols_param = ",".join(batch)
-
-        # Paginate: fetch in chunks working backward from end_date
-        current_end = end_date
-        batch_bars = {sym: [] for sym in batch}
-
-        while current_end > start_date:
-            params = {
-                "symbols": symbols_param,
-                "timeframe": timeframe,
-                "limit": 500,  # Free tier max
-                "start": start_date,
-                "end": current_end,
-                "adjustment": "split",
-                "feed": "iex",
-            }
-
-            try:
-                resp = alpaca_get("/v2/stocks/bars", params=params)
-
-                if resp.status_code == 429:
-                    time.sleep(3)
-                    resp = alpaca_get("/v2/stocks/bars", params=params)
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    bars_data = data.get('bars', {})
-                    if isinstance(bars_data, dict):
-                        for sym, bars in bars_data.items():
-                            if bars and isinstance(bars, list):
-                                batch_bars[sym].extend(bars)
-                                # Update end date to oldest bar - 1 day for next page
-                                oldest = bars[0].get('t', '')
-                                if isinstance(oldest, str):
-                                    oldest_date = oldest[:10]
-                                elif isinstance(oldest, (int, float)):
-                                    oldest_date = datetime.fromtimestamp(
-                                        oldest / 1000 if oldest > 1e12 else oldest
-                                    ).strftime('%Y-%m-%d')
-                                else:
-                                    oldest_date = current_end
-                                current_end = oldest_date
-                    else:
-                        break  # No data returned, stop paginating
-                elif resp.status_code == 400:
-                    print(f"  Batch 400, trying individually for {len(batch)} symbols")
-                    for sym in batch:
-                        try:
-                            sr = alpaca_get(f"/v2/stocks/{sym}/bars", params={
-                                "timeframe": timeframe, "limit": 500,
-                                "start": start_date, "end": current_end,
-                                "adjustment": "split", "feed": "iex",
-                            })
-                            if sr.status_code == 200:
-                                sd = sr.json()
-                                sb = sd.get('bars', [])
-                                if sb:
-                                    batch_bars[sym].extend(sb)
-                                    oldest = sb[0].get('t', '')
-                                    if isinstance(oldest, str):
-                                        oldest_date = oldest[:10]
-                                    elif isinstance(oldest, (int, float)):
-                                        oldest_date = datetime.fromtimestamp(
-                                            oldest / 1000 if oldest > 1e12 else oldest
-                                        ).strftime('%Y-%m-%d')
-                                    else:
-                                        oldest_date = current_end
-                                    current_end = min(current_end, oldest_date)
-                        except Exception:
-                            pass
-                    break  # After individual attempts, move to next batch
-                else:
-                    break  # Other error, stop paginating
-            except Exception as e:
-                print(f"  Batch error: {e}")
-                break
-
-        # Deduplicate and store results
-        for sym, bars in batch_bars.items():
-            if bars:
-                seen = set()
-                unique = []
-                for b in bars:
-                    date_key = b.get('t', '')
-                    if isinstance(date_key, str):
-                        date_key = date_key[:10]
-                    if date_key not in seen:
-                        seen.add(date_key)
-                        unique.append(b)
-                all_results[sym] = unique
-
-    return all_results
-
-
-def _fill_historical_gaps(all_symbols, db_conn, today):
-    """Fill missing older data for symbols where oldest_data is not early enough.
-
-    For symbols that already have data but only go back a few years,
-    fetch the missing historical bars in 500-bar chunks (free tier limit).
-    """
-    print("\nChecking for historical gaps...")
-
-    # Find symbols that have data but oldest_data is after 2020 (missing early history)
-    gap_symbols = db_conn.execute("""
-        SELECT symbol, oldest_data FROM stats
-        WHERE oldest_data IS NOT NULL AND oldest_data > '2020-01-01'
-    """).fetchall()
-
-    # Also find symbols with stats but no oldest_data
-    no_oldest = db_conn.execute("""
-        SELECT symbol FROM stats
-        WHERE oldest_data IS NULL AND price > 0
-    """).fetchall()
-
-    need_check = [r['symbol'] for r in gap_symbols] + [r['symbol'] for r in no_oldest]
-    need_check = list(set(need_check))  # Deduplicate
-
-    if not need_check:
-        print("  No gaps found — all symbols have data back to 2020 or earlier")
-        return 0
-
-    print(f"  Found {len(need_check)} symbols with data gaps (oldest after 2020 or missing)")
-
-    gap_filled = 0
-    gap_bars = 0
-    FREE_TIER_LIMIT = 500
-    EARLIEST_TARGET = "2016-01-01"
-
-    # Process in batches of 10
-    for i in range(0, len(need_check), 10):
-        batch = need_check[i:i + 10]
-
-        for symbol in batch:
-            # Get current oldest data for this symbol
-            row = db_conn.execute(
-                "SELECT oldest_data FROM stats WHERE symbol = ?", (symbol,)
-            ).fetchone()
-            current_oldest = row['oldest_data'] if row else None
-
-            if not current_oldest or current_oldest <= EARLIEST_TARGET:
-                continue  # Already has full history
-
-            # Fetch data from EARLIEST_TARGET to current_oldest
-            fetch_start = EARLIEST_TARGET
-            fetch_end = current_oldest
-            all_gap_bars = []
-
-            while fetch_start < fetch_end:
-                try:
-                    resp = alpaca_get(f"/v2/stocks/{symbol}/bars", params={
-                        "timeframe": "1Day", "limit": FREE_TIER_LIMIT,
-                        "start": fetch_start, "end": fetch_end,
-                        "adjustment": "split", "feed": "iex",
-                    })
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        bars = data.get('bars', [])
-                        if not bars:
-                            break
-                        all_gap_bars.extend(bars)
-                        # Update fetch_end to oldest bar - 1 day for next page
-                        oldest_t = bars[0].get('t', '')
-                        if isinstance(oldest_t, str):
-                            oldest_date = oldest_t[:10]
-                        elif isinstance(oldest_t, (int, float)):
-                            oldest_date = datetime.fromtimestamp(
-                                oldest_t / 1000 if oldest_t > 1e12 else oldest_t
-                            ).strftime('%Y-%m-%d')
-                        else:
-                            break
-                        fetch_end = oldest_date
-                        if len(bars) < FREE_TIER_LIMIT:
-                            break  # No more data available
-                    elif resp.status_code == 429:
-                        time.sleep(3)
-                        continue
-                    else:
-                        break
-                except Exception as e:
-                    print(f"  Gap fill error for {symbol}: {e}")
-                    break
-
-            if all_gap_bars:
-                # Deduplicate and store
-                seen = set()
-                unique = []
-                for b in all_gap_bars:
-                    date_key = b.get('t', '')
-                    if isinstance(date_key, str):
-                        date_key = date_key[:10]
-                    if date_key not in seen:
-                        seen.add(date_key)
-                        unique.append(b)
-
-                for bar in unique:
-                    t = bar.get('t', '')
-                    if isinstance(t, str):
-                        date_str = t[:10]
-                    else:
-                        try:
-                            date_str = datetime.fromtimestamp(
-                                t / 1000 if t > 1e12 else t
-                            ).strftime('%Y-%m-%d')
-                        except Exception:
-                            continue
-
-                    db_conn.execute("""
-                        INSERT OR IGNORE INTO bars (symbol, timeframe, date, open, high, low, close, volume)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        symbol, '1Day', date_str,
-                        bar.get('o', 0), bar.get('h', 0),
-                        bar.get('l', 0), bar.get('c', 0),
-                        bar.get('v', 0)
-                    ))
-
-                db_conn.commit()
-                gap_filled += 1
-                gap_bars += len(unique)
-                print(f"  Filled {symbol}: +{len(unique)} bars (oldest now: {unique[-1].get('t', '?')})")
-
-                # Recompute stats with the full bar history
-                _store_stats_for_symbol(symbol, conn=db_conn)
-
-        if (i + 10) % 100 == 0:
-            print(f"  Gap fill progress: {min(i + 10, len(need_check))}/{len(need_check)}")
-
-    print(f"  Gap fill complete: {gap_filled} symbols, +{gap_bars:,} bars")
-    return gap_bars
-
-
-def download_all_history():
-    """Download ALL max historical data for all symbols.
-
-    - Fetches full asset list from Alpaca (12k+ symbols)
-    - Stores asset metadata in DB
-    - Skips already-downloaded symbols (resume capability)
-    - Downloads corporate actions (splits/dividends) for top 500
-    - Downloads bars for 1Day only (1Week/1Month computed from 1Day)
-    - Uses multi-symbol batch API (up to 10 per request) for speed
-    - Handles free-tier 500-bar limit by paginating backward in time
-    - Fills historical gaps for symbols with incomplete data
-    - Computes and stores stats progressively as each symbol completes
-    """
-    global downloading_history, download_progress
-    with download_lock:
-        if downloading_history:
-            return {"status": "already_running"}
-        downloading_history = True
-
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start_time = time.time()
-
-        with download_lock:
-            download_progress = {
-                "status": "running",
-                "timeframe": "",
-                "phase": "init",
-                "symbols_total": 0,
-                "symbols_done": 0,
-                "bars_found": 0,
-                "current_symbol": "",
-                "start_date": "2016-01-01",
-                "end_date": today,
-                "assets_total": 0,
-                "assets_fetched": 0,
-                "message": "Starting...",
-                "start_time": start_time,
-            }
-
-        print("=" * 50)
-        print(f"Full history download started at {datetime.now()}")
-        print("=" * 50)
-
-        # Phase 1: Get all assets
-        _update_progress(phase="assets", message="Fetching all tradable assets...")
-        all_symbols = _get_all_asset_symbols()
-        _update_progress(assets_total=len(all_symbols), message=f"Found {len(all_symbols)} assets")
-        print(f"Total symbols to process: {len(all_symbols)}")
-
-        total_bars = 0
-        # Only 1Day — weekly/monthly computed from it
-        # Max limit=10000 per request gives ALL available history from 2016
-        timeframes = [
-            ("1Day", 10000),
-        ]
-
-        for tf, per_req_limit in timeframes:
-            _update_progress(
-                phase="bars",
-                timeframe=tf,
-                symbols_total=len(all_symbols),
-                symbols_done=0,
-                current_symbol="",
-                message=f"Downloading {tf} bars..."
-            )
-
-            tf_bars = 0
-            tf_found = 0
-            tf_skipped = 0
-            db_conn = get_db()
-            batch_count = 0
-
-            # Build list of symbols that need downloading (skip cached)
-            need_download = []
-            for idx, symbol in enumerate(all_symbols):
-                if _is_downloaded(symbol, tf, conn=db_conn):
-                    tf_skipped += 1
-                    with download_lock:
-                        download_progress["symbols_done"] = idx + 1
-                        download_progress["current_symbol"] = f"{symbol} (cached)"
-                        download_progress["bars_found"] = download_progress.get("bars_found", 0)
-                else:
-                    need_download.append(symbol)
-
-            print(f"  {tf}: {tf_skipped} cached, {len(need_download)} need download")
-
-            # Download in batches of 10 symbols per API call
-            api_batch = 10
-            for i in range(0, len(need_download), api_batch):
-                batch_symbols = need_download[i:i + api_batch]
-
-                _update_progress(phase="bars", message=f"Downloading {tf} batch {i//api_batch + 1}...")
-                batch_results = download_bars_batch(batch_symbols, tf, per_req_limit, "2016-01-01", today)
-
-                for symbol in batch_symbols:
-                    symbol_bars = batch_results.get(symbol, [])
-
-                    with download_lock:
-                        download_progress["symbols_done"] = download_progress["symbols_done"] + 1
-                        download_progress["current_symbol"] = symbol
-                        download_progress["bars_found"] += len(symbol_bars)
-
-                    if symbol_bars:
-                        _store_bars(symbol, tf, symbol_bars, conn=db_conn)
-                        tf_bars += len(symbol_bars)
-                        tf_found += 1
-                        batch_count += 1
-
-                        if batch_count >= 50:
-                            db_conn.commit()
-                            batch_count = 0
-
-                        _mark_downloaded(symbol, tf, conn=db_conn)
-
-                        if tf == "1Day":
-                            _update_progress(phase="stats", message=f"Computing stats for {symbol}...")
-                            _store_stats_for_symbol(symbol, conn=db_conn)
-
-                if (i + api_batch) % 100 == 0:
-                    done = tf_skipped + i + len(batch_symbols)
-                    print(f"  {tf}: {done}/{len(all_symbols)} | {tf_found} new | {tf_skipped} cached | {tf_bars} bars")
-
-            total_bars += tf_bars
-            db_conn.commit()
-            db_conn.close()
-            print(f"\n  {tf} complete: {tf_found} new, {tf_skipped} cached, {tf_bars} bars")
-
-        # Phase 2: Download corporate actions for top symbols
-        _update_progress(phase="corporate", message="Downloading corporate actions...")
-        top_symbols = all_symbols[:500]  # Top 500 for splits/dividends
-        download_all_corporate_actions(top_symbols)
-
-        # Phase 3: Final stats pass for any symbols that have bars but no stats
-        _update_progress(phase="stats", message="Final stats pass...")
-        conn = get_db()
-        symbols_needing_stats = [r['symbol'] for r in conn.execute(
-            "SELECT symbol FROM bars WHERE timeframe = '1Day' GROUP BY symbol HAVING COUNT(*) >= 60"
-        ).fetchall()]
-        conn.close()
-
-        # Only compute for symbols that don't already have stats
-        conn = get_db()
-        existing_stats = [r['symbol'] for r in conn.execute("SELECT symbol FROM stats WHERE weighted_alpha != 0 OR price > 0").fetchall()]
-        conn.close()
-
-        need_stats = [s for s in symbols_needing_stats if s not in existing_stats]
-        print(f"Computing stats for {len(need_stats)} remaining symbols...")
-        for i, sym in enumerate(need_stats):
-            _store_stats_for_symbol(sym)
-            if (i + 1) % 50 == 0:
-                print(f"  Stats: {i+1}/{len(need_stats)}")
-
-        # Phase 4: Fill historical gaps for symbols with incomplete data
-        _update_progress(phase="gaps", message="Checking for historical data gaps...")
-        conn = get_db()
-        gap_bars = _fill_historical_gaps(all_symbols, conn, today)
-        conn.close()
-        total_bars += gap_bars
-
-        # Final summary
-        conn = get_db()
-        total_all = conn.execute("SELECT COUNT(*) FROM bars").fetchone()[0]
-        total_stats = conn.execute("SELECT COUNT(*) FROM stats WHERE price > 0").fetchone()[0]
-        total_assets = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-        by_tf = conn.execute("SELECT timeframe, COUNT(*) FROM bars GROUP BY timeframe").fetchall()
-        conn.close()
-
-        print(f"\n{'='*50}")
-        print(f"DOWNLOAD COMPLETE")
-        print(f"Assets in DB: {total_assets}")
-        print(f"Symbols with stats: {total_stats}")
-        print(f"Total bars in database: {total_all}")
-        for tf_name, cnt in by_tf:
-            print(f"  {tf_name}: {cnt:,}")
-        print(f"{'='*50}")
-
-        # Recompute streaks from bar data using fast SQL
-        _update_progress(phase="streaks", message="Recomputing streaks...")
-        conn2 = get_db()
-        _recompute_streaks_sql(conn2)
-        conn2.close()
-        print("Streaks recomputed after download.")
-
-        with download_lock:
-            download_progress = {
-                "status": "complete",
-                "timeframe": "",
-                "phase": "done",
-                "symbols_total": len(all_symbols),
-                "symbols_done": len(all_symbols),
-                "bars_found": total_bars,
-                "current_symbol": "",
-                "start_date": "2016-01-01",
-                "end_date": today,
-                "assets_total": total_assets,
-                "assets_fetched": total_assets,
-                "message": f"Complete! {total_assets:,} assets, {total_stats:,} with stats, {total_all:,} bars",
-            }
-
-        return {
-            "status": "complete",
-            "bars_stored": total_bars,
-            "symbols": len(all_symbols),
-            "total_in_db": total_all,
-            "assets": total_assets,
-            "stats": total_stats,
-        }
-
-    except Exception as e:
-        print(f"History download error: {e}")
-        import traceback
-        traceback.print_exc()
-        with download_lock:
-            download_progress["status"] = "error"
-            download_progress["message"] = str(e)
-        return {"status": "error", "message": str(e)}
-    finally:
-        with download_lock:
-            downloading_history = False
-
-
-# ── Popular Tickers (Fallback / Quick Start) ────────────────────────
-def _build_fallback_assets():
-    """Build asset dicts from popular tickers when API fails."""
-    assets = []
-    for sym in POPULAR_TICKERS:
-        assets.append({
-            "symbol": sym,
-            "name": sym,
-            "tradable": True,
-            "asset_class": "us_equity",
-            "exchange": "NYSE/NASDAQ",
-            "status": "active",
-            "fractionable": True,
-            "marginable": True,
-        })
-    return assets
-
-
-# ── AI Analysis ─────────────────────────────────────────────────────
-
-def compute_atr(symbol, timeframe='1Day', period=14, multiplier=2):
-    """Compute ATR with Wilder's RMA smoothing and Supertrend trailing stop line.
-    Uses LATEST bars (DESC LIMIT, then reversed) for accurate recent ATR.
-    """
-    conn = get_db()
-    tf = timeframe if timeframe != '1Day' else '1Day'
-
-    bars = conn.execute("""
-        SELECT date, open, high, low, close, volume FROM bars
-        WHERE symbol = ? AND timeframe = ?
-        ORDER BY date DESC
-        LIMIT 250
-    """, (symbol.upper(), tf)).fetchall()
-    bars.reverse()
-    conn.close()
-
-    if not bars or len(bars) < period + 1:
-        return None
-
-    # Calculate True Range (TR)
-    tr_values = []
-    for i in range(1, len(bars)):
-        high = bars[i]['high']
-        low = bars[i]['low']
-        prev_close = bars[i-1]['close']
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        tr_values.append(tr)
-
-    if len(tr_values) < period:
-        return None
-
-    # Wilder's RMA
-    rma = sum(tr_values[:period]) / period
-    atr_values = [rma]
-
-    for i in range(period, len(tr_values)):
-        rma = (rma * (period - 1) + tr_values[i]) / period
-        atr_values.append(rma)
-
-    # ── Supertrend trailing stop line ──
-    basic_upper = []
-    basic_lower = []
-    for i in range(len(atr_values)):
-        bar_idx = period + i
-        close = bars[bar_idx]['close']
-        basic_upper.append(close + multiplier * atr_values[i])
-        basic_lower.append(close - multiplier * atr_values[i])
-
-    # Supertrend direction tracking (start in uptrend)
-    trailing_stop = []
-    direction = []
-    final_stop = basic_lower[0]
-    final_dir = 1
-
-    for i in range(len(atr_values)):
-        close = bars[period + i]['close']
-
-        # Progressive bands
-        if i == 0:
-            final_upper = basic_upper[0]
-            final_lower = basic_lower[0]
-        else:
-            final_upper = min(basic_upper[i], final_upper) if close > final_stop else basic_upper[i]
-            final_lower = max(basic_lower[i], final_lower) if close < final_stop else basic_lower[i]
-
-        # Trail stop
-        if final_dir == 1:
-            final_stop = max(final_lower, final_stop) if i > 0 else final_lower
-        else:
-            final_stop = min(final_upper, final_stop) if i > 0 else final_upper
-
-        # Check for flip
-        if close < final_stop and final_dir == 1:
-            final_dir = -1
-            final_stop = final_upper
-        elif close > final_stop and final_dir == -1:
-            final_dir = 1
-            final_stop = final_lower
-
-        trailing_stop.append(round(final_stop, 4))
-        direction.append(final_dir)
-
-    current_atr = atr_values[-1]
-    current_price = bars[-1]['close']
-
-    return {
-        "atr": round(current_atr, 4),
-        "atr_pct": round((current_atr / current_price * 100), 2) if current_price > 0 else 0,
-        "long_stop": round(basic_lower[-1], 2),
-        "short_stop": round(basic_upper[-1], 2),
-        "above_atr": current_price > basic_lower[-1],
-        "below_atr": current_price < basic_upper[-1],
-        "crossed_above_today": False,
-        "crossed_below_today": False,
-        "timeframe": tf,
-        "multiplier": multiplier,
-        "bars_used": len(bars),
-        "trailing_stop": trailing_stop,
-        "direction": direction,
-        "atr_offset": period,
-    }
-
-
-def compute_atr_for_screener(symbol, timeframe='1Day', multiplier=2, end_date=None):
-    """Compute Supertrend-style ATR trailing stop for screener.
-    Uses LATEST bars (DESC LIMIT, then reversed) for accurate recent ATR.
-    If end_date is set, only uses bars on or before that date.
-    Returns dict with atr_value, atr_stop, atr_signal, crossed flags, streak.
-    """
-    conn = get_db()
-    date_condition = " AND date <= ?" if end_date else ""
-
-    # For 1Week/1Month, aggregate from 1Day bars
-    if timeframe in ('1Week', '1Month'):
-        tf_bars = aggregate_bars_to_tf(symbol, timeframe)
-        if end_date:
-            tf_bars = [b for b in tf_bars if b['date'] <= end_date]
-    else:
-        query = f"""
-            SELECT date, open, high, low, close, volume FROM bars
-            WHERE symbol = ? AND timeframe = '1Day'{date_condition}
-            ORDER BY date DESC
-            LIMIT 250
-        """
-        params = [symbol.upper()]
-        if end_date:
-            params.append(end_date)
-        tf_bars = conn.execute(query, params).fetchall()
-        tf_bars.reverse()
-
-    conn.close()
-
-    if not tf_bars or len(tf_bars) < 15:
-        return None
-
-    bars = [dict(b) for b in tf_bars]
-    period = 14
-
-    # Calculate True Range (TR)
-    tr_values = []
-    for i in range(1, len(bars)):
-        h = bars[i]['high']
-        l = bars[i]['low']
-        pc = bars[i-1]['close']
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        tr_values.append(tr)
-
-    if len(tr_values) < period:
-        return None
-
-    # Wilder's RMA
-    rma = sum(tr_values[:period]) / period
-    atr_values = [rma]
-    for i in range(period, len(tr_values)):
-        rma = (rma * (period - 1) + tr_values[i]) / period
-        atr_values.append(rma)
-
-    current_atr = atr_values[-1]
-    current_price = bars[-1]['close']
-    current_close = bars[-1]['close']
-    prev_close = bars[-2]['close'] if len(bars) > 1 else current_close
-
-    # ── Supertrend via full history (same as compute_atr) ──
-    basic_upper = []
-    basic_lower = []
-    for i in range(len(atr_values)):
-        bar_idx = period + i
-        close = bars[bar_idx]['close']
-        basic_upper.append(close + multiplier * atr_values[i])
-        basic_lower.append(close - multiplier * atr_values[i])
-
-    trailing_stop = []
-    direction = []
-    final_stop = basic_lower[0]
-    final_dir = 1
-
-    for i in range(len(atr_values)):
-        close = bars[period + i]['close']
-
-        if i == 0:
-            final_upper = basic_upper[0]
-            final_lower = basic_lower[0]
-        else:
-            final_upper = min(basic_upper[i], final_upper) if close > final_stop else basic_upper[i]
-            final_lower = max(basic_lower[i], final_lower) if close < final_stop else basic_lower[i]
-
-        if final_dir == 1:
-            final_stop = max(final_lower, final_stop) if i > 0 else final_lower
-        else:
-            final_stop = min(final_upper, final_stop) if i > 0 else final_upper
-
-        if close < final_stop and final_dir == 1:
-            final_dir = -1
-            final_stop = final_upper
-        elif close > final_stop and final_dir == -1:
-            final_dir = 1
-            final_stop = final_lower
-
-        trailing_stop.append(round(final_stop, 4))
-        direction.append(final_dir)
-
-    atr_stop = trailing_stop[-1]
-    atr_signal = direction[-1]
-
-    # Cross detection using full Supertrend history
-    crossed_above_today = 0
-    crossed_below_today = 0
-    if len(direction) >= 2:
-        if direction[-1] == 1 and direction[-2] == -1:
-            crossed_above_today = 1
-        elif direction[-1] == -1 and direction[-2] == 1:
-            crossed_below_today = 1
-
-    # ATR streak: days since last flip
-    atr_streak = 0
-    if direction:
-        last_sig = direction[-1]
-        for i in range(len(direction) - 1, -1, -1):
-            if direction[i] == last_sig:
-                atr_streak += 1
-            else:
-                break
-
-    return {
-        "atr_value": round(current_atr, 4),
-        "atr_stop": round(atr_stop, 2),
-        "atr_signal": atr_signal,
-        "atr_pct": round((current_atr / current_price * 100), 2) if current_price > 0 else 0,
-        "crossed_above": crossed_above_today,
-        "crossed_below": crossed_below_today,
-        "atr_streak": atr_streak,
-        "multiplier": multiplier,
-        "timeframe": timeframe,
-        "bars_used": len(bars),
-    }
-
-
-def compute_ai_analysis(symbol):
-    """Compute AI analysis score and bias for a stock from stored data."""
-    conn = get_db()
-
-    # Get bars (1Day) - limit to most recent 500 for fast computation
-    bars = conn.execute("""
-        SELECT date, open, high, low, close, volume FROM bars
-        WHERE symbol = ? AND timeframe = '1Day'
-        ORDER BY date ASC
-        LIMIT 500
-    """, (symbol.upper(),)).fetchall()
-
-    # Get stats
-    stat = conn.execute("""
-        SELECT * FROM stats WHERE UPPER(symbol) = ?
-    """, (symbol.upper(),)).fetchone()
-
-    # Get corporate events
-    events = conn.execute("""
-        SELECT event_type, event_date FROM corporate_events
-        WHERE UPPER(symbol) = ? ORDER BY event_date DESC LIMIT 5
-    """, (symbol.upper(),)).fetchall()
-
-    conn.close()
-
-    if not bars or len(bars) < 10:
-        return {
-            "symbol": symbol.upper(),
-            "overall_score": 0,
-            "bias": "neutral",
-            "tech_score": 0,
-            "momentum_score": 0,
-            "volume_score": 0,
-            "events_score": 0,
-            "signals": ["Insufficient data for analysis"],
-        }
-
-    closes = [b['close'] for b in bars]
-    volumes = [b['volume'] for b in bars]
-    highs = [b['high'] for b in bars]
-    lows = [b['low'] for b in bars]
-    n = len(closes)
-
-    # ── Technical Score (0-100) ──────────────────────────────────────
-    tech_score = 50.0
-
-    # RSI (14-period)
-    if n >= 15:
-        gains, losses = [], []
-        for i in range(1, min(15, n)):
-            delta = closes[i] - closes[i-1]
-            gains.append(max(0, delta))
-            losses.append(max(0, -delta))
-        avg_gain = sum(gains) / len(gains)
-        avg_loss = sum(losses) / len(losses)
-        if avg_loss > 0:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-            if rsi < 30:
-                tech_score += 20  # Oversold = bullish
-            elif rsi < 45:
-                tech_score += 10
-            elif rsi > 70:
-                tech_score -= 20  # Overbought = bearish
-            elif rsi > 55:
-                tech_score -= 5
-
-    # Moving averages
-    sma20 = sum(closes[-20:]) / min(20, n) if n >= 10 else closes[-1]
-    sma50 = sum(closes[-50:]) / min(50, n) if n >= 25 else sma20
-    current = closes[-1]
-
-    if current > sma20 > sma50:
-        tech_score += 15  # Golden trend
-    elif current > sma20:
-        tech_score += 5
-    elif current < sma20 < sma50:
-        tech_score -= 15  # Death cross
-    elif current < sma20:
-        tech_score -= 5
-
-    # Price position in range
-    if n >= 20:
-        high_20 = max(highs[-20:])
-        low_20 = min(lows[-20:])
-        if high_20 > low_20:
-            position = (current - low_20) / (high_20 - low_20)
-            if position > 0.8:
-                tech_score -= 10  # Near highs
-            elif position < 0.2:
-                tech_score += 10  # Near lows
-
-    tech_score = max(0, min(100, tech_score))
-
-    # ── Momentum Score (0-100) ──────────────────────────────────────
-    momentum_score = 50.0
-
-    if stat:
-        wa = stat['weighted_alpha'] or 0
-        change = stat['change_pct'] or 0
-        streak = stat['streak'] or 0
-
-        # Weighted alpha
-        if wa > 50:
-            momentum_score += 25
-        elif wa > 20:
-            momentum_score += 15
-        elif wa > 0:
-            momentum_score += 5
-        elif wa < -30:
-            momentum_score -= 25
-        elif wa < -10:
-            momentum_score -= 15
-
-        # Daily change
-        if change > 5:
-            momentum_score += 10
-        elif change > 2:
-            momentum_score += 5
-        elif change < -5:
-            momentum_score -= 10
-        elif change < -2:
-            momentum_score -= 5
-
-        # Streak
-        if streak >= 5:
-            momentum_score += 10
-        elif streak >= 3:
-            momentum_score += 5
-        elif streak <= -5:
-            momentum_score -= 10
-        elif streak <= -3:
-            momentum_score -= 5
-
-    # Short-term price direction
-    if n >= 5:
-        short_trend = sum(closes[-3:]) / 3 - sum(closes[-6:-3]) / 3
-        if short_trend > 0:
-            momentum_score += 5
-        else:
-            momentum_score -= 5
-
-    momentum_score = max(0, min(100, momentum_score))
-
-    # ── Volume Score (0-100) ────────────────────────────────────────
-    volume_score = 50.0
-
-    if n >= 20 and stat:
-        avg_vol = sum(volumes[-20:]) / min(20, n)
-        current_vol = volumes[-1]
-        if avg_vol > 0:
-            vol_ratio = current_vol / avg_vol
-            if vol_ratio > 2.0:
-                volume_score += 20  # High volume = interest
-            elif vol_ratio > 1.5:
-                volume_score += 10
-            elif vol_ratio < 0.5:
-                volume_score -= 10  # Low volume = disinterest
-
-        # Volume trend
-        if n >= 10:
-            early_avg = sum(volumes[-10:-5]) / 5 if len(volumes) >= 10 else avg_vol
-            recent_avg = sum(volumes[-5:]) / min(5, n)
-            if recent_avg > early_avg * 1.2:
-                volume_score += 10
-            elif recent_avg < early_avg * 0.8:
-                volume_score -= 5
-
-    volume_score = max(0, min(100, volume_score))
-
-    # ── Volume Profile Score (0-100) ─────────────────────────────────
-    volume_profile_score = 50.0
-    if n >= 20:
-        # VWAP relative position
-        recent_c = closes[-20:]
-        recent_v = volumes[-20:]
-        total_v = sum(recent_v)
-        vwap = sum(c * v for c, v in zip(recent_c, recent_v)) / total_v if total_v > 0 else current
-        vwap_pct = ((current - vwap) / vwap) * 100 if vwap > 0 else 0
-        if vwap_pct > 3:
-            volume_profile_score += 15  # Above VWAP = buying pressure
-        elif vwap_pct < -3:
-            volume_profile_score -= 15  # Below VWAP = selling pressure
-
-        # Volume concentration (high volume at highs vs lows)
-        high_vol_days = sum(1 for i in range(-10, 0) if volumes[i] > sum(volumes[-20:]) / 20)
-        if high_vol_days >= 6:
-            if current > sum(closes[-20:]) / 20:
-                volume_profile_score += 10  # High vol at high prices
-            else:
-                volume_profile_score -= 10  # High vol at low prices
-
-        # Accumulation/Distribution
-        ad_scores = []
-        for i in range(max(0, n - 20), n):
-            clv = ((highs[i] - lows[i]) / (highs[i] - lows[i])) if highs[i] != lows[i] else 0.5
-            ad = ((closes[i] - lows[i]) - (highs[i] - closes[i])) / (highs[i] - lows[i]) if highs[i] != lows[i] else 0
-            ad_scores.append(ad * volumes[i])
-        if ad_scores and sum(ad_scores[-5:]) > sum(ad_scores[:5]):
-            volume_profile_score += 10  # Accumulation
-        elif ad_scores and sum(ad_scores[-5:]) < sum(ad_scores[:5]):
-            volume_profile_score -= 10  # Distribution
-
-    volume_profile_score = max(0, min(100, volume_profile_score))
-
-    # ── Trendline Score (0-100) ──────────────────────────────────────
-    trendline_score = 50.0
-    if n >= 20:
-        # Higher highs / higher lows check
-        recent_highs = highs[-10:]
-        recent_lows = lows[-10:]
-        higher_highs = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
-        higher_lows = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i-1])
-
-        if higher_highs >= 6 and higher_lows >= 6:
-            trendline_score += 20  # Strong uptrend
-        elif higher_highs >= 4:
-            trendline_score += 10
-        elif higher_highs <= 2 and higher_lows <= 2:
-            trendline_score -= 20  # Strong downtrend
-        elif higher_highs <= 4:
-            trendline_score -= 10
-
-        # Trendline breakout detection
-        if n >= 30:
-            resistance = max(highs[-30:-5])
-            support = min(lows[-30:-5])
-            if current > resistance:
-                trendline_score += 15  # Breakout above resistance
-            elif current < support:
-                trendline_score -= 15  # Breakdown below support
-
-        # Channel position
-        if n >= 20:
-            channel_high = max(highs[-20:])
-            channel_low = min(lows[-20:])
-            if channel_high > channel_low:
-                channel_pos = (current - channel_low) / (channel_high - channel_low)
-                if channel_pos > 0.85:
-                    trendline_score -= 5  # Overextended
-                elif channel_pos < 0.15:
-                    trendline_score += 5  # Oversold in channel
-
-    trendline_score = max(0, min(100, trendline_score))
-
-    # ── Social/News Sentiment Score (0-100) ──────────────────────────
-    # Derived from price action + events as proxy for news/social buzz
-    sentiment_score = 50.0
-
-    # Recent price acceleration (proxy for positive news)
-    if n >= 5:
-        recent_return = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0
-        if recent_return > 10:
-            sentiment_score += 15  # Strong positive momentum
-        elif recent_return > 5:
-            sentiment_score += 8
-        elif recent_return < -10:
-            sentiment_score -= 15  # Strong negative
-        elif recent_return < -5:
-            sentiment_score -= 8
-
-    # Volume spike (proxy for social media buzz)
-    if n >= 20:
-        avg_vol_20 = sum(volumes[-20:]) / 20
-        if avg_vol_20 > 0 and volumes[-1] > avg_vol_20 * 3:
-            if closes[-1] > closes[-2]:
-                sentiment_score += 10  # High volume up move
-            else:
-                sentiment_score -= 10  # High volume down move
-
-    # Event impact
-    for ev in events[:3]:
-        evt_type = (ev['event_type'] or '').lower()
-        if evt_type in {'split', 'bonus', 'merger', 'acquisition', 'dividend'}:
-            sentiment_score += 8
-        elif evt_type in {'dilution', 'rights_issue', 'bankruptcy'}:
-            sentiment_score -= 8
-
-    sentiment_score = max(0, min(100, sentiment_score))
-
-    # ── Events Score (0-100) ────────────────────────────────────────
-    events_score = 50.0
-    important_types = {'split', 'bonus', 'merger', 'acquisition', 'dividend', 'spin_off'}
-    negative_types = {'dilution', 'rights_issue', 'bankruptcy'}
-
-    for ev in events:
-        evt_type = (ev['event_type'] or '').lower()
-        if evt_type in important_types:
-            events_score += 15
-        elif evt_type in negative_types:
-            events_score -= 15
-        else:
-            events_score += 3
-
-    events_score = max(0, min(100, events_score))
-
-    # ── Overall Score ───────────────────────────────────────────────
-    overall = (tech_score * 0.25 + momentum_score * 0.25 +
-               volume_score * 0.10 + volume_profile_score * 0.10 +
-               trendline_score * 0.10 + sentiment_score * 0.10 +
-               events_score * 0.10)
-    overall = round(max(0, min(100, overall)), 1)
-
-    # ── Bias (computed before conclusion logic needs it) ────────────
-    if overall >= 65:
-        bias = "bullish"
-    elif overall <= 35:
-        bias = "bearish"
-    else:
-        bias = "neutral"
-
-    # ── Buy/Sell Conclusion ─────────────────────────────────────────
-    if overall >= 70 and bias != 'bearish':
-        conclusion = "BUY"
-        conclusion_class = "buy"
-    elif overall <= 30 and bias != 'bullish':
-        conclusion = "SELL"
-        conclusion_class = "sell"
-    elif bias == 'bullish' and overall >= 55:
-        conclusion = "BUY"
-        conclusion_class = "buy"
-    elif bias == 'bearish' and overall <= 45:
-        conclusion = "SELL"
-        conclusion_class = "sell"
-    else:
-        conclusion = "HOLD"
-        conclusion_class = "hold"
-
-    # Build signals list
-    signals = []
-    if stat:
-        wa = stat['weighted_alpha'] or 0
-        if wa > 30:
-            signals.append(f"Strong momentum (Wtd Alpha: {wa:.1f})")
-        elif wa < -20:
-            signals.append(f"Weak momentum (Wtd Alpha: {wa:.1f})")
-        streak = stat['streak'] or 0
-        if streak >= 5:
-            signals.append(f"{streak}-day winning streak")
-        elif streak <= -5:
-            signals.append(f"{abs(streak)}-day losing streak")
-    if n >= 20:
-        if current > sma20:
-            signals.append("Price above SMA20")
-        else:
-            signals.append("Price below SMA20")
-    for ev in events[:2]:
-        signals.append(f"{ev['event_type']}: {ev['event_date']}")
-
-    if not signals:
-        signals.append("No significant signals detected")
-
-    result = {
-        "symbol": symbol.upper(),
-        "overall_score": overall,
-        "bias": bias,
-        "tech_score": round(tech_score, 1),
-        "momentum_score": round(momentum_score, 1),
-        "volume_score": round(volume_score, 1),
-        "events_score": round(events_score, 1),
-        "volume_profile_score": round(volume_profile_score, 1),
-        "trendline_score": round(trendline_score, 1),
-        "sentiment_score": round(sentiment_score, 1),
-        "conclusion": conclusion,
-        "signals": signals[:6],
-    }
-
-    # Cache in DB
-    try:
-        db = get_db()
-        db.execute("""
-            INSERT OR REPLACE INTO ai_analysis
-            (symbol, overall_score, bias, tech_score, momentum_score, volume_score, events_score,
-             volume_profile_score, trendline_score, sentiment_score, conclusion, computed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (symbol.upper(), overall, bias, result['tech_score'], result['momentum_score'],
-              result['volume_score'], result['events_score'],
-              result.get('volume_profile_score', 0), result.get('trendline_score', 0),
-              result.get('sentiment_score', 0), result.get('conclusion', 'HOLD'),
-              datetime.now().isoformat()))
-        db.commit()
-        db.close()
-    except Exception:
-        pass
-
-    return result
-
-
-# ── Routes ───────────────────────────────────────────────────────────
 @app.route("/")
-def index():
-    resp = make_response(render_template("index.html", server_id=SERVER_ID))
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
-    return resp
+def home():
+    return render_template("screener.html", market="US")
 
 
-@app.route("/api/health")
-def health():
-    conn = get_db()
-    stats_count = conn.execute("SELECT COUNT(*) as cnt FROM stats WHERE price > 0").fetchone()["cnt"]
-    assets_count = conn.execute("SELECT COUNT(*) as cnt FROM assets").fetchone()["cnt"]
-    conn.close()
-    return jsonify({
-        "status": "ok",
-        "server_id": SERVER_ID,
-        "timestamp": datetime.now().isoformat(),
-        "refreshing": refreshing,
-        "stocks_loaded": stats_count,
-        "assets_loaded": assets_count,
-    })
-
-
-
-@app.route("/api/stock/<symbol>/atr")
-def stock_atr(symbol):
-    """Get ATR data for a stock with specified timeframe and multiplier."""
-    symbol = symbol.upper()
-    timeframe = request.args.get("timeframe", "1Day")
-    period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 2))
-
-    result = compute_atr(symbol, timeframe, period, multiplier)
-    if not result:
-        return jsonify({"error": "Insufficient data for ATR calculation"})
-    return jsonify(result)
-
-
-@app.route("/api/screener")
-def screener():
-    """Get screener data with filtering, sorting, pagination + timeframe support."""
-    conn = get_db()
-
-    page = int(request.args.get("page", 1))
-    per_page = int(request.args.get("per_page", 20))
-    sort_by = request.args.get("sort", "symbol")
-    sort_dir = request.args.get("dir", "asc")
-    search = request.args.get("search", "").strip()
-    filter_type = request.args.get("type", "all")
-    min_wa = request.args.get("min_wa")
-    max_atrp = request.args.get("max_atrp")
-    timeframe = request.args.get("timeframe", "1Day")
-    date_cutoff = request.args.get("date_cutoff", "").strip()
-    exchange_filter = request.args.get("exchange", "").strip()
-
-    # Build base query: join stats with assets for name
-    base_query = """
-        SELECT s.symbol, a.name as asset_name, s.asset_class, s.fractionable,
-               s.marginable, s.exchange, s.status, s.tradable, s.last_updated,
-               s.oldest_data,
-               s.price, s.change_pct, s.weighted_alpha, s.volume, s.atrp,
-               s.streak, s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct,
-               s.atr_value, s.atr_stop, s.atr_signal, s.atr_crossed_above, s.atr_crossed_below, s.atr_streak, s.atr_multiplier,
-               s.profit_status, s.profit_last_qtr_pct, s.profit_millions, s.profit_expectations, s.profit_post_result_dir,
-               ai.overall_score, ai.bias, ai.tech_score, ai.momentum_score, ai.volume_score, ai.events_score,
-               ai.volume_profile_score, ai.trendline_score, ai.sentiment_score, ai.conclusion
-        FROM stats s
-        LEFT JOIN assets a ON s.symbol = a.symbol
-        LEFT JOIN ai_analysis ai ON UPPER(s.symbol) = UPPER(ai.symbol)
-        WHERE 1=1
-    """
-    params = []
-
-    if search:
-        base_query += " AND (UPPER(s.symbol) LIKE ? OR UPPER(COALESCE(a.name, s.name)) LIKE ?)"
-        params.extend([f"%{search.upper()}%", f"%{search.upper()}%"])
-
-    if filter_type == "stock":
-        base_query += """ AND s.asset_class = 'us_equity'
-            AND UPPER(COALESCE(a.name, s.name)) NOT LIKE '%ETF%'
-            AND UPPER(COALESCE(a.name, s.name)) NOT LIKE '%ETN%'
-            AND UPPER(COALESCE(a.name, s.name)) NOT LIKE '%INDEX FUND%'
-            AND s.symbol NOT LIKE '%-USD' AND s.symbol NOT LIKE '%.V'
-            AND s.symbol NOT LIKE '%-RT' AND s.symbol NOT LIKE '%-WT'
-            AND UPPER(COALESCE(a.name, s.name)) NOT LIKE '%ADR%'
-            AND UPPER(COALESCE(a.name, s.name)) NOT LIKE '%AMERICAN DEPOSITARY%'"""
-    elif filter_type == "etf":
-        base_query += """ AND s.asset_class = 'us_equity'
-            AND (UPPER(COALESCE(a.name, s.name)) LIKE '%ETF%'
-                OR UPPER(COALESCE(a.name, s.name)) LIKE '%ETN%'
-                OR UPPER(COALESCE(a.name, s.name)) LIKE '%INDEX FUND%'
-                OR s.symbol LIKE '%-USD' OR s.symbol LIKE '%.V')"""
-    elif filter_type == "index":
-        base_query += " AND (s.asset_class = 'index' OR s.symbol IN ('SPY','QQQ','IWM','DIA','VTI','VOO'))"
-    elif filter_type == "adr":
-        base_query += """ AND s.asset_class = 'us_equity'
-            AND (UPPER(COALESCE(a.name, s.name)) LIKE '%ADR%'
-                OR UPPER(COALESCE(a.name, s.name)) LIKE '%AMERICAN DEPOSITARY%')"""
-
-    # Price filters
-    min_price = request.args.get("min_price")
-    max_price = request.args.get("max_price")
-    if min_price:
-        base_query += " AND s.price >= ?"
-        params.append(float(min_price))
-    if max_price:
-        base_query += " AND s.price <= ?"
-        params.append(float(max_price))
-
-    # Change% filters
-    min_change = request.args.get("min_change")
-    max_change = request.args.get("max_change")
-    if min_change:
-        base_query += " AND s.change_pct >= ?"
-        params.append(float(min_change))
-    if max_change:
-        base_query += " AND s.change_pct <= ?"
-        params.append(float(max_change))
-
-    # Weighted Alpha filters
-    max_wa = request.args.get("max_wa")
-    if min_wa:
-        base_query += " AND s.weighted_alpha >= ?"
-        params.append(float(min_wa))
-    if max_wa:
-        base_query += " AND s.weighted_alpha <= ?"
-        params.append(float(max_wa))
-
-    # Volume filter
-    min_volume = request.args.get("min_volume")
-    if min_volume:
-        base_query += " AND s.volume >= ?"
-        params.append(int(min_volume))
-
-    # Streak filters
-    min_streak = request.args.get("min_streak")
-    max_streak = request.args.get("max_streak")
-    if min_streak:
-        base_query += " AND s.streak >= ?"
-        params.append(int(min_streak))
-    if max_streak:
-        base_query += " AND s.streak <= ?"
-        params.append(int(max_streak))
-
-    # Pre-market change filter
-    min_pre_change = request.args.get("min_pre_change")
-    if min_pre_change:
-        base_query += " AND s.pre_change_pct >= ?"
-        params.append(float(min_pre_change))
-
-    # Post-market change filter
-    min_post_change = request.args.get("min_post_change")
-    if min_post_change:
-        base_query += " AND s.post_change_pct >= ?"
-        params.append(float(min_post_change))
-
-    # ATR status filter
-    atr_status = request.args.get("atr_status", "").strip()
-    if atr_status == "above":
-        base_query += " AND s.atr_signal = 1 AND s.atr_stop > 0"
-    elif atr_status == "below":
-        base_query += " AND s.atr_signal = -1 AND s.atr_stop > 0"
-    elif atr_status == "crossed_above":
-        base_query += " AND s.atr_crossed_above = 1"
-    elif atr_status == "crossed_below":
-        base_query += " AND s.atr_crossed_below = 1"
-
-    # ATR multiplier filter
-    atr_mult = request.args.get("atr_multiplier", "").strip()
-    if atr_mult:
-        base_query += " AND s.atr_multiplier = ?"
-        params.append(float(atr_mult))
-
-    # Fractionable filter
-    fractionable_filter = request.args.get("fractionable", "").strip()
-    if fractionable_filter in ("0", "1"):
-        base_query += " AND s.fractionable = ?"
-        params.append(int(fractionable_filter))
-
-    # Profitability filter
-    profit_filter = request.args.get("profit_status", "").strip()
-    if profit_filter == "profitable":
-        base_query += " AND s.profit_status = 'profitable'"
-    elif profit_filter == "loss_making":
-        base_query += " AND s.profit_status = 'loss_making'"
-    elif profit_filter == "growing":
-        base_query += " AND s.profit_status = 'growing'"
-    elif profit_filter == "declining":
-        base_query += " AND s.profit_status = 'declining'"
-
-    # Date cutoff filter: show historical data as of that date
-    # We keep the main query simple (filter by oldest_data) and overwrite
-    # price/change/volume later for the paginated results only.
-    if date_cutoff:
-        base_query += " AND s.oldest_data <= ?"
-        params.append(date_cutoff)
-
-    # Exchange filter — support comma-separated multi-select
-    if exchange_filter:
-        exchanges = [e.strip() for e in exchange_filter.split(',') if e.strip()]
-        if len(exchanges) == 1:
-            base_query += " AND s.exchange = ?"
-            params.append(exchanges[0])
-        elif len(exchanges) > 1:
-            placeholders = ",".join(["?" for _ in exchanges])
-            base_query += f" AND s.exchange IN ({placeholders})"
-            params.extend(exchanges)
-
-    # Total count — wrap the WHERE-filtered query as a subquery so COUNT(*) is
-    # valid even when the outer SELECT references joined columns.
-    where_idx = base_query.find(" WHERE 1=1")
-    count_query = "SELECT COUNT(*) as cnt FROM (" + base_query[:where_idx] + base_query[where_idx:] + ") _cnt"
-    total = conn.execute(count_query, params).fetchone()["cnt"]
-
-    # Sorting — for 1W/1M, we sort by the pre-computed 1D stats columns as proxy
-    valid_sorts = {
-        "symbol": "s.symbol", "name": "COALESCE(a.name, s.name)",
-        "price": "s.price", "change_pct": "s.change_pct",
-        "weighted_alpha": "s.weighted_alpha", "atrp": "s.atrp",
-        "volume": "s.volume", "streak": "s.streak",
-        "oldest_data": "s.oldest_data",
-        "exchange": "s.exchange",
-        "atr_signal": "s.atr_signal", "atr_streak": "s.atr_streak",
-        "atr_value": "s.atr_value", "atr_stop": "s.atr_stop",
-        "ai_score": "ai.overall_score",
-        "vp_score": "ai.volume_profile_score",
-        "trendline_score": "ai.trendline_score",
-        "sentiment_score": "ai.sentiment_score",
-        "pre_change_pct": "s.pre_change_pct",
-        "post_change_pct": "s.post_change_pct",
-        "profit_status": "s.profit_status",
-        "fractionable": "s.fractionable",
-        "last_updated": "s.last_updated"
-    }
-    sort_col = valid_sorts.get(sort_by, "s.symbol")
-    order = "DESC" if sort_dir == "desc" else "ASC"
-    base_query += f" ORDER BY {sort_col} {order}"
-
-    # Pagination
-    offset = (page - 1) * per_page
-    base_query += f" LIMIT {per_page} OFFSET {offset}"
-
-    rows = conn.execute(base_query, params).fetchall()
-
-    # Build results — single query, no N+1
-    stocks = []
-    symbols_in_results = []
-    if timeframe == '1Day':
-        # Fast path: all stats already in the query result
-        for row in rows:
-            sym = row["symbol"]
-            symbols_in_results.append(sym)
-            stocks.append({
-                "symbol": sym,
-                "name": row["asset_name"] or row["name"] or sym,
-                "price": row["price"],
-                "change_pct": row["change_pct"],
-                "weighted_alpha": row["weighted_alpha"],
-                "volume": row["volume"],
-                "atrp": row["atrp"],
-                "streak": row["streak"],
-                "pre_price": row["pre_price"],
-                "pre_change_pct": row["pre_change_pct"],
-                "post_price": row["post_price"],
-                "post_change_pct": row["post_change_pct"],
-                "fractionable": row["fractionable"],
-                "marginable": row["marginable"],
-                "asset_class": row["asset_class"],
-                "exchange": row["exchange"],
-                "status": row["status"],
-                "tradable": row["tradable"],
-                "last_updated": row["last_updated"],
-                "oldest_data": row["oldest_data"],
-                "atr_value": row["atr_value"],
-                "atr_stop": row["atr_stop"],
-                "atr_signal": row["atr_signal"],
-                "atr_crossed_above": row["atr_crossed_above"],
-                "atr_crossed_below": row["atr_crossed_below"],
-                "atr_streak": row["atr_streak"],
-                "atr_multiplier": row["atr_multiplier"],
-                "profit_status": row["profit_status"],
-                "profit_last_qtr_pct": row["profit_last_qtr_pct"],
-                "profit_millions": row.get("profit_millions"),
-                "profit_expectations": row.get("profit_expectations", "N/A"),
-                "profit_post_result_dir": row.get("profit_post_result_dir", "flat"),
-                "ai_score": row["overall_score"],
-                "ai_bias": row["bias"],
-                "ai_tech": row["tech_score"],
-                "ai_momentum": row["momentum_score"],
-                "ai_volume": row["volume_score"],
-                "ai_events": row["events_score"],
-                "ai_volume_profile": row["volume_profile_score"],
-                "ai_trendline": row["trendline_score"],
-                "ai_sentiment": row["sentiment_score"],
-                "ai_conclusion": row["conclusion"],
-            })
-
-    # If date_cutoff is set, overwrite price/change/volume with historical bar data
-    # (only for the paginated results on this page)
-    if date_cutoff and stocks:
-        syms = [s["symbol"] for s in stocks]
-        placeholders = ",".join(["?" for _ in syms])
-        params_hist = [date_cutoff, date_cutoff] + syms
-        hist_rows = conn.execute(f"""
-            SELECT lb.symbol, lb.close, lb.volume,
-                   CASE WHEN pb.close IS NOT NULL AND pb.close > 0
-                       THEN ROUND(((lb.close - pb.close) / pb.close) * 100, 2)
-                       ELSE 0 END as change_pct
-            FROM (
-                SELECT b1.symbol, b1.close, b1.volume
-                FROM bars b1
-                WHERE b1.timeframe = '1Day' AND b1.date <= ?
-                AND b1.symbol IN ({placeholders})
-                AND b1.date = (
-                    SELECT MAX(b2.date) FROM bars b2
-                    WHERE b2.symbol = b1.symbol
-                    AND b2.timeframe = '1Day' AND b2.date <= ?
-                )
-            ) lb
-            LEFT JOIN bars pb ON pb.symbol = lb.symbol
-                AND pb.timeframe = '1Day'
-                AND pb.date = (SELECT MAX(b3.date) FROM bars b3
-                               WHERE b3.symbol = lb.symbol
-                               AND b3.timeframe = '1Day' AND b3.date < lb.date)
-        """, params_hist).fetchall()
-        hist_map = {r["symbol"]: r for r in hist_rows}
-        for s in stocks:
-            h = hist_map.get(s["symbol"])
-            if h:
-                s["price"] = h["close"]
-                s["volume"] = h["volume"]
-                s["change_pct"] = h["change_pct"]
-                s["pre_price"] = None
-                s["pre_change_pct"] = None
-                s["post_price"] = None
-                s["post_change_pct"] = None
-            # Recompute ATR and streak from historical data
-            atr_data = compute_atr_for_screener(s["symbol"], timeframe, 2, end_date=date_cutoff)
-            if atr_data:
-                s["atr_value"] = atr_data.get("atr_value", 0)
-                s["atr_stop"] = atr_data.get("atr_stop", 0)
-                s["atr_signal"] = atr_data.get("atr_signal", 0)
-                s["atr_crossed_above"] = atr_data.get("crossed_above", 0)
-                s["atr_crossed_below"] = atr_data.get("crossed_below", 0)
-                s["atr_streak"] = atr_data.get("atr_streak", 0)
-                s["streak"] = atr_data.get("atr_streak", 0)
-
-    else:
-        # 1Week / 1Month: compute stats on-the-fly from aggregated 1Day bars
-        for row in rows:
-            sym = row["symbol"]
-            symbols_in_results.append(sym)
-            stat = compute_stats_from_bars_tf(sym, timeframe)
-            if stat:
-                stat['name'] = row["asset_name"] or stat["name"] or sym
-                stat['fractionable'] = row["fractionable"]
-                stat['marginable'] = row["marginable"]
-                stat['asset_class'] = row["asset_class"]
-                stat['exchange'] = row["exchange"]
-                stat['status'] = row["status"]
-                stat['tradable'] = row["tradable"]
-                stat['oldest_data'] = row["oldest_data"]
-                stat['ai_score'] = row["overall_score"]
-                stat['ai_bias'] = row["bias"]
-                stat['ai_tech'] = row["tech_score"]
-                stat['ai_momentum'] = row["momentum_score"]
-                stat['ai_volume'] = row["volume_score"]
-                stat['ai_events'] = row["events_score"]
-                stat['ai_volume_profile'] = row["volume_profile_score"]
-                stat['ai_trendline'] = row["trendline_score"]
-                stat['ai_sentiment'] = row["sentiment_score"]
-                stat['ai_conclusion'] = row["conclusion"]
-                stat['profit_status'] = row["profit_status"]
-                stat['profit_last_qtr_pct'] = row["profit_last_qtr_pct"]
-                stat['profit_millions'] = row.get("profit_millions")
-                stat['profit_expectations'] = row.get("profit_expectations", "N/A")
-                stat['profit_post_result_dir'] = row.get("profit_post_result_dir", "flat")
-                # Compute ATR for this timeframe
-                atr_data = compute_atr_for_screener(sym, timeframe, 2)
-                if atr_data:
-                    stat['atr_value'] = atr_data.get('atr_value', 0)
-                    stat['atr_stop'] = atr_data.get('atr_stop', 0)
-                    stat['atr_signal'] = atr_data.get('atr_signal', 0)
-                    stat['atr_crossed_above'] = atr_data.get('crossed_above', 0)
-                    stat['atr_crossed_below'] = atr_data.get('crossed_below', 0)
-                    stat['atr_streak'] = atr_data.get('atr_streak', 0)
-                    stat['atr_multiplier'] = atr_data.get('multiplier', 2)
-                else:
-                    stat['atr_value'] = 0
-                    stat['atr_stop'] = 0
-                    stat['atr_signal'] = 0
-                    stat['atr_crossed_above'] = 0
-                    stat['atr_crossed_below'] = 0
-                    stat['atr_streak'] = 0
-                    stat['atr_multiplier'] = 2
-                stocks.append(stat)
-
-    # Fetch corporate events for all results in one query
-    if symbols_in_results:
-        placeholders = ",".join(["?" for _ in symbols_in_results])
-        events_rows = conn.execute(f"""
-            SELECT symbol, event_type, event_date, description
-            FROM corporate_events
-            WHERE UPPER(symbol) IN ({placeholders})
-            ORDER BY event_date DESC
-        """, [s.upper() for s in symbols_in_results]).fetchall()
-
-        # Group events by symbol
-        events_by_symbol = {}
-        for e in events_rows:
-            sym = e["symbol"].upper()
-            if sym not in events_by_symbol:
-                events_by_symbol[sym] = []
-            events_by_symbol[sym].append(dict(e))
-
-        # Attach events to stocks
-        for stock in stocks:
-            stock["events"] = events_by_symbol.get(stock["symbol"].upper(), [])
-    else:
-        for stock in stocks:
-            stock["events"] = []
-
-    conn.close()
-
-    return jsonify({
-        "stocks": stocks,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": math.ceil(total / per_page) if total > 0 else 0,
-        "timeframe": timeframe,
-    })
-
-
-@app.route("/api/market-breadth")
-def market_breadth():
-    """Market breadth: advancing vs declining across indexes."""
-    conn = get_db()
-    indexes = {
-        "S&P 500": ["SPY"],
-        "NASDAQ": ["QQQ"],
-        "NYSE": ["DIA"],
-        "Russell 2000": ["IWM"],
-    }
-
-    result = {}
-    for name, symbols in indexes.items():
-        advancing = 0
-        declining = 0
-        for sym in symbols:
-            row = conn.execute(
-                "SELECT change_pct FROM stats WHERE symbol = ?", (sym,)
-            ).fetchone()
-            if row:
-                if row["change_pct"] > 0:
-                    advancing += 1
-                elif row["change_pct"] < 0:
-                    declining += 1
-
-        total_sampled = advancing + declining
-        result[name] = {
-            "advancing": advancing,
-            "declining": declining,
-            "total": max(total_sampled, 1),
-            "ratio": round(advancing / max(total_sampled, 1) * 100, 1)
-        }
-
-    conn.close()
-    return jsonify(result)
-
-
-@app.route("/api/top-lists")
-def top_lists():
-    """Top 10 Momentum (WA), Gainers (Change%), Volume."""
-    conn = get_db()
-
-    momentum = conn.execute("""
-        SELECT symbol, name, price, weighted_alpha, change_pct
-        FROM stats WHERE price > 0
-        ORDER BY weighted_alpha DESC LIMIT 10
-    """).fetchall()
-
-    gainers = conn.execute("""
-        SELECT symbol, name, price, change_pct, weighted_alpha
-        FROM stats WHERE price > 0
-        ORDER BY change_pct DESC LIMIT 10
-    """).fetchall()
-
-    volume = conn.execute("""
-        SELECT symbol, name, price, volume, change_pct
-        FROM stats WHERE price > 0 AND volume > 0
-        ORDER BY volume DESC LIMIT 10
-    """).fetchall()
-
-    conn.close()
-
-    def rows_to_list(rows):
-        return [dict(r) for r in rows]
-
-    return jsonify({
-        "momentum": rows_to_list(momentum),
-        "gainers": rows_to_list(gainers),
-        "volume": rows_to_list(volume)
-    })
+@app.route("/india/")
+def india_home():
+    return render_template("screener.html", market="INDIA")
 
 
 @app.route("/stock/<symbol>")
-def stock_page(symbol):
-    """Full stock detail page (opens in new tab)."""
-    return render_template("stock_detail.html", symbol=symbol.upper())
+@app.route("/india/stock/<symbol>")
+def stock_detail(symbol):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("stock_detail.html", symbol=symbol, market=market)
 
 
-@app.route("/api/recompute-streaks", methods=["POST"])
-def api_recompute_streaks():
-    """Recompute all streaks from local bar data. Runs in background."""
-    import threading
-    threading.Thread(target=recompute_all_streaks, daemon=True).start()
-    return jsonify({"status": "started", "message": "Recomputing streaks in background..."})
+@app.route("/portfolio")
+def portfolio_list():
+    return render_template("portfolio_list.html", market="US")
 
 
-@app.route("/api/alpaca-news/<symbol>")
-def alpaca_news(symbol):
-    """Fetch latest news for a symbol from Alpaca."""
+@app.route("/india/portfolio")
+def india_portfolio_list():
+    return render_template("portfolio_list.html", market="INDIA")
+
+
+@app.route("/portfolio/<int:pid>")
+@app.route("/india/portfolio/<int:pid>")
+def portfolio_detail(pid):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("portfolio_detail.html", pid=pid, market=market)
+
+
+@app.route("/portfolio/<int:pid>/details")
+@app.route("/india/portfolio/<int:pid>/details")
+def portfolio_inside(pid):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("portfolio_inside.html", pid=pid, market=market)
+
+
+@app.route("/portfolio/overall")
+@app.route("/india/portfolio/overall")
+def portfolio_overall():
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("portfolio_overall.html", market=market)
+
+
+@app.route("/portfolio/<int:pid>/string/<int:psid>")
+@app.route("/india/portfolio/<int:pid>/string/<int:psid>")
+def string_detail_from_portfolio(pid, psid):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("string_detail_portfolio.html", pid=pid, psid=psid, market=market)
+
+
+@app.route("/portfolio/ai-discovered")
+@app.route("/india/portfolio/ai-discovered")
+def ai_discovered_list():
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("ai_discovered_list.html", market=market)
+
+
+@app.route("/portfolio/ai-discovered/<int:pid>")
+@app.route("/india/portfolio/ai-discovered/<int:pid>")
+def ai_discovered_detail(pid):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("ai_discovered_detail.html", pid=pid, market=market)
+
+
+@app.route("/string-screener/")
+def string_screener_list():
+    return render_template("string_screener.html", market="US")
+
+
+@app.route("/india/string-screener/")
+def india_string_screener_list():
+    return render_template("string_screener.html", market="INDIA")
+
+
+@app.route("/string-screener/strategy/<int:sid>")
+@app.route("/india/string-screener/strategy/<int:sid>")
+def string_screener_detail(sid):
+    market = "INDIA" if "/india/" in request.path else "US"
+    return render_template("string_strategy_detail.html", sid=sid, market=market)
+
+
+@app.route("/paper-trading")
+def paper_trading():
+    return render_template("paper_trading.html", market="US")
+
+
+@app.route("/india/paper-trading")
+def india_paper_trading():
+    return render_template("paper_trading.html", market="INDIA")
+
+
+@app.route("/btst-dashboard")
+def btst_dashboard():
+    return render_template("btst_dashboard.html", market="US")
+
+
+@app.route("/india/btst-dashboard")
+def india_btst_dashboard():
+    return render_template("btst_dashboard.html", market="INDIA")
+
+
+@app.route("/vault")
+def vault():
+    from dumbmoney.vault_data import VAULT_STRATEGIES
+    return render_template("vault.html", market="US", strategies=VAULT_STRATEGIES)
+
+
+@app.route("/vault/<slug>")
+def vault_strategy(slug):
+    from dumbmoney.vault_data import VAULT_STRATEGIES
+    strategy = next((s for s in VAULT_STRATEGIES if s["slug"] == slug), None)
+    if not strategy:
+        return "Strategy not found", 404
+    return render_template("vault_strategy.html", market="US", strategy=strategy)
+
+
+@app.route("/india/vault")
+def india_vault():
+    from dumbmoney.vault_data import VAULT_STRATEGIES
+    return render_template("vault.html", market="INDIA", strategies=VAULT_STRATEGIES)
+
+
+@app.route("/india/vault/<slug>")
+def india_vault_strategy(slug):
+    from dumbmoney.vault_data import VAULT_STRATEGIES
+    strategy = next((s for s in VAULT_STRATEGIES if s["slug"] == slug), None)
+    if not strategy:
+        return "Strategy not found", 404
+    return render_template("vault_strategy.html", market="INDIA", strategy=strategy)
+
+
+@app.route("/settings")
+def settings_page():
+    return render_template("settings.html", market="US")
+
+
+@app.route("/india/settings")
+def india_settings_page():
+    return render_template("settings.html", market="INDIA")
+
+
+# ===========================================================================
+# CRYPTO routes
+# ===========================================================================
+
+@app.route("/crypto/")
+def crypto_home():
+    return render_template("crypto_screener.html", market="CRYPTO")
+
+
+@app.route("/crypto/stock/<symbol>")
+def crypto_stock_detail(symbol):
+    return render_template("stock_detail.html", symbol=symbol, market="CRYPTO")
+
+
+@app.route("/crypto/portfolio")
+def crypto_portfolio_list():
+    return render_template("portfolio_list.html", market="CRYPTO")
+
+
+@app.route("/crypto/portfolio/<int:pid>")
+def crypto_portfolio_detail(pid):
+    return render_template("portfolio_detail.html", pid=pid, market="CRYPTO")
+
+
+@app.route("/crypto/paper-trading")
+def crypto_paper_trading():
+    from dumbmoney.data_crypto import get_all_symbols
+    symbols = get_all_symbols()
+    return render_template("crypto_paper_trading.html", market="CRYPTO", symbols=symbols)
+
+
+# ===========================================================================
+# CRYPTO API endpoints
+# ===========================================================================
+
+@crypto_bp.route("/api/crypto/products")
+def api_crypto_products():
+    from dumbmoney.crypto import get_crypto_products
+    return jsonify(get_crypto_products())
+
+
+@crypto_bp.route("/api/crypto/ticker")
+def api_crypto_ticker():
+    from dumbmoney.crypto_ws import get_all_live_tickers
+    from dumbmoney.data_crypto import fetch_tickers
+    tickers = get_all_live_tickers()
+    if not tickers:
+        tickers = fetch_tickers()
+    return jsonify(tickers)
+
+
+@crypto_bp.route("/api/crypto/ticker/<symbol>")
+def api_crypto_ticker_single(symbol):
+    from dumbmoney.crypto_ws import get_live_ticker
+    from dumbmoney.data_crypto import fetch_tickers
+    t = get_live_ticker(symbol)
+    if not t:
+        all_t = fetch_tickers()
+        t = all_t.get(symbol, {})
+    return jsonify(t)
+
+
+@crypto_bp.route("/api/crypto/screener")
+def api_crypto_screener():
+    from dumbmoney.crypto import get_crypto_screener
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(max(1, int(request.args.get("per_page", 50))), 200)
+    sort = request.args.get("sort", "volume")
+    sort_dir = request.args.get("sort_dir", "desc")
+    search = request.args.get("search", "")
+    force = request.args.get("force", "0") == "1"
+    date_cutoff = request.args.get("date_cutoff", "")
+    args = {
+        "min_price": request.args.get("min_price"),
+        "max_price": request.args.get("max_price"),
+        "min_change": request.args.get("min_change"),
+        "max_change": request.args.get("max_change"),
+        "min_wa": request.args.get("min_wa"),
+        "max_wa": request.args.get("max_wa"),
+        "min_streak": request.args.get("min_streak"),
+        "min_volume": request.args.get("min_volume"),
+        "atr_status": request.args.get("atr_status"),
+        "atr_status_w": request.args.get("atr_status_w"),
+        "atr_status_m": request.args.get("atr_status_m"),
+        "accel_status": request.args.get("accel_status"),
+        "min_st_bars_below": request.args.get("min_st_bars_below"),
+        "min_st_bars_above": request.args.get("min_st_bars_above"),
+        "min_accel_bars_below": request.args.get("min_accel_bars_below"),
+        "min_accel_bars_above": request.args.get("min_accel_bars_above"),
+        "min_oi": request.args.get("min_oi"),
+        "min_funding_rate": request.args.get("min_funding_rate"),
+    }
+    result = get_crypto_screener(page=page, per_page=per_page, sort=sort, sort_dir=sort_dir,
+                                  search=search, force=force, date_cutoff=date_cutoff, args=args)
+    return jsonify(result)
+
+
+@crypto_bp.route("/api/crypto/screener/columns")
+def api_crypto_screener_columns():
+    from dumbmoney.crypto import get_crypto_screener_columns
+    return jsonify({"columns": get_crypto_screener_columns()})
+
+
+@crypto_bp.route("/api/crypto/candles")
+def api_crypto_candles():
+    from dumbmoney.crypto import get_crypto_chart
+    symbol = request.args.get("symbol", "BTCUSD")
+    timeframe = request.args.get("timeframe", "1d")
+    limit = min(int(request.args.get("limit", 500)), 2000)
+    candles = get_crypto_chart(symbol, timeframe=timeframe, limit=limit)
+    return jsonify(candles)
+
+
+@crypto_bp.route("/api/crypto/download", methods=["POST"])
+def api_crypto_download():
+    """Trigger candle backfill for all or specified symbols."""
+    from dumbmoney.data_crypto import backfill_all
+    body = request.get_json() or {}
+    resolution = body.get("resolution", "1d")
+    days_back = body.get("days_back", 730)
+    symbols = body.get("symbols")
+
+    def progress(pct, msg):
+        logger.info(f"[CRYPTO] download progress: {pct:.0f}% — {msg}")
+
+    done, total = backfill_all(resolution=resolution, days_back=days_back, symbols=symbols, progress_callback=progress)
+    return jsonify({"done": done, "total": total, "resolution": resolution})
+
+
+@crypto_bp.route("/api/crypto/backfill-all", methods=["POST"])
+def api_crypto_backfill_all():
+    """Download all supported timeframes for all symbols."""
+    from dumbmoney.data_crypto import backfill_all_timeframes
+
+    def progress(pct, msg):
+        logger.info(f"[CRYPTO] backfill progress: {pct:.0f}% — {msg}")
+
+    done, total = backfill_all_timeframes(progress_callback=progress)
+    return jsonify({"done": done, "total": total})
+
+
+_crypto_refresh_thread = None
+_crypto_refresh_cancel = threading.Event()
+
+
+@crypto_bp.route("/api/crypto/refresh", methods=["POST"])
+def api_crypto_refresh():
+    """Start crypto backfill with progress tracking."""
+    global _crypto_refresh_thread
+    from dumbmoney.db import get_db as _get_db
+
+    # Check if already running
     try:
-        resp = alpaca_get("/v1beta1/news", params={
-            "symbols": symbol.upper(),
-            "limit": 10,
-            "sort": "desc",
+        conn = _get_db("CRYPTO")
+        row = conn.execute("SELECT value FROM crypto_settings WHERE key='refresh_status'").fetchone()
+        conn.close()
+        if row and row[0]:
+            import json as _json
+            st = _json.loads(row[0])
+            if st.get("status") == "running":
+                # Check if thread is actually alive (not a stale DB entry from crashed process)
+                thread_alive = _crypto_refresh_thread and _crypto_refresh_thread.is_alive()
+                if thread_alive:
+                    return jsonify({"started": False, "error": "Already running"})
+                # Stale status — clear it and allow new refresh
+    except Exception:
+        pass
+
+    _crypto_refresh_cancel.clear()
+
+    import time as _time
+    import json as _json
+    started_at = _time.time()
+    _init_status = _json.dumps({
+        "status": "running", "market": "CRYPTO",
+        "step_detail": "Starting crypto refresh...",
+        "phase": "", "overall_pct": 0,
+        "symbols_total": 0, "symbols_done": 0,
+        "elapsed_sec": 0, "eta_sec": 0, "started_at": started_at,
+    })
+    conn = _get_db("CRYPTO")
+    conn.execute(
+        "INSERT OR REPLACE INTO crypto_settings (key, value) VALUES ('refresh_status', ?)",
+        (_init_status,),
+    )
+    conn.commit()
+    conn.close()
+
+    def _run():
+        import time as _time
+        import traceback as _tb
+        from dumbmoney.data_crypto import get_all_symbols, download_candles, TIMEFRAMES
+
+        try:
+            conn = _get_db("CRYPTO")
+            symbols = get_all_symbols()
+            done_ops = 0
+            started_at = _time.time()
+
+            def _persist(status_dict):
+                try:
+                    c = _get_db("CRYPTO")
+                    c.execute(
+                        "INSERT OR REPLACE INTO crypto_settings (key, value) VALUES ('refresh_status', ?)",
+                        (_json.dumps(status_dict),)
+                    )
+                    c.commit()
+                    c.close()
+                except Exception:
+                    pass
+
+            _persist({
+                "status": "running", "market": "CRYPTO",
+                "step_detail": "Downloading candles...",
+                "phase": "", "overall_pct": 1,
+                "symbols_total": len(symbols), "symbols_done": 0,
+                "elapsed_sec": 0, "eta_sec": 0, "started_at": started_at,
+            })
+
+            # Build download tasks — only screener timeframes (1d, 1w)
+            # Intraday (1m-6h) is downloaded on-demand for charts, not during refresh
+            screener_tfs = {k: v for k, v in TIMEFRAMES.items() if k in ('1d', '1w')}
+            tasks = []
+            for tf, days in screener_tfs.items():
+                for sym in symbols:
+                    # Skip if latest bar is < 4 hours old (incremental refresh)
+                    _ck = conn.execute(
+                        "SELECT MAX(date) FROM crypto_bars WHERE symbol=? AND timeframe=?",
+                        (sym, tf),
+                    ).fetchone()
+                    if _ck and _ck[0]:
+                        try:
+                            _latest = _ck[0]
+                            if " " in _latest:
+                                _ts = _time.mktime(_time.strptime(_latest, "%Y-%m-%d %H:%M:%S"))
+                            else:
+                                _ts = _time.mktime(_time.strptime(_latest, "%Y-%m-%d"))
+                            if (_time.time() - _ts) < 14400:  # 4 hours
+                                continue
+                        except Exception:
+                            pass
+                    tasks.append((sym, tf, days))
+
+            conn.close()
+
+            total_ops = len(tasks)
+            done_ops = 0
+            _persist({
+                "status": "running", "market": "CRYPTO",
+                "step_detail": f"Downloading candles ({total_ops} tasks, parallel)...",
+                "phase": "", "overall_pct": 1,
+                "symbols_total": len(symbols), "symbols_done": 0,
+                "elapsed_sec": 0, "eta_sec": 0, "started_at": started_at,
+            })
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {
+                    executor.submit(download_candles, sym, tf, days): (sym, tf)
+                    for sym, tf, days in tasks
+                }
+                for future in as_completed(futures):
+                    if _crypto_refresh_cancel.is_set():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        _persist({"status": "cancelled", "market": "CRYPTO", "step_detail": "Cancelled"})
+                        return
+                    sym, tf = futures[future]
+                    done_ops += 1
+                    try:
+                        future.result(timeout=30)
+                    except Exception:
+                        pass
+                    elapsed = _time.time() - started_at
+                    pct = done_ops / total_ops * 95
+                    eta = (elapsed / done_ops * (total_ops - done_ops)) if done_ops > 0 else 0
+                    if done_ops % 5 == 0 or done_ops == total_ops:
+                        elapsed = _time.time() - started_at
+                        pct = done_ops / total_ops * 95
+                        eta = (elapsed / done_ops * (total_ops - done_ops)) if done_ops > 0 else 0
+                        _persist({
+                            "status": "running", "market": "CRYPTO",
+                            "step_detail": f"Downloading candles ({done_ops}/{total_ops})",
+                            "phase": f"{sym} {tf}",
+                            "overall_pct": round(pct, 1),
+                            "symbols_total": len(symbols),
+                            "symbols_done": done_ops // len(screener_tfs),
+                            "elapsed_sec": int(elapsed),
+                            "eta_sec": int(eta),
+                            "started_at": started_at,
+                        })
+
+            # Compute indicators
+            _persist({
+                "status": "running", "market": "CRYPTO",
+                "step_detail": "Computing indicators...",
+                "phase": "", "overall_pct": 95,
+                "symbols_total": len(symbols), "symbols_done": 0,
+                "elapsed_sec": int(_time.time() - started_at), "eta_sec": 30,
+                "started_at": started_at,
+            })
+
+            from dumbmoney.engine import compute_crypto_stats_batch, update_crypto_historical_screener
+
+            def _compute_progress(d, t):
+                _persist({
+                    "status": "running", "market": "CRYPTO",
+                    "step_detail": f"Computing indicators: {t}",
+                    "phase": t, "overall_pct": min(95 + d * 0.025, 97.5),
+                    "symbols_total": len(symbols), "symbols_done": 0,
+                    "elapsed_sec": int(_time.time() - started_at), "eta_sec": 30,
+                    "started_at": started_at,
+                })
+
+            compute_crypto_stats_batch(only_symbols=symbols, progress_callback=_compute_progress)
+            update_crypto_historical_screener(only_symbols=symbols, progress_callback=_compute_progress)
+
+            _persist({
+                "status": "complete", "market": "CRYPTO",
+                "step_detail": "Crypto backfill complete",
+                "phase": "", "overall_pct": 100,
+                "symbols_total": len(symbols), "symbols_done": len(symbols),
+                "elapsed_sec": int(_time.time() - started_at), "eta_sec": 0,
+                "started_at": started_at,
+            })
+        except Exception as e:
+            logger.error(f"Crypto refresh error: {e}", exc_info=True)
+            _persist({
+                "status": "error", "market": "CRYPTO",
+                "step_detail": f"Error: {e}",
+                "phase": "", "overall_pct": 0,
+                "symbols_total": 0, "symbols_done": 0,
+                "elapsed_sec": 0, "eta_sec": 0,
+                "started_at": started_at if 'started_at' in dir() else 0,
+            })
+
+    _crypto_refresh_thread = threading.Thread(target=_run, daemon=True)
+    _crypto_refresh_thread.start()
+    return jsonify({"started": True})
+
+
+@crypto_bp.route("/api/crypto/refresh/status")
+def api_crypto_refresh_status():
+    """Get crypto refresh progress."""
+    from dumbmoney.db import get_db as _get_db
+    import json as _json
+    try:
+        conn = _get_db("CRYPTO")
+        row = conn.execute("SELECT value FROM crypto_settings WHERE key='refresh_status'").fetchone()
+        conn.close()
+        if row and row[0]:
+            d = _json.loads(row[0])
+            # If thread is alive, force status to running even if DB row is stale
+            if _crypto_refresh_thread and _crypto_refresh_thread.is_alive():
+                if d.get("status") not in ("running",):
+                    d["status"] = "running"
+                    d["step_detail"] = d.get("step_detail") or "Processing..."
+            return jsonify(d)
+    except Exception:
+        pass
+    # No row in DB — check if thread is still alive
+    if _crypto_refresh_thread and _crypto_refresh_thread.is_alive():
+        return jsonify({
+            "status": "running", "market": "CRYPTO",
+            "step_detail": "Processing...", "phase": "", "overall_pct": 0,
+            "symbols_total": 0, "symbols_done": 0,
+            "elapsed_sec": 0, "eta_sec": 0,
         })
-        if resp.status_code == 200:
-            data = resp.json().get('news', [])
-            return jsonify(data)
-        return jsonify([])
+    return jsonify({
+        "status": "idle", "market": "CRYPTO",
+        "step_detail": "", "phase": "", "overall_pct": 0,
+        "symbols_total": 0, "symbols_done": 0,
+        "elapsed_sec": 0, "eta_sec": 0,
+    })
+
+
+@crypto_bp.route("/api/crypto/refresh/cancel", methods=["POST"])
+def api_crypto_refresh_cancel():
+    """Cancel crypto refresh."""
+    _crypto_refresh_cancel.set()
+    from dumbmoney.db import get_db as _get_db
+    import json as _json
+    try:
+        conn = _get_db("CRYPTO")
+        conn.execute(
+            "INSERT OR REPLACE INTO crypto_settings (key, value) VALUES ('refresh_status', ?)",
+            (_json.dumps({"status": "cancelled", "market": "CRYPTO", "step_detail": "Cancelled"}),)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return jsonify({"cancelled": True})
+
+
+@crypto_bp.route("/api/crypto/download/status")
+def api_crypto_download_status():
+    from dumbmoney.db import get_db
+    conn = get_db("CRYPTO")
+    try:
+        row = conn.execute("SELECT value FROM crypto_settings WHERE key='download_progress'").fetchone()
+        return jsonify(json.loads(row[0]) if row else {})
+    finally:
+        conn.close()
+
+
+@crypto_bp.route("/api/crypto/positions")
+def api_crypto_positions():
+    from dumbmoney.data_crypto import get_positions
+    try:
+        positions = get_positions()
+        return jsonify(positions if positions else [])
     except Exception:
         return jsonify([])
 
 
-@app.route("/api/news-search")
-def news_search():
-    """Search for recent news about a stock using web search."""
-    symbol = request.args.get("symbol", "").upper()
-    name = request.args.get("name", "")
-
-    # Build search queries
-    queries = []
-    if symbol:
-        queries.append(f"{symbol} stock news today")
-        queries.append(f"{symbol} {name} latest news")
-    if name:
-        queries.append(f"{name} stock analysis {symbol}")
-
-    # For now, return structured placeholder data
-    # The frontend renders this with links to external searches
-    articles = []
-    now = datetime.now()
-
-    # Generate search links for multiple platforms
-    platforms = [
-        {"name": "Google News", "url": f"https://news.google.com/search?q={symbol}+stock+when:7d", "icon": "📰"},
-        {"name": "Reddit", "url": f"https://www.reddit.com/search/?q={symbol}+stock&type=link&sort=top&t=week", "icon": "🔴"},
-        {"name": "X / Twitter", "url": f"https://x.com/search?q={symbol}+stock&f=live", "icon": "🐦"},
-        {"name": "StockTwits", "url": f"https://stocktwits.com/symbol/{symbol}", "icon": "📈"},
-        {"name": "Yahoo Finance", "url": f"https://finance.yahoo.com/quote/{symbol}/news/", "icon": "💹"},
-    ]
-
-    for p in platforms:
-        articles.append({
-            "title": f"{p['icon']} {p['name']} — {symbol} discussions & news",
-            "source": p['name'],
-            "url": p['url'],
-            "timeAgo": "Recent",
-            "platform": p['name'],
-        })
-
-    return jsonify({"articles": articles, "symbol": symbol, "name": name})
-
-
-@app.route("/api/stock/<symbol>")
-def stock_detail(symbol):
-    """Get detailed info for a single stock."""
-    conn = None
+@crypto_bp.route("/api/crypto/balances")
+def api_crypto_balances():
+    from dumbmoney.data_crypto import get_balances
     try:
-        conn = get_db()
-
-        stat = conn.execute(
-            "SELECT * FROM stats WHERE UPPER(symbol) = ?", (symbol.upper(),)
-        ).fetchone()
-
-        if not stat:
-            return jsonify({"error": "Stock not found"}), 404
-
-        # Get total bar count
-        total_bars = conn.execute("""
-            SELECT COUNT(*) FROM bars WHERE symbol = ?
-        """, (symbol.upper(),)).fetchone()[0]
-
-        # Get recent bars for chart — return last 90 bars for fast initial load
-        bars = conn.execute("""
-            SELECT date, open, high, low, close, volume
-            FROM bars WHERE symbol = ? ORDER BY date DESC LIMIT 90
-        """, (symbol.upper(),)).fetchall()
-        # Reverse to chronological order
-        bars = [dict(b) for b in reversed(bars)]
-
-        # Get corporate events
-        events = conn.execute("""
-            SELECT event_type, event_date, description
-            FROM corporate_events WHERE UPPER(symbol) = ?
-            ORDER BY event_date DESC LIMIT 20
-        """, (symbol.upper(),)).fetchall()
-
-        stat_dict = dict(stat)
-        return jsonify({
-            "symbol": stat_dict.get("symbol", symbol.upper()),
-            "name": stat_dict.get("name", ""),
-            "price": stat_dict.get("price", 0),
-            "change_pct": stat_dict.get("change_pct", 0),
-            "weighted_alpha": stat_dict.get("weighted_alpha", 0),
-            "atrp": stat_dict.get("atrp", 0),
-            "atr_stop": stat_dict.get("atr_stop", 0),
-            "atr_signal": stat_dict.get("atr_signal", 0),
-            "streak": stat_dict.get("streak", 0),
-            "volume": stat_dict.get("volume", 0),
-            "fractionable": stat_dict.get("fractionable", 0),
-            "marginable": stat_dict.get("marginable", 0),
-            "asset_class": stat_dict.get("asset_class", ""),
-            "exchange": stat_dict.get("exchange", ""),
-            "status": stat_dict.get("status", ""),
-            "tradable": stat_dict.get("tradable", 0),
-            "pre_price": stat_dict.get("pre_price"),
-            "pre_change_pct": stat_dict.get("pre_change_pct"),
-            "post_price": stat_dict.get("post_price"),
-            "post_change_pct": stat_dict.get("post_change_pct"),
-            "downloaded_1day": stat_dict.get("downloaded_1day"),
-            "downloaded_1hour": stat_dict.get("downloaded_1hour"),
-            "downloaded_1min": stat_dict.get("downloaded_1min"),
-            "oldest_data": stat_dict.get("oldest_data"),
-            "atr_crossed_above": stat_dict.get("atr_crossed_above", 0),
-            "atr_crossed_below": stat_dict.get("atr_crossed_below", 0),
-            "profit_status": stat_dict.get("profit_status"),
-            "profit_last_qtr_pct": stat_dict.get("profit_last_qtr_pct"),
-            "total_bars": total_bars,
-            "bars": [dict(b) for b in bars],
-            "events": [dict(e) for e in events],
-        })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Failed to load stock data: {str(e)}"}), 500
-    finally:
-        if conn:
-            conn.close()
+        balances = get_balances()
+        return jsonify(balances if balances else [])
+    except Exception:
+        return jsonify([])
 
 
-@app.route("/api/stock/<symbol>/bars")
-def stock_bars_more(symbol):
-    """Get more bars for a stock (for zoom/pan). Supports offset and limit."""
-    conn = get_db()
-
-    # Verify stock exists
-    stat = conn.execute(
-        "SELECT symbol FROM stats WHERE UPPER(symbol) = ?", (symbol.upper(),)
-    ).fetchone()
-    if not stat:
-        conn.close()
-        return jsonify({"error": "Stock not found"}), 404
-
-    offset = request.args.get("offset", 0, type=int)
-    limit = request.args.get("limit", 200, type=int)
-    direction = request.args.get("dir", "older")  # "older" = earlier bars, "newer" = later bars
-
-    if direction == "older":
-        # Get bars BEFORE the current earliest (for zooming out to the left)
-        rows = conn.execute("""
-            SELECT date, open, high, low, close, volume
-            FROM bars WHERE symbol = ? AND date < (
-                SELECT MIN(date) FROM (
-                    SELECT date FROM bars WHERE symbol = ? ORDER BY date DESC LIMIT ?
-                )
-            )
-            ORDER BY date DESC LIMIT ?
-        """, (symbol.upper(), symbol.upper(), max(offset, 1), limit)).fetchall()
-    else:
-        # Get bars AFTER the current latest (for zooming out to the right)
-        rows = conn.execute("""
-            SELECT date, open, high, low, close, volume
-            FROM bars WHERE symbol = ? AND date > (
-                SELECT MAX(date) FROM (
-                    SELECT date FROM bars WHERE symbol = ? ORDER BY date ASC LIMIT ?
-                )
-            )
-            ORDER BY date ASC LIMIT ?
-        """, (symbol.upper(), symbol.upper(), max(offset, 1), limit)).fetchall()
-
-    conn.close()
-
-    # Reverse to chronological order
-    bars = [dict(r) for r in reversed(rows)]
-    return jsonify({"bars": bars, "count": len(bars)})
-
-
-@app.route("/api/stock/<symbol>/analysis")
-def stock_analysis(symbol):
-    """Get AI analysis for a stock."""
-    symbol = symbol.upper()
-
-    # Check if cached result exists and is fresh (< 1 hour old)
-    conn = get_db()
-    cached = conn.execute("""
-        SELECT * FROM ai_analysis WHERE symbol = ? AND computed_at > ?
-    """, (symbol, (datetime.now() - timedelta(hours=1)).isoformat())).fetchone()
-    conn.close()
-
-    if cached:
-        result = {
-            "symbol": cached['symbol'],
-            "overall_score": cached['overall_score'],
-            "bias": cached['bias'],
-            "tech_score": cached['tech_score'],
-            "momentum_score": cached['momentum_score'],
-            "volume_score": cached['volume_score'],
-            "events_score": cached['events_score'],
-            "signals": [],
-            "cached": True,
-        }
-    else:
-        result = compute_ai_analysis(symbol)
-        result["cached"] = False
-
+@crypto_bp.route("/api/crypto/order", methods=["POST"])
+def api_crypto_order():
+    from dumbmoney.data_crypto import place_order
+    body = request.get_json()
+    symbol = body.get("symbol", "")
+    side = body.get("side", "buy")
+    qty = float(body.get("qty", 0))
+    order_type = body.get("order_type", "market_order")
+    price = body.get("price")
+    leverage = body.get("leverage")
+    result = place_order(symbol, side, qty, order_type=order_type, price=price, leverage=leverage)
     return jsonify(result)
 
 
-@app.route("/api/download-history", methods=["POST"])
-def trigger_download_history():
-    """Trigger full historical bars download for all symbols."""
-    global downloading_history
-    with download_lock:
-        if downloading_history:
-            return jsonify({"status": "already_running"})
-
-    def _bg():
-        result = download_all_history()
-        print(f"Download result: {result}")
-
-    thread = threading.Thread(target=_bg, daemon=True)
-    thread.start()
-    return jsonify({"status": "started"})
+@crypto_bp.route("/api/crypto/cancel-order", methods=["POST"])
+def api_crypto_cancel_order():
+    from dumbmoney.data_crypto import cancel_order
+    body = request.get_json()
+    order_id = body.get("order_id")
+    ok = cancel_order(order_id)
+    return jsonify({"ok": ok})
 
 
-@app.route("/api/download-status")
-def download_status():
-    """Check download progress with detailed info."""
-    with download_lock:
-        data = dict(download_progress)
 
-    # Compute timing metrics
-    if data.get("start_time") and data.get("status") == "running":
-        elapsed = time.time() - data["start_time"]
-        done = data.get("symbols_done", 0)
-        total = data.get("symbols_total", 0)
-        bars = data.get("bars_found", 0)
 
-        data["elapsed"] = elapsed
-        data["elapsed_str"] = _format_duration(elapsed)
+@crypto_bp.route("/api/crypto/history")
+def api_crypto_history():
+    """Get trade history for the sidebar panel."""
+    from dumbmoney.data_crypto import get_trade_history
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        return jsonify(get_trade_history(limit=limit))
+    except Exception:
+        return jsonify([])
+@crypto_bp.route("/api/crypto/order-history")
+def api_crypto_order_history():
+    from dumbmoney.data_crypto import get_order_history
+    limit = min(int(request.args.get("limit", 50)), 200)
+    return jsonify(get_order_history(limit=limit))
 
-        if done > 0 and elapsed > 0:
-            speed = done / elapsed  # symbols per second
-            data["speed"] = round(speed, 2)
-            data["speed_str"] = f"{speed:.1f}/s"
 
-            if total > done:
-                remaining = total - done
-                eta = remaining / speed
-                data["eta"] = round(eta)
-                data["eta_str"] = _format_duration(eta)
+
+
+@crypto_bp.route("/api/crypto/account")
+def api_crypto_account():
+    """Get Delta account overview for the sidebar."""
+    from dumbmoney.data_crypto import get_account_info
+    try:
+        return jsonify(get_account_info())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@crypto_bp.route("/api/crypto/close-all", methods=["POST"])
+def api_crypto_close_all():
+    """Close all positions for a given symbol or all symbols."""
+    if not DELTA_API_KEY:
+        return jsonify({"error": "No API key configured"}), 400
+    from dumbmoney.data_crypto import _get, _post
+    try:
+        positions = _get("/v2/positions")
+        closed = 0
+        for pos in positions:
+            if float(pos.get("size", 0)) != 0:
+                sym = pos.get("symbol", "")
+                size = float(pos.get("size", 0))
+                side = "buy" if size < 0 else "sell"
+                _post("/v2/orders", body={
+                    "product_id": pos.get("product_id"),
+                    "size": abs(size),
+                    "order_type": "market_order",
+                    "side": side,
+                })
+                closed += 1
+        return jsonify({"closed": closed})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- Crypto Portfolio APIs (separate from US/India since they use different data sources) ---
+
+@crypto_bp.route("/api/crypto/portfolios")
+def api_crypto_portfolios():
+    from dumbmoney.db import get_db
+    from dumbmoney.data_crypto import fetch_tickers
+    conn = get_db("CRYPTO")
+    try:
+        tickers = fetch_tickers()
+        rows = conn.execute("SELECT * FROM portfolios ORDER BY created_at DESC").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            strings = conn.execute(
+                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY sort_order, created_at", (r["id"],)
+            ).fetchall()
+            str_list = []
+            total_pnl = 0
+            for s in strings:
+                sd = dict(s)
+                ep = sd.get("entry_price") or 0
+                sym_rows = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (sd["id"],)
+                ).fetchall()
+                entry_value = ep
+                current_value = 0
+                for sy in sym_rows:
+                    t = tickers.get(sy["symbol"], {})
+                    price = t.get("close", 0) or 0
+                    qty = sy["qty"] or 0
+                    current_value += price * qty
+                rp_raw = sd.get("realised_pnl")
+                rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else 0.0
+                up = current_value - entry_value if entry_value else 0
+                sd["entry_value"] = entry_value
+                sd["current_value"] = current_value
+                sd["realised_pnl"] = rp
+                sd["unrealised_pnl"] = up
+                sd["pnl_pct"] = ((current_value / entry_value - 1) * 100) if entry_value else 0
+                sd["num_stocks"] = len(sym_rows)
+                total_pnl += rp + up
+                str_list.append(sd)
+            d["strings"] = str_list
+            d["total_pnl"] = total_pnl
+            d["num_strings"] = len(str_list)
+            result.append(d)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@crypto_bp.route("/api/crypto/portfolio/<int:pid>/detail")
+def api_crypto_portfolio_detail(pid):
+    from dumbmoney.db import get_db
+    from dumbmoney.data_crypto import fetch_tickers
+    conn = get_db("CRYPTO")
+    try:
+        tickers = fetch_tickers()
+        port = conn.execute("SELECT * FROM portfolios WHERE id=?", (pid,)).fetchone()
+        if not port:
+            return jsonify({"error": "Portfolio not found"}), 404
+        pd_ = dict(port)
+        strings = conn.execute(
+            "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY status='running' DESC, created_at DESC", (pid,)
+        ).fetchall()
+        pd_["strings"] = []
+        booked_profit = 0
+        running_value = 0
+        running_invested = 0
+        running_unrealised = 0
+        closed_count = 0
+        running_count = 0
+        win_count = 0
+        total_return_list = []
+
+        for s in strings:
+            sd = dict(s)
+            sym_rows = conn.execute(
+                "SELECT symbol, qty, weight FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+                (s["id"],)
+            ).fetchall()
+            sd["num_stocks"] = len(sym_rows)
+            is_running = sd.get("status") != "closed"
+
+            if sym_rows:
+                sv = sum((tickers.get(x["symbol"], {}).get("close", 0) or 0) * float(x["qty"]) for x in sym_rows)
+                sd["current_value"] = sv
+                sd["total_value"] = sv
+                entry_total = float(sd.get("entry_price") or 0)
+                sd["entry_value"] = entry_total
+
+                if is_running:
+                    up = sv - entry_total
+                    sd["unrealised_pnl"] = up
+                    running_value += sv
+                    running_invested += entry_total
+                    running_unrealised += up
+                    running_count += 1
+                    if entry_total > 0:
+                        total_return_list.append((sv / entry_total - 1) * 100)
+                else:
+                    rp_raw = sd.get("realised_pnl")
+                    rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else (sv - entry_total)
+                    sd["realised_pnl"] = rp
+                    sd["unrealised_pnl"] = 0
+                    booked_profit += rp
+                    closed_count += 1
+                    if entry_total > 0:
+                        total_return_list.append(rp / entry_total * 100)
+                    if rp > 0:
+                        win_count += 1
             else:
-                data["eta"] = 0
-                data["eta_str"] = "done"
+                sd["current_value"] = 0
+                sd["entry_value"] = 0
+                sd["unrealised_pnl"] = 0
+                sd["realised_pnl"] = 0
+
+            pd_["strings"].append(sd)
+
+        total_invested = running_invested
+        total_value = running_value + booked_profit
+        total_pnl = running_unrealised + booked_profit
+        today_pnl = running_unrealised  # simplified — no previous day tracking yet
+
+        pd_["running_value"] = running_value
+        pd_["booked_profit"] = booked_profit
+        pd_["total_value"] = total_value
+        pd_["total_invested"] = total_invested
+        pd_["total_pnl"] = total_pnl
+        pd_["today_pnl"] = today_pnl
+        pd_["win_rate"] = round(win_count / closed_count * 100, 1) if closed_count > 0 else 0
+        pd_["avg_return_pct"] = round(sum(total_return_list) / len(total_return_list), 2) if total_return_list else 0
+        pd_["best_trade_pct"] = round(max(total_return_list), 2) if total_return_list else 0
+        pd_["worst_trade_pct"] = round(min(total_return_list), 2) if total_return_list else 0
+        pd_["closed_count"] = closed_count
+        pd_["running_count"] = running_count
+
+        return jsonify(pd_)
+    finally:
+        conn.close()
+
+
+@crypto_bp.route("/api/crypto/settings", methods=["GET"])
+def api_crypto_settings_get():
+    from dumbmoney.db import get_db
+    conn = get_db("CRYPTO")
+    try:
+        rows = conn.execute("SELECT key, value FROM crypto_settings").fetchall()
+        return jsonify({r[0]: r[1] for r in rows})
+    finally:
+        conn.close()
+
+
+@crypto_bp.route("/api/crypto/settings", methods=["POST"])
+def api_crypto_settings_set():
+    from dumbmoney.db import get_db
+    body = request.get_json()
+    conn = get_db("CRYPTO")
+    try:
+        for key, value in body.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO crypto_settings (key, value) VALUES (?, ?)",
+                (key, json.dumps(value) if isinstance(value, (dict, list)) else str(value))
+            )
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+app.register_blueprint(crypto_bp, url_prefix="")
+
+
+@api_bp.route("/screener")
+def api_screener():
+    market = request.args.get("market", "US")
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = min(max(1, int(request.args.get("per_page", 50))), 500)
+    except (TypeError, ValueError):
+        per_page = 50
+    sort = request.args.get("sort", "weighted_alpha")
+    sort_dir = request.args.get("sort_dir") or request.args.get("order", "desc")
+    search = request.args.get("search", "")
+    exchange = request.args.get("exchange", "")
+    asset_type = request.args.get("asset_type", "")
+    timeframe = request.args.get("timeframe", "1Day")
+    date_cutoff = request.args.get("date_cutoff", "")
+
+    conn = get_db(market)
+    try:
+        if date_cutoff:
+            return jsonify(_build_historical_query(conn, market, date_cutoff, search, exchange, asset_type,
+                                                    sort, sort_dir, page, per_page, request.args))
         else:
-            data["speed"] = 0
-            data["speed_str"] = "—"
-            data["eta"] = 0
-            data["eta_str"] = "—"
-
-    return jsonify(data)
+            return jsonify(_build_stats_query(conn, market, search, exchange, asset_type,
+                                               sort, sort_dir, page, per_page, request.args))
+    finally:
+        conn.close()
 
 
-@app.route("/api/download-assets", methods=["POST"])
-def trigger_download_assets():
-    """Trigger asset list download from Alpaca (fast, no bars)."""
-    def _bg():
-        _update_progress(phase="assets", message="Fetching all tradable assets...")
-        assets = download_all_assets()
-        count = store_assets(assets)
-        _update_progress(
-            status="complete",
-            phase="done",
-            assets_fetched=count,
-            message=f"Loaded {count:,} assets into database"
-        )
-
-    thread = threading.Thread(target=_bg, daemon=True)
-    thread.start()
-    return jsonify({"status": "started"})
+@api_bp.route("/screener/columns")
+def api_screener_columns():
+    return jsonify({"columns": SCREENER_COLUMN_REFERENCE})
 
 
-@app.route("/api/reset-data", methods=["POST"])
-def reset_all_data():
-    """Reset all data and trigger fresh download."""
-    global downloading_history, download_progress
+def _leveraged_etf_sql(name_col="s.name", asset_col="s.asset_class"):
+    """Multi-signal leveraged ETF detection: name patterns + asset class = etf.
 
-    with download_lock:
-        if downloading_history:
-            return jsonify({"status": "already_running", "message": "Download already in progress"})
-
-    def _bg():
-        global downloading_history
-        downloading_history = True
-        try:
-            conn = get_db()
-            # Clear all data tables
-            conn.execute("DELETE FROM bars")
-            conn.execute("DELETE FROM stats")
-            conn.execute("DELETE FROM corporate_events")
-            conn.execute("DELETE FROM ai_analysis")
-            conn.commit()
-            conn.close()
-            print("All data cleared. Starting fresh download...")
-
-            # Trigger fresh download
-            result = download_all_history()
-            print(f"Reset download result: {result}")
-        except Exception as e:
-            print(f"Reset error: {e}")
-            _update_progress(status="error", message=f"Reset failed: {e}")
-        finally:
-            downloading_history = False
-
-    thread = threading.Thread(target=_bg, daemon=True)
-    thread.start()
-    return jsonify({"status": "running", "message": "Resetting all data and starting fresh download..."})
+    Broad detection covering: leverage ratios (2x/3x/4x/5x), ProShares families
+    (UltraPro/Ultra/Short), Direxion Daily, and keywords (Leveraged/Inverse/Bear/Short).
+    """
+    name_patterns = (
+        f"({name_col} LIKE '%2x%'"
+        f" OR {name_col} LIKE '%3x%'"
+        f" OR {name_col} LIKE '%4x%'"
+        f" OR {name_col} LIKE '%5x%'"
+        f" OR {name_col} LIKE '%2X%'"
+        f" OR {name_col} LIKE '%3X%'"
+        f" OR {name_col} LIKE '%4X%'"
+        f" OR {name_col} LIKE '%5X%'"
+        f" OR {name_col} LIKE '%UltraPro%'"
+        f" OR {name_col} LIKE '%Ultra Bull%'"
+        f" OR {name_col} LIKE '%Ultra Bear%'"
+        f" OR {name_col} LIKE '%Ultra Short%'"
+        f" OR {name_col} LIKE '%Ultra VIX%'"
+        f" OR {name_col} LIKE '%ProShares Ultra%'"
+        f" OR {name_col} LIKE '%ProShares Short%'"
+        f" OR {name_col} LIKE '%Direxion Daily%'"
+        f" OR {name_col} LIKE '%Leveraged%'"
+        f" OR {name_col} LIKE '%Inverse%'"
+        f" OR {name_col} LIKE '%Bear%'"
+        f" OR {name_col} LIKE '%Short%')"
+    )
+    return f"({name_patterns} AND {asset_col} = 'etf')"
 
 
-@app.route("/api/assets")
-def list_assets():
-    """Get list of all assets from DB (offline, no API calls)."""
-    conn = get_db()
-    search = request.args.get("search", "").strip()
-    limit = int(request.args.get("limit", 100))
+def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_type,
+                             sort, sort_dir, page, per_page, args):
+    where = ["h.date = ?"]
+    params = [date_cutoff]
 
-    query = "SELECT symbol, name, asset_class, exchange, status, tradable FROM assets WHERE 1=1"
+    if search:
+        where.append("(h.symbol LIKE ? OR a.name LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if exchange:
+        where.append("a.exchange = ?")
+        params.append(exchange)
+    if asset_type:
+        where.append("a.asset_class = ?")
+        params.append(asset_type)
+
+    min_price = args.get("min_price")
+    max_price = args.get("max_price")
+    if min_price:
+        where.append("h.price >= ?")
+        params.append(float(min_price))
+    if max_price:
+        where.append("h.price <= ?")
+        params.append(float(max_price))
+
+    min_volume = args.get("min_volume")
+    if min_volume:
+        where.append("h.volume >= ?")
+        params.append(int(min_volume))
+
+    min_change = args.get("min_change")
+    max_change = args.get("max_change")
+    if min_change:
+        where.append("h.change_pct >= ?")
+        params.append(float(min_change))
+    if max_change:
+        where.append("h.change_pct <= ?")
+        params.append(float(max_change))
+
+    min_wa = args.get("min_wa")
+    max_wa = args.get("max_wa")
+    if min_wa:
+        where.append("h.weighted_alpha >= ?")
+        params.append(float(min_wa))
+    if max_wa:
+        where.append("h.weighted_alpha <= ?")
+        params.append(float(max_wa))
+
+    min_streak = args.get("min_streak")
+    if min_streak:
+        where.append("h.streak >= ?")
+        params.append(int(min_streak))
+
+    atr_status = args.get("atr_status")
+    if atr_status:
+        if atr_status == "above":
+            where.append("h.atr_signal = 1")
+        elif atr_status == "below":
+            where.append("h.atr_signal = -1")
+        elif atr_status == "crossed-above":
+            where.append("h.atr_crossed_above = 1")
+        elif atr_status == "crossed-below":
+            where.append("h.atr_crossed_below = 1")
+
+    atr_status_w = args.get("atr_status_w")
+    if atr_status_w:
+        if atr_status_w == "above":
+            where.append("h.atr_signal_w = 1")
+        elif atr_status_w == "below":
+            where.append("h.atr_signal_w = -1")
+        elif atr_status_w == "crossed-above":
+            where.append("h.atr_crossed_above_w = 1")
+        elif atr_status_w == "crossed-below":
+            where.append("h.atr_crossed_below_w = 1")
+
+    atr_status_m = args.get("atr_status_m")
+    if atr_status_m:
+        if atr_status_m == "above":
+            where.append("h.atr_signal_m = 1")
+        elif atr_status_m == "below":
+            where.append("h.atr_signal_m = -1")
+        elif atr_status_m == "crossed-above":
+            where.append("h.atr_crossed_above_m = 1")
+        elif atr_status_m == "crossed-below":
+            where.append("h.atr_crossed_below_m = 1")
+
+    accel_status = args.get("accel_status")
+    if accel_status:
+        if accel_status == "up":
+            where.append("h.accel_signal = 1")
+        elif accel_status == "down":
+            where.append("h.accel_signal = -1")
+        elif accel_status == "crossed-up":
+            where.append("h.accel_crossed_up = 1")
+        elif accel_status == "crossed-down":
+            where.append("h.accel_crossed_down = 1")
+
+    fractionable = args.get("fractionable")
+    if fractionable:
+        where.append("a.fractionable = ?")
+        params.append(1 if fractionable == "yes" else 0)
+
+    profit_status = args.get("profit_status")
+    if profit_status and not date_cutoff:
+        where.append("s.profit_status = ?")
+        params.append(profit_status)
+
+    leveraged = args.get("leveraged")
+    if leveraged == "yes":
+        where.append(_leveraged_etf_sql(name_col="a.name", asset_col="a.asset_class"))
+
+    nifty500 = args.get("nifty500")
+    if nifty500 == "yes" and market == "INDIA":
+        where.append("h.symbol IN (SELECT symbol FROM nifty500_constituents WHERE ? >= from_date AND ? <= to_date)")
+        params.extend([date_cutoff, date_cutoff])
+
+    index_filter = args.get("index")
+    if index_filter:
+        india_map = {"nifty500": "nifty500_constituents", "nifty50": "nifty50_constituents", "fo": "fo_constituents"}
+        us_map = {"sp500": "sp500_constituents", "nasdaq100": "nasdaq100_constituents", "russell2000": "russell2000_constituents", "dow30": "dow30_constituents"}
+        table_map = india_map if market == "INDIA" else us_map
+        tbl = table_map.get(index_filter)
+        if tbl:
+            where.append(f"h.symbol IN (SELECT symbol FROM {tbl} WHERE ? >= from_date AND ? <= to_date)")
+            params.extend([date_cutoff, date_cutoff])
+
+    min_st_bars_below = args.get("min_st_bars_below")
+    if min_st_bars_below:
+        where.append("h.st_bars_below >= ?")
+        params.append(int(min_st_bars_below))
+    min_st_bars_above = args.get("min_st_bars_above")
+    if min_st_bars_above:
+        where.append("h.st_bars_above >= ?")
+        params.append(int(min_st_bars_above))
+    min_accel_bars_below = args.get("min_accel_bars_below")
+    if min_accel_bars_below:
+        where.append("h.accel_bars_below >= ?")
+        params.append(int(min_accel_bars_below))
+    min_accel_bars_above = args.get("min_accel_bars_above")
+    if min_accel_bars_above:
+        where.append("h.accel_bars_above >= ?")
+        params.append(int(min_accel_bars_above))
+
+    where_str = " AND ".join(where)
+
+    base_from = (f"FROM historical_screener h "
+                 f"JOIN assets a ON h.symbol = a.symbol "
+                 f"LEFT JOIN stats s ON h.symbol = s.symbol "
+                 f"WHERE {where_str}")
+    # COUNT never needs the stats LEFT JOIN (profit_status is not filterable in date
+    # mode, and a LEFT JOIN on the unique stats.symbol key cannot change the count).
+    if "s." in where_str:
+        count_from = base_from
+    else:
+        count_from = (f"FROM historical_screener h "
+                      f"JOIN assets a ON h.symbol = a.symbol "
+                      f"WHERE {where_str}")
+
+    direction = "DESC" if sort_dir == "desc" else "ASC"
+    h_col_map = {"symbol": "h.symbol", "name": "a.name", "price": "h.price",
+                 "change_pct": "h.change_pct", "weighted_alpha": "h.weighted_alpha",
+                 "volume": "h.volume", "streak": "h.streak",
+                 "atr_signal": "h.atr_signal", "atr_stop": "h.atr_stop",
+                 "atr_value": "h.atr_value", "atr_streak": "h.atr_streak",
+                 "atrp": "h.atrp", "atr_crossed_above": "h.atr_crossed_above",
+                 "atr_crossed_below": "h.atr_crossed_below",
+                   "prob_up_1d": "h.prob_up_1d", "prob_up_5d": "h.prob_up_5d", "prob_up_st_cross": "h.prob_up_st_cross",
+                  "prob_up_1w": "h.prob_up_1w", "prob_up_1m": "h.prob_up_1m",
+                 "next_day_return": "h.next_day_return", "next_5d_return": "h.next_5d_return",
+                 "confluence": "h.confluence",
+                 "accel_a": "h.accel_a", "accel_base": "h.accel_base",
+                 "accel_signal": "h.accel_signal", "accel_streak": "h.accel_streak",
+                 "accel_crossed_up": "h.accel_crossed_up", "accel_crossed_down": "h.accel_crossed_down",
+                 "ai_overall_score": "h.ai_overall_score", "ai_matrix": "h.ai_matrix",
+                 "ai_bias": "h.ai_bias", "ai_conclusion": "h.ai_conclusion",
+                 "exchange": "a.exchange", "asset_class": "a.asset_class",
+                 "marginable": "a.marginable", "fractionable": "a.fractionable",
+                  "st_bars_below": "h.st_bars_below", "st_bars_above": "h.st_bars_above",
+                  "accel_bars_below": "h.accel_bars_below", "accel_bars_above": "h.accel_bars_above",
+                  "atr_signal_w": "h.atr_signal_w", "atr_stop_w": "h.atr_stop_w",
+                   "atr_crossed_above_w": "h.atr_crossed_above_w", "atr_crossed_below_w": "h.atr_crossed_below_w",
+                   "atr_streak_w": "h.atr_streak_w",
+                   "atr_signal_m": "h.atr_signal_m", "atr_stop_m": "h.atr_stop_m",
+                   "atr_crossed_above_m": "h.atr_crossed_above_m", "atr_crossed_below_m": "h.atr_crossed_below_m",
+                   "atr_streak_m": "h.atr_streak_m"}
+    sort_col = h_col_map.get(sort)
+    if sort_col is None:
+        sort_col = "h.weighted_alpha"
+    # "<col> <dir> NULLS LAST" is row-identical to the old CASE-WHEN-NULL wrapper but
+    # lets SQLite serve indexed sorts without a temp B-tree (verified on real DBs).
+    order_clause = f"{sort_col} {direction} NULLS LAST"
+
+    total = conn.execute(f"SELECT COUNT(*) {count_from}", params).fetchone()[0]
+    offset = (page - 1) * per_page
+    rows = conn.execute(
+        f"SELECT h.symbol, h.price, h.volume, NULL as open, NULL as high, NULL as low, "
+        f"h.change_pct, h.weighted_alpha, h.atrp, h.streak, h.atr_value, h.atr_stop, h.atr_signal, "
+        f"h.atr_crossed_above, h.atr_crossed_below, h.atr_streak, h.atr_multiplier, "
+        f"h.prob_up_1d, h.prob_up_5d, h.prob_up_st_cross, h.next_day_return, h.next_5d_return, h.confluence, "
+        f"h.prob_up_1w, h.prob_up_1m, "
+         f"h.accel_a, h.accel_base, h.accel_signal, h.accel_crossed_up, h.accel_crossed_down, "
+         f"h.st_bars_below, h.st_bars_above, h.accel_bars_below, h.accel_bars_above, "
+         f"h.atr_signal_w, h.atr_stop_w, h.atr_crossed_above_w, h.atr_crossed_below_w, h.atr_streak_w, "
+         f"h.atr_signal_m, h.atr_stop_m, h.atr_crossed_above_m, h.atr_crossed_below_m, h.atr_streak_m, "
+         f"s.profit_status, a.fractionable, a.marginable, NULL as pre_price, NULL as pre_change_pct, "
+        f"NULL as post_price, NULL as post_change_pct, h.date as last_updated, "
+        f"h.ai_overall_score, h.ai_bias, h.ai_tech_score, h.ai_momentum_score, "
+        f"h.ai_volume_score, h.ai_events_score, h.ai_volume_profile_score, "
+        f"h.ai_trendline_score, h.ai_sentiment_score, h.ai_conclusion, h.ai_matrix, "
+        f"a.name, a.exchange, a.asset_class "
+        f"{base_from} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+        params + [per_page, offset]
+    ).fetchall()
+
+    data = [dict(r) for r in rows]
+    for d in data:
+        d.setdefault("ai_overall_score", 0)
+        d.setdefault("ai_bias", "neutral")
+        d.setdefault("ai_tech_score", 0)
+        d.setdefault("ai_volume_profile_score", 0)
+        d.setdefault("ai_trendline_score", 0)
+        d.setdefault("ai_sentiment_score", 0)
+        d.setdefault("ai_conclusion", "HOLD")
+        d.setdefault("ai_matrix", "")
+        d.setdefault("name", "")
+        d.setdefault("exchange", "")
+        d.setdefault("asset_class", "")
+
+    return {
+        "data": data, "total": total, "page": page, "per_page": per_page,
+        "total_pages": (total + per_page - 1) // per_page, "historical": True, "date": date_cutoff
+    }
+
+
+def _build_stats_query(conn, market, search, exchange, asset_type,
+                        sort, sort_dir, page, per_page, args):
+
+    where = ["1=1"]
     params = []
 
     if search:
-        query += " AND (UPPER(symbol) LIKE ? OR UPPER(name) LIKE ?)"
-        params.extend([f"%{search.upper()}%", f"%{search.upper()}%"])
+        where.append("(s.symbol LIKE ? OR s.name LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    if exchange:
+        where.append("exchange = ?")
+        params.append(exchange)
+    if asset_type:
+        where.append("asset_class = ?")
+        params.append(asset_type)
 
-    query += f" ORDER BY symbol LIMIT {limit}"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    min_wa = args.get("min_wa")
+    max_wa = args.get("max_wa")
+    if min_wa:
+        where.append("weighted_alpha >= ?")
+        params.append(float(min_wa))
+    if max_wa:
+        where.append("weighted_alpha <= ?")
+        params.append(float(max_wa))
 
-    return jsonify({
-        "assets": [dict(r) for r in rows],
-        "count": len(rows),
-    })
+    min_price = args.get("min_price")
+    max_price = args.get("max_price")
+    if min_price:
+        where.append("price >= ?")
+        params.append(float(min_price))
+    if max_price:
+        where.append("price <= ?")
+        params.append(float(max_price))
 
+    min_change = args.get("min_change")
+    max_change = args.get("max_change")
+    if min_change:
+        where.append("change_pct >= ?")
+        params.append(float(min_change))
+    if max_change:
+        where.append("change_pct <= ?")
+        params.append(float(max_change))
 
-@app.route("/api/exchanges")
-def list_exchanges():
-    """Get distinct exchanges for filter dropdown."""
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT DISTINCT exchange FROM stats
-        WHERE exchange IS NOT NULL AND exchange != ''
-        ORDER BY exchange
-    """).fetchall()
-    conn.close()
-    return jsonify({"exchanges": [r["exchange"] for r in rows]})
+    min_streak = args.get("min_streak")
+    if min_streak:
+        where.append("streak >= ?")
+        params.append(int(min_streak))
 
+    min_volume = args.get("min_volume")
+    if min_volume:
+        where.append("volume >= ?")
+        params.append(int(min_volume))
 
-@app.route("/api/update-pre-post", methods=["POST"])
-def update_pre_post():
-    """Update pre/post market prices from latest Alpaca snapshots."""
-    global refreshing
-    with refresh_lock:
-        if refreshing:
-            return jsonify({"status": "already_running"})
+    atr_status = args.get("atr_status")
+    if atr_status:
+        if atr_status == "above":
+            where.append("atr_signal = 1")
+        elif atr_status == "below":
+            where.append("atr_signal = -1")
+        elif atr_status == "crossed-above":
+            where.append("atr_crossed_above = 1")
+        elif atr_status == "crossed-below":
+            where.append("atr_crossed_below = 1")
 
-    def _bg():
-        global refreshing
-        refreshing = True
-        with download_lock:
-            download_progress["progress_type"] = "prepost"
-            download_progress["status"] = "running"
-            download_progress["phase"] = "Fetching snapshots..."
-            download_progress["start_time"] = time.time()
-            download_progress["symbols_total"] = 0
-            download_progress["symbols_done"] = 0
-            download_progress["bars_found"] = 0
-            download_progress["current_symbol"] = "Starting..."
-        try:
-            conn = get_db()
-            symbols = [r['symbol'] for r in conn.execute(
-                "SELECT symbol FROM stats WHERE price > 0"
-            ).fetchall()]
-            conn.close()
+    atr_status_w = args.get("atr_status_w")
+    if atr_status_w:
+        if atr_status_w == "above":
+            where.append("atr_signal_w = 1")
+        elif atr_status_w == "below":
+            where.append("atr_signal_w = -1")
+        elif atr_status_w == "crossed-above":
+            where.append("atr_crossed_above_w = 1")
+        elif atr_status_w == "crossed-below":
+            where.append("atr_crossed_below_w = 1")
 
-            if not symbols:
-                with download_lock:
-                    download_progress["status"] = "error"
-                    download_progress["message"] = "No data found"
-                return jsonify({"status": "no_data"})
+    atr_status_m = args.get("atr_status_m")
+    if atr_status_m:
+        if atr_status_m == "above":
+            where.append("atr_signal_m = 1")
+        elif atr_status_m == "below":
+            where.append("atr_signal_m = -1")
+        elif atr_status_m == "crossed-above":
+            where.append("atr_crossed_above_m = 1")
+        elif atr_status_m == "crossed-below":
+            where.append("atr_crossed_below_m = 1")
 
-            with download_lock:
-                download_progress["symbols_total"] = len(symbols)
+    accel_status = args.get("accel_status")
+    if accel_status:
+        if accel_status == "up":
+            where.append("accel_signal = 1")
+        elif accel_status == "down":
+            where.append("accel_signal = -1")
+        elif accel_status == "crossed-up":
+            where.append("accel_crossed_up = 1")
+        elif accel_status == "crossed-down":
+            where.append("accel_crossed_down = 1")
 
-            updated = 0
-            batch_size = 10
-            for i in range(0, len(symbols), batch_size):
-                batch = symbols[i:i + batch_size]
-                symbols_param = ",".join(batch)
-                params = {"symbols": symbols_param}
-                resp = alpaca_get("/v2/stocks/snapshots", base=DATA_URL, params=params)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and "snapshots" in data and isinstance(data["snapshots"], dict):
-                        data = data["snapshots"]
-                    conn = get_db()
-                    for sym, snap in data.items():
-                        if not snap:
-                            continue
-                        latest_trade = snap.get('latestTrade', {})
-                        daily_bar = snap.get('dailyBar', {})
-                        prev_bar = snap.get('prevDailyBar', {})
+    fractionable = args.get("fractionable")
+    if fractionable:
+        where.append("fractionable = ?")
+        params.append(1 if fractionable == "yes" else 0)
 
-                        trade_price = latest_trade.get('p', 0)
-                        trade_ts = latest_trade.get('t', '')
-                        prev_close = prev_bar.get('c', 0) or daily_bar.get('o', 0)
+    profit_status = args.get("profit_status")
+    if profit_status:
+        where.append("profit_status = ?")
+        params.append(profit_status)
 
-                        pre_price = None
-                        pre_change_pct = None
-                        post_price = None
-                        post_change_pct = None
+    leveraged = args.get("leveraged")
+    if leveraged == "yes":
+        where.append(_leveraged_etf_sql(name_col="s.name", asset_col="s.asset_class"))
 
-                        if trade_price > 0 and prev_close > 0:
-                            # Determine if pre or post market based on timestamp
-                            if trade_ts:
-                                try:
-                                    from datetime import datetime
-                                    dt = datetime.fromisoformat(trade_ts.replace('Z', '+00:00'))
-                                    hour = dt.hour
-                                    # Pre-market: before 9:30 AM (before 13:30 UTC)
-                                    # Post-market: after 4:00 PM (after 20:00 UTC)
-                                    if hour < 13:
-                                        pre_price = trade_price
-                                        pre_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                    elif hour >= 20:
-                                        post_price = trade_price
-                                        post_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                    else:
-                                        # Regular hours - update both as current
-                                        pre_price = trade_price
-                                        pre_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                        post_price = trade_price
-                                        post_change_pct = round(((trade_price - prev_close) / prev_close) * 100, 2)
-                                except:
-                                    pass
+    nifty500 = args.get("nifty500")
+    if nifty500 == "yes" and market == "INDIA":
+        where.append("s.symbol IN (SELECT symbol FROM nifty500_constituents WHERE to_date = '9999-12-31')")
 
-                            conn.execute("""
-                                UPDATE stats SET
-                                    pre_price = ?, pre_change_pct = ?,
-                                    post_price = ?, post_change_pct = ?,
-                                    last_updated = ?
-                                WHERE symbol = ?
-                            """, (pre_price, pre_change_pct, post_price, post_change_pct,
-                                  datetime.now().isoformat(), sym))
-                            updated += 1
-                    conn.commit()
-                    conn.close()
+    index_filter = args.get("index")
+    if index_filter:
+        india_map = {"nifty500": "nifty500_constituents", "nifty50": "nifty50_constituents", "fo": "fo_constituents"}
+        us_map = {"sp500": "sp500_constituents", "nasdaq100": "nasdaq100_constituents", "russell2000": "russell2000_constituents", "dow30": "dow30_constituents"}
+        table_map = india_map if market == "INDIA" else us_map
+        tbl = table_map.get(index_filter)
+        if tbl:
+            where.append(f"s.symbol IN (SELECT symbol FROM {tbl} WHERE to_date = '9999-12-31')")
 
-                with download_lock:
-                    download_progress["symbols_done"] = min(i + batch_size, len(symbols))
-                    download_progress["current_symbol"] = f"Batch {i//batch_size + 1}"
+    min_st_bars_below = args.get("min_st_bars_below")
+    if min_st_bars_below:
+        where.append("s.st_bars_below >= ?")
+        params.append(int(min_st_bars_below))
+    min_st_bars_above = args.get("min_st_bars_above")
+    if min_st_bars_above:
+        where.append("s.st_bars_above >= ?")
+        params.append(int(min_st_bars_above))
+    min_accel_bars_below = args.get("min_accel_bars_below")
+    if min_accel_bars_below:
+        where.append("s.accel_bars_below >= ?")
+        params.append(int(min_accel_bars_below))
+    min_accel_bars_above = args.get("min_accel_bars_above")
+    if min_accel_bars_above:
+        where.append("s.accel_bars_above >= ?")
+        params.append(int(min_accel_bars_above))
 
-            with download_lock:
-                download_progress["status"] = "complete"
-                download_progress["phase"] = "Complete"
-                download_progress["symbols_done"] = len(symbols)
-                download_progress["message"] = f"Pre/post update complete: {updated} symbols updated"
+    where_str = " AND ".join(where)
 
-            print(f"Pre/post market update complete: {updated} symbols updated")
-        except Exception as e:
-            print(f"Pre/post update error: {e}")
-            import traceback
-            traceback.print_exc()
-            with download_lock:
-                download_progress["status"] = "error"
-                download_progress["message"] = f"Pre/post update failed: {str(e)}"
-        finally:
-            with refresh_lock:
-                refreshing = False
-
-    thread = threading.Thread(target=_bg, daemon=True)
-    thread.start()
-    return jsonify({"status": "started", "message": "Updating pre/post market prices..."})
-
-
-@app.route("/api/refresh", methods=["POST"])
-def trigger_refresh():
-    """Trigger a full data refresh."""
-    global refreshing
-    with refresh_lock:
-        if refreshing:
-            return jsonify({"status": "already_running"})
-
-    # Reset progress for refresh
-    with download_lock:
-        download_progress["status"] = "idle"
-        download_progress["progress_type"] = "refresh"
-        download_progress["phase"] = ""
-        download_progress["symbols_total"] = 0
-        download_progress["symbols_done"] = 0
-        download_progress["bars_found"] = 0
-        download_progress["current_symbol"] = ""
-        download_progress["message"] = ""
-
-    thread = threading.Thread(target=full_refresh, daemon=True)
-    thread.start()
-    return jsonify({"status": "started", "message": "Refresh started..."})
-
-
-@app.route("/api/stats")
-def stats_summary():
-    """Summary stats."""
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) as cnt FROM stats WHERE price > 0").fetchone()["cnt"]
-    avg_wa = conn.execute("SELECT AVG(weighted_alpha) as avg_wa FROM stats WHERE price > 0").fetchone()["avg_wa"]
-    avg_change = conn.execute("SELECT AVG(change_pct) as avg_chg FROM stats WHERE price > 0").fetchone()["avg_chg"]
-    assets_total = conn.execute("SELECT COUNT(*) as cnt FROM assets").fetchone()["cnt"]
-    oldest_min = conn.execute("SELECT MIN(oldest_data) FROM stats").fetchone()[0]
-    oldest_max = conn.execute("SELECT MAX(oldest_data) FROM stats").fetchone()[0]
-    conn.close()
-
-    return jsonify({
-        "total_stocks": total,
-        "total_assets": assets_total,
-        "avg_weighted_alpha": round(avg_wa or 0, 1),
-        "avg_change_pct": round(avg_change or 0, 2),
-        "oldest_data_min": oldest_min,
-        "oldest_data_max": oldest_max
-    })
-
-
-# ── Portfolio / Watchlist API ────────────────────────────────────────
-
-@app.route("/portfolio")
-def portfolio_page():
-    resp = make_response(render_template("portfolio.html"))
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    return resp
-
-
-@app.route("/api/portfolios", methods=["GET"])
-def list_portfolios():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM portfolios ORDER BY created_at DESC").fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route("/api/portfolios", methods=["POST"])
-def create_portfolio():
-    name = (request.json or {}).get("name", "").strip()
-    if not name:
-        return jsonify({"error": "Name required"}), 400
-    conn = get_db()
-    c = conn.execute("INSERT INTO portfolios (name) VALUES (?)", (name,))
-    conn.commit()
-    pid = c.lastrowid
-    row = conn.execute("SELECT * FROM portfolios WHERE id = ?", (pid,)).fetchone()
-    conn.close()
-    return jsonify(dict(row)), 201
-
-
-@app.route("/api/portfolios/<int:pid>", methods=["DELETE"])
-def delete_portfolio(pid):
-    conn = get_db()
-    conn.execute("DELETE FROM portfolio_symbols WHERE portfolio_id = ?", (pid,))
-    conn.execute("DELETE FROM portfolios WHERE id = ?", (pid,))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/portfolios/<int:pid>", methods=["GET"])
-def get_portfolio(pid):
-    conn = get_db()
-    pf = conn.execute("SELECT * FROM portfolios WHERE id = ?", (pid,)).fetchone()
-    if not pf:
-        conn.close()
-        return jsonify({"error": "Not found"}), 404
-    symbols = conn.execute(
-        "SELECT symbol, qty, avg_price, created_at FROM portfolio_symbols WHERE portfolio_id = ? ORDER BY created_at",
-        (pid,)
-    ).fetchall()
-    symbol_list = [dict(r) for r in symbols]
-    stats = {}
-    sym_names = [s["symbol"] for s in symbol_list]
-    if sym_names:
-        placeholders = ",".join(["?" for _ in sym_names])
-        rows = conn.execute(f"SELECT symbol, price, change_pct, weighted_alpha, volume, pre_price, post_price, name, exchange, atr_signal, atr_stop, atrp, streak, oldest_data, profit_status FROM stats WHERE symbol IN ({placeholders})", sym_names).fetchall()
-        for r in rows:
-            stats[r["symbol"]] = dict(r)
-    conn.close()
-    return jsonify({"portfolio": dict(pf), "symbols": symbol_list, "stats": stats})
-
-
-@app.route("/api/portfolios/<int:pid>/symbols", methods=["POST"])
-def add_portfolio_symbols(pid):
-    data = request.json or {}
-    symbols_raw = data.get("symbols", "")
-    entries = data.get("entries", [])  # [{"symbol":"AAPL","qty":10,"avg_price":150}, ...]
-    if not symbols_raw and not entries:
-        return jsonify({"error": "Symbols required"}), 400
-
-    conn = get_db()
-    pf = conn.execute("SELECT * FROM portfolios WHERE id = ?", (pid,)).fetchone()
-    if not pf:
-        conn.close()
-        return jsonify({"error": "Portfolio not found"}), 404
-
-    added = []
-
-    if entries:
-        for e in entries:
-            sym = e.get("symbol", "").strip().upper()
-            qty = float(e.get("qty", 0))
-            avg_price = e.get("avg_price")
-            if avg_price is not None:
-                avg_price = float(avg_price)
-            if not sym:
-                continue
-            try:
-                conn.execute("INSERT OR IGNORE INTO portfolio_symbols (portfolio_id, symbol, qty, avg_price) VALUES (?, ?, ?, ?)",
-                             (pid, sym, qty, avg_price))
-                added.append({"symbol": sym, "qty": qty, "avg_price": avg_price})
-            except Exception:
-                pass
+    # Filters only reference stats columns, so COUNT can skip the ai_analysis join
+    # (LEFT JOIN on the unique ai_analysis.symbol key never changes the row count).
+    if "a." in where_str:
+        total = conn.execute(f"SELECT COUNT(*) FROM stats s LEFT JOIN ai_analysis a ON s.symbol=a.symbol WHERE {where_str}", params).fetchone()[0]
     else:
-        parsed = [s.strip().upper() for s in symbols_raw.replace(",", " ").split() if s.strip()]
-        for sym in parsed:
+        total = conn.execute(f"SELECT COUNT(*) FROM stats s WHERE {where_str}", params).fetchone()[0]
+
+    allowed_sorts = {
+        "symbol", "name", "price", "change_pct", "weighted_alpha", "volume", "streak",
+        "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
+        "atr_crossed_above", "atr_crossed_below",
+        "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
+        "next_day_return", "pre_price", "pre_change_pct", "post_price", "post_change_pct",
+        "profit_status", "fractionable", "marginable", "asset_class", "exchange", "confluence",
+        "accel_a", "accel_base", "accel_signal", "accel_streak", "accel_crossed_up", "accel_crossed_down",
+        "ai_overall_score", "ai_bias", "ai_tech_score", "ai_volume_profile_score",
+        "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
+        "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
+        "atr_signal_w", "atr_stop_w", "atr_crossed_above_w", "atr_crossed_below_w", "atr_streak_w",
+        "atr_signal_m", "atr_stop_m", "atr_crossed_above_m", "atr_crossed_below_m", "atr_streak_m"
+    }
+    if sort not in allowed_sorts:
+        sort = "weighted_alpha"
+    direction = "DESC" if sort_dir == "desc" else "ASC"
+
+    ai_col_map = {
+        "ai_overall_score": "a.overall_score",
+        "ai_bias": "a.bias",
+        "ai_tech_score": "a.tech_score",
+        "ai_volume_profile_score": "a.volume_profile_score",
+        "ai_trendline_score": "a.trendline_score",
+        "ai_sentiment_score": "a.sentiment_score",
+        "ai_conclusion": "a.conclusion",
+        "ai_matrix": "a.ai_matrix",
+    }
+    sort_col = ai_col_map.get(sort) or f"s.{sort}"
+
+    # "<col> <dir> NULLS LAST" is row-identical to the old CASE-WHEN-NULL wrapper but
+    # lets SQLite use the stats indexes (idx_stats_wa etc.) instead of a temp B-tree.
+    order_clause = f"{sort_col} {direction} NULLS LAST"
+
+    offset = (page - 1) * per_page
+    rows = conn.execute(
+        f"SELECT s.symbol, s.name, s.price, s.volume, s.change_pct, "
+        f"s.atrp, s.weighted_alpha, s.atr_signal, s.atr_stop, s.atr_value, s.atr_streak, "
+        f"s.atr_crossed_above, s.atr_crossed_below, s.atr_multiplier, s.streak, "
+        f"s.next_day_return, s.prob_up_1d, s.prob_up_5d, s.prob_up_st_cross, s.prob_up_1w, s.prob_up_1m, "
+        f"s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct, "
+        f"s.profit_status, s.fractionable, s.marginable, s.asset_class, s.exchange, "
+        f"s.last_updated, s.oldest_data, s.accel_a, s.accel_base, s.accel_signal, "
+        f"s.accel_crossed_up, s.accel_crossed_down, s.accel_streak, s.confluence, "
+         f"s.st_bars_below, s.st_bars_above, s.accel_bars_below, s.accel_bars_above, "
+         f"s.atr_signal_w, s.atr_stop_w, s.atr_crossed_above_w, s.atr_crossed_below_w, s.atr_streak_w, "
+         f"s.atr_signal_m, s.atr_stop_m, s.atr_crossed_above_m, s.atr_crossed_below_m, s.atr_streak_m, "
+         f"a.overall_score as ai_overall_score, a.bias as ai_bias, "
+        f"a.tech_score as ai_tech_score, a.momentum_score as ai_momentum_score, "
+        f"a.volume_score as ai_volume_score, a.events_score as ai_events_score, "
+        f"a.volume_profile_score as ai_volume_profile_score, "
+        f"a.trendline_score as ai_trendline_score, a.sentiment_score as ai_sentiment_score, "
+        f"a.conclusion as ai_conclusion, a.ai_matrix "
+        f"FROM stats s LEFT JOIN ai_analysis a ON s.symbol=a.symbol "
+        f"WHERE {where_str} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+        params + [per_page, offset]
+    ).fetchall()
+
+    data = [dict(r) for r in rows]
+    for d in data:
+        d.setdefault("ai_overall_score", 0)
+        d.setdefault("ai_bias", "neutral")
+        d.setdefault("ai_tech_score", 0)
+        d.setdefault("ai_volume_profile_score", 0)
+        d.setdefault("ai_trendline_score", 0)
+        d.setdefault("ai_sentiment_score", 0)
+        d.setdefault("ai_conclusion", "HOLD")
+        d.setdefault("ai_matrix", "")
+    return {
+        "data": data, "total": total, "page": page, "per_page": per_page,
+        "total_pages": (total + per_page - 1) // per_page, "historical": False
+    }
+
+
+@api_bp.route("/stats")
+def api_stats():
+    market = request.args.get("market", "US")
+    symbol = request.args.get("symbol")
+    conn = get_db(market)
+    try:
+        if symbol:
+            row = conn.execute("SELECT * FROM stats WHERE symbol=?", (symbol,)).fetchone()
+            return jsonify(dict(row) if row else {})
+        else:
+            rows = conn.execute("SELECT * FROM stats LIMIT 500").fetchall()
+            return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/market-breadth")
+def api_market_breadth():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        row = conn.execute("SELECT COUNT(*) as total FROM stats").fetchone()
+        total = row["total"] if row else 0
+        up = conn.execute("SELECT COUNT(*) as c FROM stats WHERE change_pct > 0").fetchone()["c"]
+        down = conn.execute("SELECT COUNT(*) as c FROM stats WHERE change_pct < 0").fetchone()["c"]
+        unchanged = total - up - down
+        return jsonify({
+            "total": total, "advancers": up, "decliners": down, "unchanged": unchanged,
+            "pct_up": round(up / total * 100, 1) if total > 0 else 0
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/top-lists")
+def api_top_lists():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        gainers = [dict(r) for r in conn.execute(
+            "SELECT symbol, name, price, change_pct FROM stats ORDER BY change_pct DESC LIMIT 10"
+        ).fetchall()]
+        by_volume = [dict(r) for r in conn.execute(
+            "SELECT symbol, name, price, volume FROM stats ORDER BY volume DESC LIMIT 10"
+        ).fetchall()]
+        by_wa = [dict(r) for r in conn.execute(
+            "SELECT symbol, name, price, weighted_alpha FROM stats ORDER BY weighted_alpha DESC LIMIT 10"
+        ).fetchall()]
+        return jsonify({"gainers": gainers, "by_volume": by_volume, "by_weighted_alpha": by_wa})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/exchanges")
+def api_exchanges():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT DISTINCT exchange FROM stats WHERE exchange IS NOT NULL AND exchange != ''").fetchall()
+        return jsonify([r["exchange"] for r in rows])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/hs-dates")
+def api_hs_dates():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        # Recursive "loose index scan": one indexed MAX() seek per distinct date via
+        # idx_bars_tf_date instead of scanning the whole multi-million-row index
+        # (measured 410ms -> 38ms on US, 3.6s -> 26ms on India).
+        rows = conn.execute(
+            """
+            WITH RECURSIVE d(dt) AS (
+              SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day')
+              UNION ALL
+              SELECT (SELECT MAX(date) FROM bars WHERE timeframe='1Day' AND date < d.dt)
+              FROM d WHERE d.dt IS NOT NULL LIMIT 366
+            )
+            SELECT dt AS date FROM d WHERE dt IS NOT NULL LIMIT 365
+            """
+        ).fetchall()
+        return jsonify([r["date"] for r in rows])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/assets")
+def api_assets():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT * FROM assets ORDER BY symbol").fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/stock/<symbol>")
+def api_stock(symbol):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        stats = conn.execute("SELECT * FROM stats WHERE symbol=?", (symbol,)).fetchone()
+        analysis = conn.execute("SELECT * FROM ai_analysis WHERE symbol=?", (symbol,)).fetchone()
+        events = conn.execute(
+            "SELECT * FROM corporate_events WHERE symbol=? ORDER BY event_date DESC LIMIT 20", (symbol,)
+        ).fetchall()
+        return jsonify({
+            "stats": dict(stats) if stats else {},
+            "analysis": dict(analysis) if analysis else {},
+            "events": [dict(e) for e in events]
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/stock/<symbol>/retest-score")
+def api_stock_retest_score(symbol):
+    """Retest score removed. Returns null."""
+    return jsonify({"symbol": symbol, "old_swing_retest_score": None, "cached": False})
+
+
+@api_bp.route("/retest/model-status")
+def api_retest_model_status():
+    """Retest model removed."""
+    return jsonify({"status": "removed"})
+
+
+@api_bp.route("/retest/backtest")
+def api_retest_backtest():
+    """Retest removed."""
+    return jsonify({"error": "Retest removed"}), 404
+
+
+@api_bp.route("/retest/populate-historical", methods=["POST"])
+def api_retest_populate_historical():
+    """Retest removed."""
+    return jsonify({"status": "removed"})
+
+
+@api_bp.route("/stock/<symbol>/bars")
+def api_stock_bars(symbol):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1Day")
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (ValueError, TypeError):
+        limit = 200
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close, volume FROM bars WHERE symbol=? AND timeframe=? ORDER BY date DESC LIMIT ?",
+            (symbol, timeframe, limit)
+        ).fetchall()
+        data = [dict(r) for r in reversed(rows)]
+        return jsonify(data)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/stock/<symbol>/ohlc")
+def api_stock_ohlc(symbol):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1Day")
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (ValueError, TypeError):
+        limit = 200
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close, volume FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date DESC LIMIT ?",
+            (symbol, limit + 200)
+        ).fetchall()
+        data = [dict(r) for r in reversed(rows)]
+        if timeframe != "1Day" and data:
+            import pandas as pd
+            df = pd.DataFrame(data)
+            tf_map = {"1Week": "1W", "1Month": "1M", "1W": "1W", "1M": "1M"}
+            rule = tf_map.get(timeframe, timeframe)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            agg = df.resample(rule).agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum"
+            }).dropna(subset=["open"])
+            agg["date"] = agg.index.strftime("%Y-%m-%d")
+            data = agg.reset_index(drop=True)[["date", "open", "high", "low", "close", "volume"]].to_dict("records")
+        data = data[-limit:]
+        return jsonify(data)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/stock/<symbol>/supertrend")
+def api_stock_supertrend(symbol):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1Day")
+    try:
+        period = int(request.args.get("period", 14))
+        multiplier = float(request.args.get("multiplier", 1.0))
+    except (ValueError, TypeError):
+        period, multiplier = 14, 1.0
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+            (symbol,)
+        ).fetchall()
+        if not rows:
+            return jsonify({"daily": [], "weekly": [], "monthly": []})
+        import pandas as pd
+        from dumbmoney.indicators import atr_trailing_stop as compute_st
+        from dumbmoney.indicators import compute_rolling_atr_batch
+        df = pd.DataFrame([dict(r) for r in rows])
+
+        daily_dates = df["date"].tolist()
+
+        # Daily ATR Trailing Stop
+        st_daily = compute_st(df, period=period, multiplier=multiplier)
+        daily_result = []
+        for i, (_, row) in enumerate(st_daily.iterrows()):
+            daily_result.append({
+                "date": df.iloc[i]["date"] if i < len(df) else "",
+                "supertrend": round(float(row["supertrend"]), 4) if pd.notna(row["supertrend"]) else None,
+                "trend": int(row["trend"]),
+                "signal": int(row["signal"]),
+                "stop": round(float(row["stop"]), 4) if pd.notna(row["stop"]) else None,
+                "atr_value": round(float(row["atr_value"]), 4) if pd.notna(row["atr_value"]) else None,
+            })
+
+        # Anchored rolling weekly (5 sessions) - batch computation
+        weekly_result = []
+        if len(df) >= 7:
             try:
-                conn.execute("INSERT OR IGNORE INTO portfolio_symbols (portfolio_id, symbol) VALUES (?, ?)", (pid, sym))
-                added.append({"symbol": sym, "qty": 0, "avg_price": None})
+                dates_arr = df["date"].values
+                opens_arr = df["open"].astype(float).values
+                highs_arr = df["high"].astype(float).values
+                lows_arr = df["low"].astype(float).values
+                closes_arr = df["close"].astype(float).values
+                wt, ws, wv, wsk, wca, wcb, wbl, wab = compute_rolling_atr_batch(
+                    dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 5, period, multiplier
+                )
+                for i in range(len(dates_arr)):
+                    if wt[i] != 0 or ws[i] != 0:
+                        weekly_result.append({
+                            "date": dates_arr[i],
+                            "supertrend": round(float(ws[i]), 4) if ws[i] else None,
+                            "trend": int(wt[i]),
+                            "signal": int(wt[i]),
+                            "stop": round(float(ws[i]), 4) if ws[i] else None,
+                            "atr_value": round(float(wv[i]), 4) if wv[i] else None,
+                        })
             except Exception:
                 pass
 
-    conn.commit()
-    conn.close()
-    return jsonify({"added": added})
-
-
-@app.route("/api/portfolios/<int:pid>/symbols/<symbol>", methods=["DELETE"])
-def remove_portfolio_symbol(pid, symbol):
-    conn = get_db()
-    conn.execute("DELETE FROM portfolio_symbols WHERE portfolio_id = ? AND symbol = ?", (pid, symbol.upper()))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/portfolios/<int:pid>/symbols/<symbol>", methods=["PATCH"])
-def update_portfolio_symbol(pid, symbol):
-    data = request.json or {}
-    conn = get_db()
-    updates = []
-    params = []
-    if "qty" in data:
-        updates.append("qty = ?")
-        params.append(float(data["qty"]))
-    if "avg_price" in data:
-        updates.append("avg_price = ?")
-        params.append(float(data["avg_price"]) if data["avg_price"] is not None else None)
-    if updates:
-        params.append(symbol.upper())
-        params.append(pid)
-        conn.execute(f"UPDATE portfolio_symbols SET {', '.join(updates)} WHERE symbol = ? AND portfolio_id = ?", params)
-        conn.commit()
-    row = conn.execute("SELECT symbol, qty, avg_price, created_at FROM portfolio_symbols WHERE portfolio_id = ? AND symbol = ?",
-                       (pid, symbol.upper())).fetchone()
-    conn.close()
-    return jsonify(dict(row) if row else {"ok": True})
-
-
-# ── Options Chain ────────────────────────────────────────────────────
-
-@app.route("/api/options/<symbol>")
-def options_chain(symbol):
-    """Fetch options chain for a symbol from Alpaca."""
-    try:
-        params = {"underlying_symbols": symbol.upper(), "status": "active", "limit": 100}
-        headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
-        resp = requests.get("https://paper-api.alpaca.markets/v2/options/contracts", headers=headers, params=params, timeout=10)
-        if resp.status_code != 200:
-            return jsonify({"status": "unavailable", "message": f"Alpaca options API error: {resp.status_code}"})
-        data = resp.json()
-        contracts = data.get("option_contracts", [])
-        if not contracts:
-            return jsonify({"status": "unavailable", "message": "No options contracts found"})
-
-        # Get quotes
-        syms_str = ",".join([c["symbol"] for c in contracts[:100]])
-        quotes_resp = requests.get("https://paper-api.alpaca.markets/v2/options/quotes", headers=headers,
-                                   params={"symbols": syms_str, "feed": "indicative"}, timeout=10)
-        quotes = {}
-        if quotes_resp.status_code == 200:
-            for q in quotes_resp.json().get("quotes", []):
-                quotes[q["symbol"]] = q
-
-        chains = {}
-        for c in contracts:
-            q = quotes.get(c["symbol"], {})
-            exp = c["expiration_date"]
-            if exp not in chains:
-                chains[exp] = {"expiration": exp, "calls": [], "puts": []}
-            entry = {
-                "contract": c["symbol"],
-                "type": c["type"],
-                "strike": float(c["strike_price"]),
-                "bid": q.get("bid_price"),
-                "ask": q.get("ask_price"),
-                "last": q.get("last_price"),
-                "volume": q.get("volume"),
-                "open_interest": q.get("open_interest"),
-                "implied_vol": q.get("implied_volatility"),
-            }
-            chains[exp][c["type"] + "s"].append(entry)
-
-        # Sort each chain by strike
-        result = sorted(chains.values(), key=lambda x: x["expiration"])
-        for ch in result:
-            ch["calls"].sort(key=lambda x: x["strike"])
-            ch["puts"].sort(key=lambda x: x["strike"])
-
-        return jsonify({"status": "ok", "chains": result})
-    except Exception as e:
-        return jsonify({"status": "unavailable", "message": str(e)})
-
-
-# ── Entry Point ──────────────────────────────────────────────────────
-def _quick_start():
-    """Fast initial load, then background full asset download."""
-    print("Quick-start: initializing...")
-
-    # Ensure assets table has data
-    conn = get_db()
-    asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-    stats_count = conn.execute("SELECT COUNT(*) as cnt FROM stats WHERE price > 0").fetchone()["cnt"]
-    conn.close()
-
-    if asset_count == 0:
-        print("  Populating initial asset list...")
-        assets = _build_fallback_assets()
-        store_assets(assets)
-        # Also fetch from API in background
-        def _bg_assets():
+        # Anchored rolling monthly (22 sessions) - batch computation
+        monthly_result = []
+        if len(df) >= 24:
             try:
-                api_assets = download_all_assets()
-                if api_assets and len(api_assets) > len(assets):
-                    store_assets(api_assets)
-                    print(f"  Updated assets: {len(api_assets)} from API")
-            except Exception as e:
-                print(f"  Background asset fetch error: {e}")
-        threading.Thread(target=_bg_assets, daemon=True).start()
+                dates_arr = df["date"].values
+                opens_arr = df["open"].astype(float).values
+                highs_arr = df["high"].astype(float).values
+                lows_arr = df["low"].astype(float).values
+                closes_arr = df["close"].astype(float).values
+                mt, ms, mv, msk, mca, mcb, mbl, mab = compute_rolling_atr_batch(
+                    dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 22, period, multiplier
+                )
+                for i in range(len(dates_arr)):
+                    if mt[i] != 0 or ms[i] != 0:
+                        monthly_result.append({
+                            "date": dates_arr[i],
+                            "supertrend": round(float(ms[i]), 4) if ms[i] else None,
+                            "trend": int(mt[i]),
+                            "signal": int(mt[i]),
+                            "stop": round(float(ms[i]), 4) if ms[i] else None,
+                            "atr_value": round(float(mv[i]), 4) if mv[i] else None,
+                        })
+            except Exception:
+                pass
 
-    if stats_count == 0:
-        print("  Loading initial data from snapshots...")
-        # Get symbols we have assets for
-        conn = get_db()
-        symbols = [r['symbol'] for r in conn.execute("SELECT symbol FROM assets LIMIT 200").fetchall()]
+        return jsonify({"daily": daily_result, "weekly": weekly_result, "monthly": monthly_result})
+    finally:
         conn.close()
 
-        if symbols:
-            snapshots = download_snapshots(symbols)
-            tradable_symbols = [s for s in symbols if snapshots.get(s)]
-            assets_for_stats = []
-            conn = get_db()
-            for sym in tradable_symbols:
-                a = conn.execute("SELECT * FROM assets WHERE symbol = ?", (sym,)).fetchone()
-                if a:
-                    assets_for_stats.append(dict(a))
-            conn.close()
 
-            compute_and_store_stats(assets_for_stats, snapshots)
-            print(f"  Quick-start: {len(assets_for_stats)} symbols loaded")
+@api_bp.route("/stock/<symbol>/accel")
+def api_stock_accel(symbol):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1Day")
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+            (symbol,)
+        ).fetchall()
+        if not rows:
+            return jsonify([])
+        import pandas as pd
+        from dumbmoney.indicators import accel as compute_accel
+        df = pd.DataFrame([dict(r) for r in rows])
+        if timeframe != "1Day":
+            tf_map = {"1Week": "1W", "1Month": "1M", "1W": "1W", "1M": "1M"}
+            rule = tf_map.get(timeframe, timeframe)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            df = df.resample(rule).agg({
+                "open": "first", "high": "max", "low": "min", "close": "last"
+            }).dropna(subset=["open"])
+            df["date"] = df.index.strftime("%Y-%m-%d")
+            df = df.reset_index(drop=True)
+        acc = compute_accel(df)
+        result = []
+        for i, (_, row) in enumerate(acc.iterrows()):
+            result.append({
+                "date": df.iloc[i]["date"] if i < len(df) else "",
+                "accel_a": round(float(row["accel_a"]), 6) if pd.notna(row["accel_a"]) else None,
+                "accel_base": round(float(row["accel_base"]), 6) if pd.notna(row["accel_base"]) else None,
+                "signal": int(row["accel_signal"]),
+                "crossed_up": int(row["accel_crossed_up"]),
+                "crossed_down": int(row["accel_crossed_down"]),
+            })
+        return jsonify(result)
+    finally:
+        conn.close()
 
-    print("Starting background full download...")
 
-    def _bg_full():
-        try:
-            download_all_history()
-        except Exception as e:
-            print(f"Background download error: {e}")
+@api_bp.route("/stock/<symbol>/wa_history")
+def api_stock_wa_history(symbol):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1Day")
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (ValueError, TypeError):
+        limit = 200
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+            (symbol,)
+        ).fetchall()
+        if not rows:
+            return jsonify([])
+        import pandas as pd
+        from dumbmoney.indicators import weighted_alpha as compute_wa
+        df = pd.DataFrame([dict(r) for r in rows])
+        if timeframe != "1Day":
+            tf_map = {"1Week": "1W", "1Month": "1M", "1W": "1W", "1M": "1M"}
+            rule = tf_map.get(timeframe, timeframe)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            df = df.resample(rule).agg({
+                "open": "first", "high": "max", "low": "min", "close": "last"
+            }).dropna(subset=["open"])
+            df["date"] = df.index.strftime("%Y-%m-%d")
+            df = df.reset_index(drop=True)
+        wa = compute_wa(df)
+        result = []
+        for i, (_, row) in enumerate(wa.items()):
+            val = float(row) if pd.notna(row) else 0.0
+            result.append({
+                "date": df.iloc[i]["date"] if i < len(df) else "",
+                "weighted_alpha": round(val, 4),
+            })
+        result = result[-limit:]
+        return jsonify(result)
+    finally:
+        conn.close()
 
-    threading.Thread(target=_bg_full, daemon=True).start()
 
-
-# ── Live Price Manager (Alpaca WebSocket) ──────────────────────────────
-import asyncio
-_live_prices = {}
-_live_subscriptions = set()
-_live_lock = threading.Lock()
-_live_ws = None
-
-async def _alpaca_ws_loop():
-    global _live_prices, _live_ws
-    uri = "wss://stream.data.alpaca.markets/v2/iex"
-    while True:
-        try:
-            async with websockets.connect(uri, ping_interval=20) as ws:
-                _live_ws = ws
-                auth = {"action": "auth", "key": API_KEY, "secret": API_SECRET}
-                await ws.send(json.dumps(auth))
-                resp = await asyncio.wait_for(ws.recv(), timeout=10)
-                auth_resp = json.loads(resp)
-                if not any(msg.get('T') == 'success' for msg in (auth_resp if isinstance(auth_resp, list) else [auth_resp])):
-                    print(f"  Live: Auth failed: {auth_resp}")
-                    await asyncio.sleep(30)
-                    continue
-                print("  Live: Connected to Alpaca IEX WebSocket")
-
-                syms = list(_live_subscriptions)
-                if syms:
-                    await ws.send(json.dumps({"action": "subscribe", "trades": syms}))
-
-                while True:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                    for data in json.loads(msg):
-                        if data.get('T') == 't':
-                            sym = data.get('S', '')
-                            price = data.get('p', 0)
-                            ts = data.get('t', '')
-                            if sym and price > 0:
-                                with _live_lock:
-                                    _live_prices[sym] = {"price": price, "time": ts}
-                        elif data.get('T') == 'subscription':
-                            pass
-        except asyncio.TimeoutError:
-            continue
-        except websockets.exceptions.ConnectionClosed:
-            print("  Live: Disconnected, reconnecting...")
-            await asyncio.sleep(5)
-            continue
-        except Exception as e:
-            print(f"  Live: Error: {e}")
-            await asyncio.sleep(10)
-            continue
-
-def _subscribe_symbols(symbols):
-    new_syms = []
-    with _live_lock:
-        for s in symbols:
-            if s.upper() not in _live_subscriptions:
-                _live_subscriptions.add(s.upper())
-                new_syms.append(s.upper())
-    return new_syms
-
-@app.route('/api/live/subscribe', methods=['POST'])
-def api_live_subscribe():
-    data = request.json or {}
-    symbols = data.get('symbols', [])
-    new_syms = _subscribe_symbols(symbols)
-    return jsonify({"status": "ok", "subscribed": len(new_syms)})
-
-@app.route('/api/live/prices')
-def api_live_prices():
-    symbols = request.args.get('symbols', '')
+def _combined_ohlc_for_symbols(conn, symbols, weights=None):
     if not symbols:
+        return None
+    import pandas as pd
+    from dumbmoney.indicators import combined_ohlc
+    all_data = {}
+    for sym in symbols:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close, volume FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+            (sym,)
+        ).fetchall()
+        if rows:
+            all_data[sym] = pd.DataFrame([dict(r) for r in rows])
+    if not all_data:
+        return None
+    combined = combined_ohlc(all_data, weights=weights)
+    return combined if combined is not None and not combined.empty else None
+
+
+def _resample_ohlc(ohlc_df, timeframe):
+    import pandas as pd
+    if timeframe in ("1D", "daily", None):
+        return ohlc_df
+    df = ohlc_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")
+    rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+    agg = df.resample(rule).agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum"
+    }).dropna(subset=["open"])
+    agg["date"] = agg.index.strftime("%Y-%m-%d")
+    return agg.reset_index(drop=True)[["date", "open", "high", "low", "close", "volume"]]
+
+
+def _accel_payload(df):
+    if df is None or df.empty:
+        return []
+    import pandas as pd
+    from dumbmoney.indicators import accel as compute_accel
+    acc = compute_accel(df)
+    result = []
+    for i, (_, row) in enumerate(acc.iterrows()):
+        result.append({
+            "date": df.iloc[i]["date"] if i < len(df) else "",
+            "accel_a": round(float(row["accel_a"]), 6) if pd.notna(row["accel_a"]) else None,
+            "accel_base": round(float(row["accel_base"]), 6) if pd.notna(row["accel_base"]) else None,
+            "signal": int(row["accel_signal"]),
+            "crossed_up": int(row["accel_crossed_up"]),
+            "crossed_down": int(row["accel_crossed_down"]),
+        })
+    return result
+
+
+@api_bp.route("/stock/<symbol>/analysis")
+def api_stock_analysis(symbol):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        row = conn.execute("SELECT * FROM ai_analysis WHERE symbol=?", (symbol,)).fetchone()
+        return jsonify(dict(row) if row else {})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/alpaca-news/<symbol>")
+def api_alpaca_news(symbol):
+    from dumbmoney.data_us import get_alpaca_news
+    news = get_alpaca_news(symbol)
+    return jsonify(news)
+
+
+@api_bp.route("/news-search")
+def api_news_search():
+    query = request.args.get("q", "")
+    from dumbmoney.data_us import get_news_search
+    news = get_news_search(query)
+    return jsonify(news)
+
+
+@api_bp.route("/options/<symbol>")
+def api_options(symbol):
+    from dumbmoney.data_us import get_options_chain
+    chain = get_options_chain(symbol)
+    return jsonify(chain)
+
+
+@api_bp.route("/live/prices")
+def api_live_prices():
+    symbols_str = request.args.get("symbols", "")
+    if not symbols_str:
         return jsonify({})
-    sym_list = [s.strip().upper() for s in symbols.split(',') if s.strip()]
-    with _live_lock:
-        result = {s: _live_prices.get(s) for s in sym_list}
-    conn = get_db()
-    missing = [s for s in sym_list if not result.get(s)]
-    if missing:
-        placeholders = ','.join('?' * len(missing))
-        rows = conn.execute(f"SELECT symbol, price FROM stats WHERE symbol IN ({placeholders})", missing).fetchall()
+    symbols = [s.strip() for s in symbols_str.split(",") if s.strip()]
+    market = request.args.get("market", "US")
+    if market == "US":
+        from dumbmoney.data_us import get_live_prices
+        return jsonify(get_live_prices(symbols))
+    else:
+        from dumbmoney.data_india import get_live_prices_india
+        return jsonify(get_live_prices_india(symbols))
+
+
+@api_bp.route("/refresh", methods=["POST"])
+def api_refresh():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US") or request.args.get("market", "US")
+    from dumbmoney.refresh import run_refresh
+    success = run_refresh(market)
+    return jsonify({"started": success})
+
+
+@api_bp.route("/refresh/cancel", methods=["POST"])
+def api_refresh_cancel():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US") or request.args.get("market", "US")
+    from dumbmoney.refresh import cancel_refresh
+    cancel_refresh(market)
+    return jsonify({"cancelled": True})
+
+
+@api_bp.route("/refresh/status")
+def api_refresh_status():
+    market = request.args.get("market", "US")
+    from dumbmoney.refresh import get_refresh_status
+    return jsonify(get_refresh_status(market))
+
+
+_MARKET_STATS_CACHE = {}
+_MARKET_STATS_TTL = 60  # seconds; heavy distinct-symbol counts only
+
+
+@api_bp.route("/market-stats")
+def api_market_stats():
+    market = request.args.get("market", "US")
+    from dumbmoney.db import get_db
+    import json
+    import time as _time
+    from datetime import datetime, timedelta
+    IST = timedelta(hours=5, minutes=30)
+    conn = get_db(market)
+    try:
+        total_assets = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+        oldest = conn.execute("SELECT MIN(date) FROM bars WHERE timeframe='1Day'").fetchone()[0] or ""
+        latest = conn.execute("SELECT MAX(date) FROM bars WHERE timeframe='1Day'").fetchone()[0] or ""
+        with_stats = conn.execute("SELECT COUNT(*) FROM stats WHERE price > 0").fetchone()[0]
+
+        # Distinct-symbol counts over the multi-million-row bars table are the only
+        # expensive parts of this endpoint (COUNT(DISTINCT) scanned the whole index:
+        # 5.2s US / 18s India). Use a recursive loose index scan over
+        # idx_bars_tf_symbol plus a short TTL cache, since base.html hits this on
+        # every page load.
+        cached = _MARKET_STATS_CACHE.get(market)
+        if cached and _time.time() - cached[0] < _MARKET_STATS_TTL and cached[1] == latest:
+            with_bars, new_today = cached[2], cached[3]
+        else:
+            with_bars = conn.execute(
+                """
+                WITH RECURSIVE s(sym) AS (
+                  SELECT (SELECT MIN(symbol) FROM bars WHERE timeframe='1Day')
+                  UNION ALL
+                  SELECT (SELECT MIN(symbol) FROM bars WHERE timeframe='1Day' AND symbol > s.sym)
+                  FROM s WHERE s.sym IS NOT NULL
+                )
+                SELECT COUNT(*) FROM s WHERE sym IS NOT NULL
+                """
+            ).fetchone()[0]
+            new_today = conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM bars WHERE timeframe='1Day' AND date = ?",
+                (latest,)
+            ).fetchone()[0] if latest else 0
+            _MARKET_STATS_CACHE[market] = (_time.time(), latest, with_bars, new_today)
+
+        last_refresh = {}
+        row = conn.execute("SELECT value FROM settings WHERE key='refresh_status'").fetchone()
+        if row and row[0]:
+            s = json.loads(row[0])
+            ts = s.get("started_at", 0)
+            finished = ""
+            if ts:
+                finished = (datetime.utcfromtimestamp(ts) + IST).strftime("%Y-%m-%d %I:%M %p IST")
+            last_refresh = {
+                "status": s.get("status", "idle"),
+                "finished_at": finished,
+                "new_stocks": s.get("new_stocks_count", 0),
+                "phase": s.get("phase", ""),
+            }
+
+        return jsonify({
+            "market": market,
+            "total_assets": total_assets,
+            "with_bars": with_bars,
+            "with_stats": with_stats,
+            "oldest_date": oldest,
+            "latest_date": latest,
+            "new_today": new_today,
+            "last_refresh": last_refresh,
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/settings/get")
+def api_settings_get():
+    market = request.args.get("market", "US")
+    from dumbmoney.db import get_db
+    import json
+    conn = get_db(market)
+    try:
+        settings = {}
+        for row in conn.execute("SELECT key, value FROM settings").fetchall():
+            try:
+                settings[row[0]] = json.loads(row[1])
+            except Exception:
+                settings[row[0]] = row[1]
+        return jsonify(settings)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/settings/set", methods=["POST"])
+def api_settings_set():
+    data = request.json or {}
+    market = data.get("market", "US")
+    key = data.get("key", "")
+    value = data.get("value", "")
+    from dumbmoney.db import get_db
+    import json
+    conn = get_db(market)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, json.dumps(value))
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/download-history", methods=["POST"])
+def api_download_history():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US")
+    from dumbmoney.refresh import run_refresh
+    run_refresh(market)
+    return jsonify({"started": True})
+
+
+@api_bp.route("/download-status")
+def api_download_status():
+    market = request.args.get("market", "US")
+    from dumbmoney.refresh import get_refresh_status
+    return jsonify(get_refresh_status(market))
+
+
+@api_bp.route("/download-assets", methods=["POST"])
+def api_download_assets():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US")
+    if market == "US":
+        from dumbmoney.data_us import sync_assets
+        n = sync_assets()
+    else:
+        from dumbmoney.data_india import sync_india_assets
+        n = sync_india_assets()
+    return jsonify({"synced": n})
+
+
+@api_bp.route("/update-pre-post", methods=["POST"])
+def api_update_pre_post():
+    return jsonify({"status": "ok"})
+
+
+@api_bp.route("/recompute-streaks", methods=["POST"])
+def api_recompute_streaks():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US")
+    from dumbmoney.engine import vectorized_stats_pass
+    n = vectorized_stats_pass(market)
+    return jsonify({"updated": n})
+
+
+@api_bp.route("/historical/rebuild", methods=["POST"])
+def api_historical_rebuild():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US") or request.args.get("market", "US")
+    force = bool((data or {}).get("force", True))
+    from dumbmoney.engine import update_historical_screener, update_signal_prob_matrix
+    update_historical_screener(market, force_rebuild=force)
+    update_signal_prob_matrix(market)
+    return jsonify({"rebuilt": True, "market": market})
+
+
+@api_bp.route("/reset-data", methods=["POST"])
+def api_reset_data():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US")
+    from dumbmoney.config import DB_PATHS
+    db_path = DB_PATHS[market]
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    ensure_schema(db_path)
+    migrate_nulls(db_path)
+    return jsonify({"reset": True})
+
+
+@api_bp.route("/kill-python", methods=["POST"])
+def api_kill_python():
+    return jsonify({"status": "ok"})
+
+
+@api_bp.route("/health")
+def api_health():
+    return jsonify({"status": "ok"})
+
+
+@api_bp.route("/settings/alpaca", methods=["GET", "POST"])
+def api_settings_alpaca():
+    if request.method == "POST":
+        data = request.json
+        from dumbmoney import config
+        if "api_key" in data:
+            config.ALPACA_API_KEY = data["api_key"]
+        if "api_secret" in data:
+            config.ALPACA_API_SECRET = data["api_secret"]
+        if "base_url" in data:
+            config.ALPACA_BASE_URL = data["base_url"]
+        return jsonify({"updated": True})
+    return jsonify({
+        "api_key": "***" + (config.ALPACA_API_KEY[-4:] if len(config.ALPACA_API_KEY) > 4 else ""),
+        "base_url": config.ALPACA_BASE_URL
+    })
+
+
+@api_bp.route("/portfolios")
+def api_portfolios():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT * FROM portfolios ORDER BY created_at DESC").fetchall()
+        result = []
         for r in rows:
-            if not result.get(r['symbol']):
-                result[r['symbol']] = {"price": r['price'], "time": None, "from_db": True}
-    conn.close()
+            d = dict(r)
+            strings = conn.execute(
+                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY sort_order, created_at", (r["id"],)
+            ).fetchall()
+            str_list = []
+            total_pnl = 0
+            for s in strings:
+                sd = dict(s)
+                ep = sd.get("entry_price") or 0
+                syms = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (sd["id"],)
+                ).fetchall()
+                entry_value = ep
+                current_value = 0
+                prob_num = 0
+                prob_den = 0
+                chg_num = 0
+                for sy in syms:
+                    price_row = conn.execute(
+                        "SELECT close FROM bars WHERE symbol=? ORDER BY date DESC LIMIT 1", (sy["symbol"],)
+                    ).fetchone()
+                    price = price_row["close"] if price_row else 0
+                    qty = sy["qty"] or 0
+                    current_value += price * qty
+                    prob_row = conn.execute(
+                        "SELECT prob_up_1d, change_pct FROM stats WHERE symbol=?", (sy["symbol"],)
+                    ).fetchone()
+                    prob = float(prob_row["prob_up_1d"] or 0) if prob_row else 0
+                    chg = float(prob_row["change_pct"] or 0) if prob_row else 0
+                    prob_num += prob * price * qty
+                    prob_den += price * qty
+                    chg_num += chg * price * qty
+                rp_raw = sd.get("realised_pnl")
+                rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else 0.0
+                up = current_value - entry_value if entry_value else 0
+                sd["entry_value"] = entry_value
+                sd["current_value"] = current_value
+                sd["realised_pnl"] = rp
+                sd["unrealised_pnl"] = up
+                sd["pnl_pct"] = ((current_value / entry_value - 1) * 100) if entry_value else 0
+                sd["num_stocks"] = len(syms)
+                sd["prob_1up"] = round(prob_num / prob_den, 4) if prob_den > 0 else 0
+                sd["change_pct"] = round(chg_num / prob_den, 4) if prob_den > 0 else 0
+                total_pnl += rp + up
+                str_list.append(sd)
+            d["strings"] = str_list
+            d["total_pnl"] = total_pnl
+            d["num_strings"] = len(str_list)
+            d["symbol_count"] = sum(s.get("num_stocks", 0) for s in str_list)
+            result.append(d)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios/stats")
+def api_portfolios_stats():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT * FROM portfolios ORDER BY created_at DESC").fetchall()
+        total_invested = 0
+        total_current = 0
+        total_realised = 0
+        total_unrealised = 0
+        num_strings = 0
+        prob_weight_sum = 0
+        value_sum = 0
+        for r in rows:
+            strings = conn.execute(
+                "SELECT * FROM portfolio_strings WHERE portfolio_id=?", (r["id"],)
+            ).fetchall()
+            for s in strings:
+                sd = dict(s)
+                num_strings += 1
+                ep = sd.get("entry_price") or 0
+                syms = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (sd["id"],)
+                ).fetchall()
+                entry_value = ep
+                total_invested += entry_value
+                current_value = 0
+                prob_sum = 0
+                weight_sum = 0
+                for sy in syms:
+                    price_row = conn.execute(
+                        "SELECT close FROM bars WHERE symbol=? ORDER BY date DESC LIMIT 1", (sy["symbol"],)
+                    ).fetchone()
+                    price = price_row["close"] if price_row else 0
+                    qty = sy["qty"] or 0
+                    current_value += price * qty
+                    prob_row = conn.execute(
+                        "SELECT prob_up_1d FROM stats WHERE symbol=?", (sy["symbol"],)
+                    ).fetchone()
+                    prob = float(prob_row["prob_up_1d"] or 0) if prob_row else 0
+                    prob_sum += prob * price * qty
+                    weight_sum += price * qty
+                total_current += current_value
+                rp_raw = sd.get("realised_pnl")
+                rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else 0.0
+                up = current_value - entry_value if entry_value else 0
+                total_realised += rp
+                total_unrealised += up
+                if weight_sum > 0:
+                    prob_weight_sum += prob_sum
+                    value_sum += weight_sum
+        return jsonify({
+            "total_invested": total_invested,
+            "total_current": total_current,
+            "total_pnl": total_realised + total_unrealised,
+            "total_realised": total_realised,
+            "total_unrealised": total_unrealised,
+            "num_strings": num_strings,
+            "prob_1up": round(prob_weight_sum / value_sum, 4) if value_sum > 0 else 0,
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios/ohlc")
+def api_portfolios_ohlc():
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 365))
+    timeframe = request.args.get("timeframe", "1D")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT id FROM portfolios ORDER BY created_at DESC").fetchall()
+        if not rows:
+            return jsonify([])
+        all_syms = {}
+        for r in rows:
+            strings = conn.execute("SELECT id FROM portfolio_strings WHERE portfolio_id=?", (r["id"],)).fetchall()
+            for s in strings:
+                syms = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (s["id"],)
+                ).fetchall()
+                for sy in syms:
+                    sym = sy["symbol"]
+                    qty = sy["qty"] or 0
+                    if sym in all_syms:
+                        all_syms[sym] += qty
+                    else:
+                        all_syms[sym] = qty
+        if not all_syms:
+            return jsonify([])
+
+        from datetime import date, timedelta
+        days = limit * 7 if timeframe == "1W" else limit * 31 if timeframe == "1M" else limit + 10
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+
+        placeholders = ",".join("?" * len(all_syms))
+        sym_list = list(all_syms.keys())
+        bars = conn.execute(
+            f"SELECT symbol, date, open, high, low, close, volume FROM bars WHERE symbol IN ({placeholders}) AND date >= ? ORDER BY date",
+            sym_list + [cutoff]
+        ).fetchall()
+
+        date_map = {}
+        for b in bars:
+            d = b["date"]
+            qty = all_syms.get(b["symbol"], 0)
+            if d not in date_map:
+                date_map[d] = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}
+            date_map[d]["open"] += (b["open"] or 0) * qty
+            date_map[d]["high"] += (b["high"] or 0) * qty
+            date_map[d]["low"] += (b["low"] or 0) * qty
+            date_map[d]["close"] += (b["close"] or 0) * qty
+            date_map[d]["volume"] += (b["volume"] or 0)
+
+        result = [{"time": d, "open": round(v["open"], 2), "high": round(v["high"], 2),
+                    "low": round(v["low"], 2), "close": round(v["close"], 2), "volume": v["volume"]}
+                   for d, v in sorted(date_map.items())]
+
+        if timeframe not in ("1D", "daily", None) and result:
+            import pandas as pd
+            df = pd.DataFrame(result)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            result = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2),
+                        "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])}
+                       for _, row in agg.iterrows()]
+
+        return jsonify(result[-limit:])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios/supertrend")
+def api_portfolios_supertrend():
+    market = request.args.get("market", "US")
+    period = int(request.args.get("period", 14))
+    multiplier = float(request.args.get("multiplier", 1.0))
+    limit = int(request.args.get("limit", 500))
+
+    ohlc = _portfolios_ohlc_all(market, limit=500, timeframe="1D")
+    if not ohlc:
+        return jsonify({"daily": [], "weekly": [], "monthly": []})
+
+    import pandas as pd
+    from dumbmoney.indicators import atr_trailing_stop
+    from dumbmoney.indicators import compute_rolling_atr_batch
+
+    df = pd.DataFrame(ohlc)
+    for c in ["open", "high", "low", "close"]:
+        df[c] = pd.to_numeric(df[c])
+
+    st = atr_trailing_stop(df, period=period, multiplier=multiplier)
+    st["time"] = df["time"].values
+    daily_result = []
+    for _, row in st.iterrows():
+        daily_result.append({
+            "time": row["time"],
+            "value": round(float(row["supertrend"]), 2) if pd.notna(row["supertrend"]) else None,
+            "signal": int(row["signal"]),
+            "atr_value": round(float(row["atr_value"]), 4) if pd.notna(row.get("atr_value")) else None,
+        })
+
+    weekly_result = []
+    if len(df) >= 7:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            wt, ws, wv, wsk, wca, wcb, wbl, wab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 5, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if wt[i] != 0 or ws[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    weekly_result.append({"time": key, "value": round(float(ws[i]), 2) if ws[i] else None, "signal": int(wt[i]), "atr_value": round(float(wv[i]), 4) if wv[i] else None})
+        except Exception:
+            pass
+
+    monthly_result = []
+    if len(df) >= 24:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            mt, ms, mv, msk, mca, mcb, mbl, mab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 22, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if mt[i] != 0 or ms[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    monthly_result.append({"time": key, "value": round(float(ms[i]), 2) if ms[i] else None, "signal": int(mt[i]), "atr_value": round(float(mv[i]), 4) if mv[i] else None})
+        except Exception:
+            pass
+
+    return jsonify({"daily": daily_result[-limit:], "weekly": weekly_result[-limit:], "monthly": monthly_result[-limit:]})
+
+
+def _portfolios_ohlc_all(market, limit=500, timeframe="1D"):
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT id FROM portfolios ORDER BY created_at DESC").fetchall()
+        if not rows:
+            return []
+        all_syms = {}
+        for r in rows:
+            strings = conn.execute("SELECT id FROM portfolio_strings WHERE portfolio_id=?", (r["id"],)).fetchall()
+            for s in strings:
+                syms = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (s["id"],)
+                ).fetchall()
+                for sy in syms:
+                    sym = sy["symbol"]
+                    qty = sy["qty"] or 0
+                    if sym in all_syms:
+                        all_syms[sym] += qty
+                    else:
+                        all_syms[sym] = qty
+        if not all_syms:
+            return []
+        placeholders = ",".join("?" * len(all_syms))
+        sym_list = list(all_syms.keys())
+        bars = conn.execute(
+            f"SELECT symbol, date, open, high, low, close, volume FROM bars WHERE symbol IN ({placeholders}) ORDER BY date",
+            sym_list
+        ).fetchall()
+        date_map = {}
+        for b in bars:
+            d = b["date"]
+            qty = all_syms.get(b["symbol"], 0)
+            if d not in date_map:
+                date_map[d] = {"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}
+            date_map[d]["open"] += (b["open"] or 0) * qty
+            date_map[d]["high"] += (b["high"] or 0) * qty
+            date_map[d]["low"] += (b["low"] or 0) * qty
+            date_map[d]["close"] += (b["close"] or 0) * qty
+            date_map[d]["volume"] += (b["volume"] or 0)
+        result = [{"time": d, "open": round(v["open"], 2), "high": round(v["high"], 2), "low": round(v["low"], 2), "close": round(v["close"], 2), "volume": v["volume"]} for d, v in sorted(date_map.items())]
+        if timeframe not in ("1D", "daily", None) and result:
+            import pandas as pd
+            df = pd.DataFrame(result)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            result = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2), "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])} for _, row in agg.iterrows()]
+        return result[-limit:]
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios/equity_ohlc")
+def api_portfolios_equity_ohlc():
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 1000))
+    timeframe = request.args.get("timeframe", "1D")
+    conn = get_db(market)
+    try:
+        portfolios = conn.execute("SELECT id FROM portfolios ORDER BY created_at DESC").fetchall()
+        if not portfolios:
+            return jsonify([])
+
+        string_data = []
+        all_syms = set()
+        for p in portfolios:
+            strings = conn.execute(
+                "SELECT id, entry_date, exit_date, status, entry_price, exit_price, realised_pnl FROM portfolio_strings WHERE portfolio_id=?",
+                (p["id"],)
+            ).fetchall()
+            for s in strings:
+                sd = dict(s)
+                syms = conn.execute(
+                    "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+                    (sd["id"],)
+                ).fetchall()
+                sd["symbols"] = [{"symbol": x["symbol"], "qty": float(x["qty"])} for x in syms]
+                for x in syms:
+                    all_syms.add(x["symbol"])
+                string_data.append(sd)
+
+        if not all_syms:
+            return jsonify([])
+
+        placeholders = ",".join(["?"] * len(all_syms))
+        sym_list = list(all_syms)
+        rows = conn.execute(
+            f"SELECT symbol, date, open, high, low, close FROM bars WHERE symbol IN ({placeholders}) ORDER BY date",
+            sym_list
+        ).fetchall()
+
+        if not rows:
+            return jsonify([])
+
+        price_data = {}
+        all_dates = set()
+        for r in rows:
+            dt, sym = r["date"], r["symbol"]
+            all_dates.add(dt)
+            if dt not in price_data:
+                price_data[dt] = {}
+            price_data[dt][sym] = {"open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"])}
+
+        sorted_dates = sorted(all_dates)
+        equity_data = []
+        cumulative_booked = 0
+
+        for dt in sorted_dates:
+            running_val = 0
+            running_val_open = 0
+            running_val_high = 0
+            running_val_low = 0
+
+            for sd in string_data:
+                is_running = sd["status"] != "closed"
+                entry_dt = sd["entry_date"]
+                exit_dt = sd.get("exit_date")
+
+                if is_running:
+                    if entry_dt and dt >= entry_dt:
+                        for sym_info in sd["symbols"]:
+                            sym, qty = sym_info["symbol"], sym_info["qty"]
+                            if sym in price_data.get(dt, {}):
+                                p = price_data[dt][sym]
+                                running_val += p["close"] * qty
+                                running_val_open += p["open"] * qty
+                                running_val_high += p["high"] * qty
+                                running_val_low += p["low"] * qty
+                else:
+                    if exit_dt and dt >= exit_dt:
+                        rp_raw = sd.get("realised_pnl")
+                        rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else 0.0
+                        if rp == 0 and sd.get("entry_price") and sd.get("exit_price"):
+                            rp = float(sd["exit_price"]) - float(sd["entry_price"])
+                        cumulative_booked += rp
+                    elif entry_dt and dt >= entry_dt and (not exit_dt or dt < exit_dt):
+                        for sym_info in sd["symbols"]:
+                            sym, qty = sym_info["symbol"], sym_info["qty"]
+                            if sym in price_data.get(dt, {}):
+                                p = price_data[dt][sym]
+                                running_val += p["close"] * qty
+                                running_val_open += p["open"] * qty
+                                running_val_high += p["high"] * qty
+                                running_val_low += p["low"] * qty
+
+            total_close = running_val + cumulative_booked
+            if total_close > 0 or running_val > 0:
+                equity_data.append({
+                    "time": dt,
+                    "open": round(running_val_open + cumulative_booked, 2),
+                    "high": round(max(running_val_open + cumulative_booked, running_val_high + cumulative_booked, total_close), 2),
+                    "low": round(min(running_val_open + cumulative_booked, running_val_low + cumulative_booked, total_close), 2),
+                    "close": round(total_close, 2),
+                    "volume": 0
+                })
+
+        if timeframe not in ("1D", "daily", None) and equity_data:
+            import pandas as pd
+            df = pd.DataFrame(equity_data)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            equity_data = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2), "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])} for _, row in agg.iterrows()]
+
+        return jsonify(equity_data[-limit:])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios", methods=["POST"])
+def api_create_portfolio():
+    data = request.json
+    market = data.get("market", "US")
+    name = data.get("name", "New Portfolio")
+    conn = get_db(market)
+    try:
+        conn.execute("INSERT INTO portfolios (name) VALUES (?)", (name,))
+        conn.commit()
+        pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return jsonify({"id": pid, "name": name})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolios/<int:pid>", methods=["DELETE"])
+def api_delete_portfolio(pid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        conn.execute("DELETE FROM portfolios WHERE id=?", (pid,))
+        conn.commit()
+        return jsonify({"deleted": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/add", methods=["POST"])
+def api_portfolio_add():
+    data = request.json
+    market = data.get("market", "US")
+    pid = data["portfolio_id"]
+    symbol = data["symbol"]
+    qty = data.get("qty", 0)
+    avg_price = data.get("avg_price", 0)
+    conn = get_db(market)
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO portfolio_symbols (portfolio_id, symbol, qty, avg_price)
+               VALUES (?, ?, ?, ?)""",
+            (pid, symbol, qty, avg_price)
+        )
+        conn.commit()
+        return jsonify({"added": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/remove", methods=["POST"])
+def api_portfolio_remove():
+    data = request.json
+    market = data.get("market", "US")
+    pid = data["portfolio_id"]
+    symbol = data["symbol"]
+    conn = get_db(market)
+    try:
+        conn.execute("DELETE FROM portfolio_symbols WHERE portfolio_id=? AND symbol=?", (pid, symbol))
+        conn.commit()
+        return jsonify({"removed": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/ohlc")
+@api_bp.route("/portfolios/<int:pid>/ohlc")
+def api_portfolio_ohlc(pid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1D")
+    result = _portfolio_ohlc(pid, market, limit, timeframe)
     return jsonify(result)
 
-# ── Server Start ──────────────────────────────────────────────────────
+
+def _portfolio_ohlc(pid, market, limit=500, timeframe="1D"):
+    conn = get_db(market)
+    try:
+        symbols = []
+        strings = conn.execute("SELECT id FROM portfolio_strings WHERE portfolio_id=?", (pid,)).fetchall()
+        for s in strings:
+            syms = conn.execute(
+                "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (s["id"],)
+            ).fetchall()
+            for x in syms:
+                if x["symbol"] not in [s2["symbol"] for s2 in symbols]:
+                    symbols.append({"symbol": x["symbol"], "qty": float(x["qty"])})
+        if not symbols:
+            return []
+        sym_qty = {s["symbol"]: s["qty"] for s in symbols}
+        sym_list = list(sym_qty.keys())
+        placeholders = ",".join(["?"] * len(sym_list))
+        rows = conn.execute(
+            f"SELECT symbol, date, open, high, low, close, volume FROM bars WHERE symbol IN ({placeholders}) ORDER BY date",
+            sym_list
+        ).fetchall()
+        if not rows:
+            return []
+        all_bars = {}
+        for r in rows:
+            dt = r["date"]
+            if dt not in all_bars:
+                all_bars[dt] = {"time": dt, "open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}
+            qty = sym_qty.get(r["symbol"], 1.0)
+            all_bars[dt]["open"] += qty * float(r["open"])
+            all_bars[dt]["high"] += qty * float(r["high"])
+            all_bars[dt]["low"] += qty * float(r["low"])
+            all_bars[dt]["close"] += qty * float(r["close"])
+            all_bars[dt]["volume"] += int(r["volume"])
+        result = []
+        for dt in sorted(all_bars.keys()):
+            b = all_bars[dt]
+            result.append({
+                "time": b["time"],
+                "open": round(b["open"], 2),
+                "high": round(b["high"], 2),
+                "low": round(b["low"], 2),
+                "close": round(b["close"], 2),
+                "volume": b["volume"]
+            })
+        if timeframe not in ("1D", "daily", None) and result:
+            import pandas as pd
+            df = pd.DataFrame(result)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            result = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2), "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])} for _, row in agg.iterrows()]
+        return result[-limit:]
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/supertrend")
+@api_bp.route("/portfolios/<int:pid>/supertrend")
+def api_portfolio_supertrend(pid):
+    market = request.args.get("market", "US")
+    period = int(request.args.get("period", 14))
+    multiplier = float(request.args.get("multiplier", 1.0))
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1D")
+
+    ohlc = _portfolio_ohlc(pid, market, limit=500, timeframe="1D")
+    if not ohlc:
+        return jsonify({"daily": [], "weekly": [], "monthly": []})
+
+    import pandas as pd
+    from dumbmoney.indicators import atr_trailing_stop
+    from dumbmoney.indicators import compute_rolling_atr_batch
+
+    df = pd.DataFrame(ohlc)
+    df["open"] = pd.to_numeric(df["open"])
+    df["high"] = pd.to_numeric(df["high"])
+    df["low"] = pd.to_numeric(df["low"])
+    df["close"] = pd.to_numeric(df["close"])
+
+    # Daily ATR Trailing Stop
+    st = atr_trailing_stop(df, period=period, multiplier=multiplier)
+    st["time"] = df["time"].values
+    daily_result = []
+    for _, row in st.iterrows():
+        daily_result.append({
+            "time": row["time"],
+            "value": round(float(row["supertrend"]), 2) if pd.notna(row["supertrend"]) else None,
+            "signal": int(row["signal"]),
+            "atr_value": round(float(row["atr_value"]), 4) if pd.notna(row.get("atr_value")) else None,
+        })
+
+    # Anchored rolling weekly (5 sessions) - batch computation
+    weekly_result = []
+    if len(df) >= 7:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            wt, ws, wv, wsk, wca, wcb, wbl, wab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 5, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if wt[i] != 0 or ws[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    weekly_result.append({
+                        "time": key,
+                        "value": round(float(ws[i]), 2) if ws[i] else None,
+                        "signal": int(wt[i]),
+                        "atr_value": round(float(wv[i]), 4) if wv[i] else None,
+                    })
+        except Exception:
+            pass
+
+    # Anchored rolling monthly (22 sessions) - batch computation
+    monthly_result = []
+    if len(df) >= 24:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            mt, ms, mv, msk, mca, mcb, mbl, mab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 22, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if mt[i] != 0 or ms[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    monthly_result.append({
+                        "time": key,
+                        "value": round(float(ms[i]), 2) if ms[i] else None,
+                        "signal": int(mt[i]),
+                        "atr_value": round(float(mv[i]), 4) if mv[i] else None,
+                    })
+        except Exception:
+            pass
+
+    return jsonify({"daily": daily_result[-limit:], "weekly": weekly_result[-limit:], "monthly": monthly_result[-limit:]})
+
+
+@api_bp.route("/portfolio/<int:pid>/equity_ohlc")
+def api_portfolio_equity_ohlc(pid):
+    """Equity chart: reconstructs portfolio value over time from trade history.
+    Running strings contribute market value, closed strings contribute booked profit."""
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 1000))
+    timeframe = request.args.get("timeframe", "1D")
+
+    conn = get_db(market)
+    try:
+        # Get all strings with their symbols
+        strings = conn.execute(
+            "SELECT id, entry_date, exit_date, status, entry_price, exit_price, realised_pnl FROM portfolio_strings WHERE portfolio_id=?",
+            (pid,)
+        ).fetchall()
+        if not strings:
+            return jsonify([])
+
+        # Build string data with symbols
+        string_data = []
+        all_syms = set()
+        for s in strings:
+            sd = dict(s)
+            syms = conn.execute(
+                "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+                (sd["id"],)
+            ).fetchall()
+            sd["symbols"] = [{"symbol": x["symbol"], "qty": float(x["qty"])} for x in syms]
+            for x in syms:
+                all_syms.add(x["symbol"])
+            string_data.append(sd)
+
+        if not all_syms:
+            return jsonify([])
+
+        # Get all bars for these symbols
+        placeholders = ",".join(["?"] * len(all_syms))
+        sym_list = list(all_syms)
+        rows = conn.execute(
+            f"SELECT symbol, date, open, high, low, close FROM bars WHERE symbol IN ({placeholders}) ORDER BY date",
+            sym_list
+        ).fetchall()
+
+        if not rows:
+            return jsonify([])
+
+        # Build price lookup: {date: {symbol: {open, high, low, close}}}
+        price_data = {}
+        all_dates = set()
+        for r in rows:
+            dt = r["date"]
+            sym = r["symbol"]
+            all_dates.add(dt)
+            if dt not in price_data:
+                price_data[dt] = {}
+            price_data[dt][sym] = {
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"])
+            }
+
+        sorted_dates = sorted(all_dates)
+
+        # Build equity curve
+        equity_data = []
+        cumulative_booked = 0
+
+        for dt in sorted_dates:
+            running_val = 0
+            running_val_open = 0
+            running_val_high = 0
+            running_val_low = 0
+
+            for sd in string_data:
+                is_running = sd["status"] != "closed"
+                entry_dt = sd["entry_date"]
+                exit_dt = sd.get("exit_date")
+
+                # Check if this string was active on this date
+                if is_running:
+                    # Active if date >= entry_date
+                    if entry_dt and dt >= entry_dt:
+                        for sym_info in sd["symbols"]:
+                            sym = sym_info["symbol"]
+                            qty = sym_info["qty"]
+                            if sym in price_data.get(dt, {}):
+                                p = price_data[dt][sym]
+                                running_val += p["close"] * qty
+                                running_val_open += p["open"] * qty
+                                running_val_high += p["high"] * qty
+                                running_val_low += p["low"] * qty
+                else:
+                    # Closed string: add booked profit from exit_date onwards
+                    if exit_dt and dt >= exit_dt:
+                        rp_raw = sd.get("realised_pnl")
+                        rp = float(rp_raw) if rp_raw is not None and str(rp_raw) not in ('None', 'null', '') else 0.0
+                        if rp == 0 and sd.get("entry_price") and sd.get("exit_price"):
+                            rp = float(sd["exit_price"]) - float(sd["entry_price"])
+                        cumulative_booked += rp
+                    # While still active (entry_date <= dt < exit_date), contribute market value
+                    elif entry_dt and dt >= entry_dt and (not exit_dt or dt < exit_dt):
+                        for sym_info in sd["symbols"]:
+                            sym = sym_info["symbol"]
+                            qty = sym_info["qty"]
+                            if sym in price_data.get(dt, {}):
+                                p = price_data[dt][sym]
+                                running_val += p["close"] * qty
+                                running_val_open += p["open"] * qty
+                                running_val_high += p["high"] * qty
+                                running_val_low += p["low"] * qty
+
+            total_close = running_val + cumulative_booked
+            total_open = running_val_open + cumulative_booked
+            total_high = running_val_high + cumulative_booked
+            total_low = running_val_low + cumulative_booked
+
+            if total_close > 0 or running_val > 0:
+                equity_data.append({
+                    "time": dt,
+                    "open": round(total_open, 2),
+                    "high": round(max(total_open, total_high, total_close), 2),
+                    "low": round(min(total_open, total_low, total_close), 2),
+                    "close": round(total_close, 2),
+                    "volume": 0
+                })
+
+        # Resample for weekly/monthly if needed
+        if timeframe not in ("1D", "daily", None) and equity_data:
+            import pandas as pd
+            df = pd.DataFrame(equity_data)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            equity_data = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2), "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])} for _, row in agg.iterrows()]
+
+        return jsonify(equity_data[-limit:])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/accel")
+@api_bp.route("/portfolios/<int:pid>/accel")
+def api_portfolio_accel(pid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1D")
+
+    ohlc = _portfolio_ohlc(pid, market, limit=500, timeframe=timeframe)
+    if not ohlc:
+        return jsonify([])
+
+    import pandas as pd
+    from dumbmoney.indicators import accel
+
+    df = pd.DataFrame(ohlc)
+    df["open"] = pd.to_numeric(df["open"])
+    df["high"] = pd.to_numeric(df["high"])
+    df["low"] = pd.to_numeric(df["low"])
+    df["close"] = pd.to_numeric(df["close"])
+
+    acc = accel(df)
+    acc["time"] = df["time"].values
+    result = []
+    for _, row in acc.iterrows():
+        result.append({
+            "time": row["time"],
+            "accel_a": round(float(row.get("accel_a", 0)), 4),
+            "accel_base": round(float(row.get("accel_base", 0)), 4),
+            "crossed_up": int(row.get("accel_crossed_up", 0)),
+            "crossed_down": int(row.get("accel_crossed_down", 0))
+        })
+    return jsonify(result[-limit:])
+
+
+@api_bp.route("/portfolios/groups")
+def api_portfolio_groups():
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute("SELECT * FROM portfolio_groups ORDER BY created_at DESC").fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            members = conn.execute(
+                "SELECT p.id, p.name FROM portfolio_group_members gm JOIN portfolios p ON gm.portfolio_id=p.id WHERE gm.group_id=?",
+                (r["id"],)
+            ).fetchall()
+            d["portfolios"] = [dict(m) for m in members]
+            result.append(d)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/preview", methods=["POST"])
+def api_portfolio_string_preview():
+    data = request.json
+    market = data.get("market", "US")
+    raw = data.get("symbols", "")
+    amount = data.get("amount")
+    symbol_list = []
+
+    for part in raw.replace("+", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "*" in part:
+            parts = part.split("*", 1)
+            sym = parts[0].strip().upper()
+            try:
+                qty = float(parts[1].strip())
+            except (ValueError, IndexError):
+                qty = 0
+            symbol_list.append({"symbol": sym, "qty": qty})
+        else:
+            sym = part.strip().upper()
+            if sym:
+                symbol_list.append({"symbol": sym, "qty": 0})
+
+    if not symbol_list:
+        return jsonify({"error": "No valid symbols"}), 400
+
+    conn = get_db(market)
+    try:
+        results = []
+        for item in symbol_list:
+            sym = item["symbol"]
+            row = conn.execute(
+                "SELECT name, price, volume, change_pct, weighted_alpha FROM stats WHERE symbol=?",
+                (sym,)
+            ).fetchone()
+            if row:
+                price = float(row["price"] or 0)
+                name = row["name"] or sym
+            else:
+                bsym = sym.replace(".NS", "").replace(".BO", "")
+                price = 0
+                name = bsym
+            item["price"] = price
+            item["name"] = name
+            results.append(item)
+
+        has_qty = any(r["qty"] > 0 for r in results)
+        if not has_qty and amount and amount > 0:
+            for r in results:
+                if r["price"] > 0:
+                    r["qty"] = round(amount / r["price"]) if market == "INDIA" else round(amount / r["price"], 4)
+                else:
+                    r["qty"] = 0
+
+        total_value = sum(r["price"] * r["qty"] for r in results if r["price"] > 0)
+        return jsonify({"symbols": results, "total_value": total_value, "has_qty": has_qty})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/add", methods=["POST"])
+def api_portfolio_string_add():
+    data = request.json
+    market = data.get("market", "US")
+    portfolio_id = data.get("portfolio_id")
+    name = data.get("name", "")
+    entry_date = data.get("entry_date")
+    entry_price = data.get("entry_price")
+    fractional = data.get("fractional", 0)
+    symbols = data.get("symbols", [])
+
+    if not portfolio_id or not entry_date or not symbols:
+        return jsonify({"error": "portfolio_id, entry_date, and symbols required"}), 400
+
+    conn = get_db(market)
+    try:
+        ep = float(entry_price) if entry_price else 0
+        num_syms = len(symbols)
+
+        if ep > 0 and num_syms > 0:
+            per_stock = ep / num_syms
+            corrected = []
+            for s in symbols:
+                sym = s.get("symbol", "").upper()
+                bar = conn.execute(
+                    "SELECT close FROM bars WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1",
+                    (sym, entry_date)
+                ).fetchone()
+                entry_px = float(bar["close"]) if bar and bar["close"] else 0
+                if entry_px > 0:
+                    corrected_qty = per_stock / entry_px
+                else:
+                    corrected_qty = float(s.get("qty", 0))
+                corrected.append((sym, corrected_qty, s.get("weight", 1.0), s.get("fractional_allowed", False)))
+        else:
+            total_cost = 0
+            for s in symbols:
+                price = s.get("price", 0) or 0
+                total_cost += float(s.get("qty", 0)) * float(price)
+            ep = total_cost
+            corrected = [(s.get("symbol", "").upper(), float(s.get("qty", 0)), s.get("weight", 1.0), s.get("fractional_allowed", False)) for s in symbols]
+
+        cur = conn.execute(
+            """INSERT INTO portfolio_strings (portfolio_id, name, entry_date, entry_price, fractional)
+               VALUES (?, ?, ?, ?, ?)""",
+            (portfolio_id, name, entry_date, round(ep, 2), 1 if fractional else 0)
+        )
+        psid = cur.lastrowid
+
+        for sym, qty, weight, frac_allowed in corrected:
+            if sym:
+                conn.execute(
+                    """INSERT INTO portfolio_string_symbols
+                       (portfolio_string_id, symbol, qty, weight, fractional_allowed)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (psid, sym, qty, weight, frac_allowed)
+                )
+        conn.commit()
+
+        string_row = conn.execute("SELECT * FROM portfolio_strings WHERE id=?", (psid,)).fetchone()
+        return jsonify({"ok": True, "string": dict(string_row) if string_row else None})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/close", methods=["POST"])
+def api_portfolio_string_close():
+    data = request.json
+    market = data.get("market", "US")
+    psid = data.get("portfolio_string_id")
+    exit_date = data.get("exit_date")
+    exit_price = data.get("exit_price")
+
+    if not psid or not exit_date:
+        return jsonify({"error": "portfolio_string_id and exit_date required"}), 400
+
+    conn = get_db(market)
+    try:
+        # Get entry_price to calculate realised_pnl
+        row = conn.execute("SELECT entry_price FROM portfolio_strings WHERE id=?", (psid,)).fetchone()
+        entry_price = float(row["entry_price"] or 0) if row else 0
+        ep = float(exit_price) if exit_price else 0
+        realised_pnl = ep - entry_price
+
+        conn.execute(
+            "UPDATE portfolio_strings SET exit_date=?, exit_price=?, status='closed', realised_pnl=? WHERE id=?",
+            (exit_date, exit_price, realised_pnl, psid)
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/reopen", methods=["POST"])
+def api_portfolio_string_reopen():
+    data = request.json
+    market = data.get("market", "US")
+    psid = data.get("portfolio_string_id")
+    entry_date = data.get("entry_date")
+    entry_price = data.get("entry_price")
+
+    if not psid or not entry_date:
+        return jsonify({"error": "portfolio_string_id and entry_date required"}), 400
+
+    conn = get_db(market)
+    try:
+        conn.execute(
+            "UPDATE portfolio_strings SET entry_date=?, entry_price=?, exit_date=NULL, exit_price=NULL, status='running' WHERE id=?",
+            (entry_date, entry_price, psid)
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/edit", methods=["POST"])
+def api_portfolio_string_edit():
+    data = request.json
+    market = data.get("market", "US")
+    psid = data.get("portfolio_string_id")
+    name = data.get("name")
+    entry_date = data.get("entry_date")
+    entry_price = data.get("entry_price")
+    exit_date = data.get("exit_date")
+    exit_price = data.get("exit_price")
+    status = data.get("status")
+    symbols = data.get("symbols")
+
+    if not psid:
+        return jsonify({"error": "portfolio_string_id required"}), 400
+
+    conn = get_db(market)
+    try:
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name=?")
+            params.append(name)
+        if entry_date is not None:
+            updates.append("entry_date=?")
+            params.append(entry_date)
+        if entry_price is not None:
+            updates.append("entry_price=?")
+            params.append(entry_price)
+        if exit_date is not None:
+            updates.append("exit_date=?")
+            params.append(exit_date)
+        if exit_price is not None:
+            updates.append("exit_price=?")
+            params.append(exit_price)
+        if status is not None:
+            updates.append("status=?")
+            params.append(status)
+        # Recalculate realised_pnl if entry_price or exit_price changed
+        if entry_price is not None or exit_price is not None:
+            row = conn.execute("SELECT entry_price, exit_price, status FROM portfolio_strings WHERE id=?", (psid,)).fetchone()
+            if row:
+                ep_val = float(entry_price) if entry_price is not None else float(row["entry_price"] or 0)
+                xp_val = float(exit_price) if exit_price is not None else float(row["exit_price"] or 0)
+                st_val = status if status is not None else row["status"]
+                if st_val == "closed" and ep_val and xp_val:
+                    updates.append("realised_pnl=?")
+                    params.append(xp_val - ep_val)
+        if updates:
+            params.append(psid)
+            conn.execute(f"UPDATE portfolio_strings SET {','.join(updates)} WHERE id=?", params)
+        if symbols is not None:
+            conn.execute("DELETE FROM portfolio_string_symbols WHERE portfolio_string_id=?", (psid,))
+            for s in symbols:
+                sym = s.get("symbol", "").upper()
+                qty = s.get("qty", 0)
+                weight = s.get("weight", 1.0)
+                frac_allowed = 1 if s.get("fractional_allowed", False) else 0
+                if sym:
+                    conn.execute(
+                        """INSERT INTO portfolio_string_symbols
+                           (portfolio_string_id, symbol, qty, weight, fractional_allowed)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (psid, sym, qty, weight, frac_allowed)
+                    )
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/edit", methods=["POST"])
+def api_portfolio_edit(pid):
+    data = request.json
+    market = data.get("market", "US")
+    name = data.get("name")
+    conn = get_db(market)
+    try:
+        if name is not None:
+            conn.execute("UPDATE portfolios SET name=? WHERE id=?", (name, pid))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/reorder", methods=["POST"])
+def api_portfolio_reorder(pid):
+    data = request.json
+    market = data.get("market", "US")
+    order = data.get("order", [])
+    conn = get_db(market)
+    try:
+        for i, psid in enumerate(order):
+            conn.execute("UPDATE portfolio_strings SET sort_order=? WHERE id=? AND portfolio_id=?", (i, psid, pid))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/minichart")
+def api_portfolio_minichart(pid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 30))
+    ohlc = _portfolio_ohlc(pid, market, limit=limit)
+    return jsonify(ohlc)
+
+
+@api_bp.route("/portfolio/string/<int:psid>/minichart")
+def api_portfolio_string_minichart(psid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 30))
+    ohlc = _string_ohlc(psid, market, limit=limit)
+    return jsonify(ohlc)
+
+
+@api_bp.route("/portfolio/seed", methods=["POST"])
+def api_portfolio_seed():
+    data = request.json
+    market = data.get("market", "US")
+    conn = get_db(market)
+    try:
+        existing = conn.execute("SELECT COUNT(*) FROM portfolios").fetchone()[0]
+        if existing > 0:
+            return jsonify({"ok": True, "msg": "Already seeded"})
+
+        samples = [
+            {"name": "Tech Growth", "strings": [
+                {"name": "FAANG Long", "symbols": [{"symbol": "META", "qty": 10}, {"symbol": "AAPL", "qty": 10}, {"symbol": "NFLX", "qty": 5}, {"symbol": "AMZN", "qty": 8}, {"symbol": "GOOGL", "qty": 7}]},
+                {"name": "AI Bets", "symbols": [{"symbol": "NVDA", "qty": 15}, {"symbol": "MSFT", "qty": 10}, {"symbol": "PLTR", "qty": 20}]},
+            ]},
+            {"name": "Dividend Income", "strings": [
+                {"name": "High Yield", "symbols": [{"symbol": "T", "qty": 50}, {"symbol": "VZ", "qty": 40}, {"symbol": "KO", "qty": 30}]},
+                {"name": "REIT Play", "symbols": [{"symbol": "O", "qty": 25}, {"symbol": "AGNC", "qty": 40}]},
+            ]},
+            {"name": "Momentum Play", "strings": [
+                {"name": "Breakout Pack", "symbols": [{"symbol": "TSLA", "qty": 8}, {"symbol": "AMD", "qty": 12}, {"symbol": "COIN", "qty": 10}]},
+            ]},
+        ]
+
+        from datetime import date
+        today = date.today().isoformat()
+
+        for port in samples:
+            cur = conn.execute("INSERT INTO portfolios (name) VALUES (?)", (port["name"],))
+            pid = cur.lastrowid
+            for i, string in enumerate(port["strings"]):
+                syms = string["symbols"]
+                total_cost = 0
+                total_shares = 0
+                for s in syms:
+                    row = conn.execute("SELECT price FROM stats WHERE symbol=?", (s["symbol"],)).fetchone()
+                    price = float(row[0]) if row and row[0] else 100.0
+                    total_cost += price * s["qty"]
+                    total_shares += s["qty"]
+                scur = conn.execute(
+                    "INSERT INTO portfolio_strings (portfolio_id, name, entry_date, entry_price, status, sort_order) VALUES (?,?,?,?,?,?)",
+                    (pid, string["name"], today, round(total_cost, 2), "running", i)
+                )
+                psid = scur.lastrowid
+                for s in syms:
+                    conn.execute(
+                        "INSERT INTO portfolio_string_symbols (portfolio_string_id, symbol, qty, weight, fractional_allowed) VALUES (?,?,?,?,?)",
+                        (psid, s["symbol"], s["qty"], 1.0, 0)
+                    )
+        conn.commit()
+        return jsonify({"ok": True, "msg": "Seeded 3 portfolios"})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/<int:psid>", methods=["DELETE"])
+def api_portfolio_string_delete(psid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        conn.execute("DELETE FROM portfolio_string_symbols WHERE portfolio_string_id=?", (psid,))
+        conn.execute("DELETE FROM portfolio_strings WHERE id=?", (psid,))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/<int:pid>/strings")
+def api_portfolio_strings_list(pid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        strings = conn.execute(
+            "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY created_at DESC", (pid,)
+        ).fetchall()
+        result = []
+        for s in strings:
+            d = dict(s)
+            syms = conn.execute(
+                "SELECT symbol, qty, weight, fractional_allowed FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+                (s["id"],)
+            ).fetchall()
+            d["symbols"] = [dict(x) for x in syms]
+
+            if d["symbols"]:
+                placeholders = ",".join(["?"] * len(d["symbols"]))
+                sym_list = [x["symbol"] for x in d["symbols"]]
+                stats_rows = conn.execute(
+                    f"SELECT symbol, price, change_pct, weighted_alpha FROM stats WHERE symbol IN ({placeholders})",
+                    sym_list
+                ).fetchall()
+                stats_map = {r["symbol"]: dict(r) for r in stats_rows}
+
+                entry_value = 0
+                current_value = 0
+                for x in d["symbols"]:
+                    st = stats_map.get(x["symbol"], {})
+                    price = float(st.get("price") or 0)
+                    current_value += float(x["qty"]) * price
+
+                if d.get("entry_price"):
+                    entry_value = float(d["entry_price"])
+                    if d.get("status") == "closed" and d.get("exit_price"):
+                        exit_value = float(d["exit_price"])
+                        d["realised_pnl"] = exit_value - entry_value
+                        d["unrealised_pnl"] = 0
+                    else:
+                        d["realised_pnl"] = 0
+                        d["unrealised_pnl"] = current_value - entry_value
+                else:
+                    d["realised_pnl"] = 0
+                    d["unrealised_pnl"] = 0
+
+                d["total_value"] = current_value
+                d["num_stocks"] = len(d["symbols"])
+            else:
+                d["total_value"] = 0
+                d["num_stocks"] = 0
+                d["realised_pnl"] = 0
+                d["unrealised_pnl"] = 0
+
+            result.append(d)
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/<int:psid>/detail")
+def api_portfolio_string_detail(psid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        s = conn.execute("SELECT * FROM portfolio_strings WHERE id=?", (psid,)).fetchone()
+        if not s:
+            return jsonify({"error": "String not found"}), 404
+        d = dict(s)
+        syms = conn.execute(
+            "SELECT symbol, qty, weight, fractional_allowed FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+            (psid,)
+        ).fetchall()
+        d["symbols"] = [dict(x) for x in syms]
+
+        if d["symbols"]:
+            placeholders = ",".join(["?"] * len(d["symbols"]))
+            sym_list = [x["symbol"] for x in d["symbols"]]
+            stats_rows = conn.execute(
+                f"""SELECT symbol, name, price, change_pct, volume, weighted_alpha,
+                    atr_signal, atr_stop, atr_value, atr_streak, atr_multiplier,
+                    streak, prob_up_1d, prob_up_5d, atrp, confluence,
+                    accel_a, accel_base, accel_signal, accel_crossed_up, accel_crossed_down
+                    FROM stats WHERE symbol IN ({placeholders})""",
+                sym_list
+            ).fetchall()
+            stats_map = {r["symbol"]: dict(r) for r in stats_rows}
+
+            for x in d["symbols"]:
+                st = stats_map.get(x["symbol"], {})
+                x["name"] = st.get("name", x["symbol"])
+                x["price"] = float(st.get("price") or 0)
+                x["change_pct"] = float(st.get("change_pct") or 0)
+                x["weighted_alpha"] = float(st.get("weighted_alpha") or 0)
+                x["atr_signal"] = int(st.get("atr_signal") or 0)
+                x["streak"] = int(st.get("streak") or 0)
+                x["prob_up_1d"] = float(st.get("prob_up_1d") or 0)
+                x["atrp"] = float(st.get("atrp") or 0)
+                x["volume"] = float(st.get("volume") or 0)
+                x["current_price"] = x["price"]
+
+            current_value = sum(x["price"] * float(x["qty"]) for x in d["symbols"] if x["price"] > 0)
+            d["total_value"] = current_value
+            d["current_value"] = current_value
+            d["entry_value"] = float(d["entry_price"]) if d.get("entry_price") else 0
+
+            total_weight = sum(float(x["price"]) * float(x["qty"]) for x in d["symbols"] if x["price"] > 0)
+            if total_weight > 0:
+                d["prob_1up"] = round(sum(x["prob_up_1d"] * float(x["price"]) * float(x["qty"]) for x in d["symbols"] if x["price"] > 0) / total_weight, 4)
+                d["change_pct"] = round(sum(x["change_pct"] * float(x["price"]) * float(x["qty"]) for x in d["symbols"] if x["price"] > 0) / total_weight, 4)
+            else:
+                d["prob_1up"] = 0
+                d["change_pct"] = 0
+
+            if d.get("entry_price"):
+                entry_total = float(d["entry_price"])
+                total_qty = sum(float(x["qty"]) for x in d["symbols"]) or 1
+                per_share_entry = entry_total / total_qty
+                for x in d["symbols"]:
+                    x["entry_price"] = per_share_entry
+                    x["pnl"] = (x["price"] - per_share_entry) * float(x["qty"])
+                    x["pnl_pct"] = ((x["price"] - per_share_entry) / per_share_entry * 100) if per_share_entry > 0 else 0
+                if d.get("status") == "closed" and d.get("exit_price"):
+                    exit_total = float(d["exit_price"])
+                    d["realised_pnl"] = exit_total - entry_total
+                    d["unrealised_pnl"] = 0
+                else:
+                    d["realised_pnl"] = 0
+                    d["unrealised_pnl"] = current_value - entry_total
+                d["pnl_pct"] = ((current_value / entry_total - 1) * 100) if entry_total > 0 else 0
+            else:
+                d["realised_pnl"] = 0
+                d["unrealised_pnl"] = 0
+                d["pnl_pct"] = 0
+                for x in d["symbols"]:
+                    x["entry_price"] = 0
+        else:
+            d["total_value"] = 0
+            d["realised_pnl"] = 0
+            d["unrealised_pnl"] = 0
+
+        return jsonify(d)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/<int:psid>/ohlc")
+def api_portfolio_string_ohlc(psid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1D")
+    result = _string_ohlc(psid, market, limit, timeframe)
+    return jsonify(result)
+
+
+def _string_ohlc(psid, market, limit=500, timeframe="1D"):
+    conn = get_db(market)
+    try:
+        syms = conn.execute(
+            "SELECT symbol, qty, weight FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+            (psid,)
+        ).fetchall()
+        if not syms:
+            return []
+
+        valid_syms = []
+        for s in syms:
+            latest = conn.execute(
+                "SELECT close FROM bars WHERE symbol=? ORDER BY date DESC LIMIT 1",
+                (s["symbol"],)
+            ).fetchone()
+            if latest and float(latest["close"] or 0) > 0:
+                valid_syms.append(s)
+        if not valid_syms:
+            return []
+
+        all_bars = {}
+        for s in valid_syms:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close, volume FROM bars WHERE symbol=? ORDER BY date",
+                (s["symbol"],)
+            ).fetchall()
+            for r in rows:
+                dt = r["date"]
+                if dt not in all_bars:
+                    all_bars[dt] = {"time": dt, "open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}
+                qty = float(s["qty"])
+                all_bars[dt]["open"] += qty * float(r["open"])
+                all_bars[dt]["high"] += qty * float(r["high"])
+                all_bars[dt]["low"] += qty * float(r["low"])
+                all_bars[dt]["close"] += qty * float(r["close"])
+                all_bars[dt]["volume"] += int(r["volume"])
+
+        result = []
+        for dt in sorted(all_bars.keys()):
+            b = all_bars[dt]
+            result.append({
+                "time": b["time"],
+                "open": round(b["open"], 2),
+                "high": round(b["high"], 2),
+                "low": round(b["low"], 2),
+                "close": round(b["close"], 2),
+                "volume": b["volume"]
+            })
+        if timeframe not in ("1D", "daily", None) and result:
+            import pandas as pd
+            df = pd.DataFrame(result)
+            df["time"] = pd.to_datetime(df["time"])
+            df = df.set_index("time")
+            rule = {"1W": "W", "1M": "ME"}.get(timeframe, "W")
+            agg = df.resample(rule).agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["open"])
+            agg["time"] = agg.index.strftime("%Y-%m-%d")
+            result = [{"time": row["time"], "open": round(row["open"], 2), "high": round(row["high"], 2), "low": round(row["low"], 2), "close": round(row["close"], 2), "volume": int(row["volume"])} for _, row in agg.iterrows()]
+        return result[-limit:]
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/<int:psid>/supertrend")
+def api_portfolio_string_supertrend(psid):
+    market = request.args.get("market", "US")
+    period = int(request.args.get("period", 14))
+    multiplier = float(request.args.get("multiplier", 1.0))
+    limit = int(request.args.get("limit", 500))
+
+    ohlc = _string_ohlc(psid, market, limit=500, timeframe="1D")
+    if not ohlc:
+        return jsonify({"daily": [], "weekly": [], "monthly": []})
+
+    import pandas as pd
+    from dumbmoney.indicators import atr_trailing_stop
+    from dumbmoney.indicators import compute_rolling_atr_batch
+
+    df = pd.DataFrame(ohlc)
+    df["open"] = pd.to_numeric(df["open"])
+    df["high"] = pd.to_numeric(df["high"])
+    df["low"] = pd.to_numeric(df["low"])
+    df["close"] = pd.to_numeric(df["close"])
+
+    # Daily ATR Trailing Stop
+    st = atr_trailing_stop(df, period=period, multiplier=multiplier)
+    st["time"] = df["time"].values
+    daily_result = []
+    for _, row in st.iterrows():
+        daily_result.append({
+            "time": row["time"],
+            "value": round(float(row["supertrend"]), 2) if pd.notna(row["supertrend"]) else None,
+            "signal": int(row["signal"]),
+            "atr_value": round(float(row["atr_value"]), 4) if pd.notna(row.get("atr_value")) else None,
+        })
+
+    # Anchored rolling weekly (5 sessions) - batch computation
+    weekly_result = []
+    if len(df) >= 7:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            wt, ws, wv, wsk, wca, wcb, wbl, wab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 5, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if wt[i] != 0 or ws[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    weekly_result.append({
+                        "time": key,
+                        "value": round(float(ws[i]), 2) if ws[i] else None,
+                        "signal": int(wt[i]),
+                        "atr_value": round(float(wv[i]), 4) if wv[i] else None,
+                    })
+        except Exception:
+            pass
+
+    # Anchored rolling monthly (22 sessions) - batch computation
+    monthly_result = []
+    if len(df) >= 24:
+        try:
+            dates_arr = df["time"].values
+            opens_arr = df["open"].astype(float).values
+            highs_arr = df["high"].astype(float).values
+            lows_arr = df["low"].astype(float).values
+            closes_arr = df["close"].astype(float).values
+            mt, ms, mv, msk, mca, mcb, mbl, mab = compute_rolling_atr_batch(
+                dates_arr, opens_arr, highs_arr, lows_arr, closes_arr, 22, period, multiplier
+            )
+            for i in range(len(dates_arr)):
+                if mt[i] != 0 or ms[i] != 0:
+                    key = str(dates_arr[i])[:10]
+                    monthly_result.append({
+                        "time": key,
+                        "value": round(float(ms[i]), 2) if ms[i] else None,
+                        "signal": int(mt[i]),
+                        "atr_value": round(float(mv[i]), 4) if mv[i] else None,
+                    })
+        except Exception:
+            pass
+
+    return jsonify({"daily": daily_result[-limit:], "weekly": weekly_result[-limit:], "monthly": monthly_result[-limit:]})
+
+
+@api_bp.route("/portfolio/string/<int:psid>/accel")
+def api_portfolio_string_accel(psid):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1D")
+
+    ohlc = _string_ohlc(psid, market, limit=500, timeframe=timeframe)
+    if not ohlc:
+        return jsonify([])
+
+    import pandas as pd
+    from dumbmoney.indicators import accel
+
+    df = pd.DataFrame(ohlc)
+    df["open"] = pd.to_numeric(df["open"])
+    df["high"] = pd.to_numeric(df["high"])
+    df["low"] = pd.to_numeric(df["low"])
+    df["close"] = pd.to_numeric(df["close"])
+
+    acc = accel(df)
+    acc["time"] = df["time"].values
+    result = []
+    for _, row in acc.iterrows():
+        result.append({
+            "time": row["time"],
+            "accel_a": round(float(row.get("accel_a", 0)), 4),
+            "accel_base": round(float(row.get("accel_base", 0)), 4),
+            "crossed_up": int(row.get("accel_crossed_up", 0)),
+            "crossed_down": int(row.get("accel_crossed_down", 0))
+        })
+    return jsonify(result[-limit:])
+
+
+@api_bp.route("/portfolio/string/<int:psid>/stats")
+def api_portfolio_string_stats(psid):
+    market = request.args.get("market", "US")
+    ohlc = _string_ohlc(psid, market, limit=500)
+    if not ohlc or len(ohlc) < 2:
+        return jsonify({})
+
+    import numpy as np
+    closes = np.array([float(b["close"]) for b in ohlc])
+    returns = np.diff(closes) / closes[:-1]
+    returns = returns[~np.isnan(returns)]
+
+    if len(returns) == 0:
+        return jsonify({})
+
+    total_days = len(closes)
+    win_days = int(np.sum(returns > 0))
+    loss_days = int(np.sum(returns < 0))
+    win_rate = round(win_days / len(returns) * 100, 1) if len(returns) > 0 else 0
+
+    avg_ret = float(np.mean(returns))
+    std_ret = float(np.std(returns))
+    sharpe = round(avg_ret / std_ret * np.sqrt(252), 3) if std_ret > 0 else 0
+
+    neg_returns = returns[returns < 0]
+    sortino = round(avg_ret / float(np.std(neg_returns)) * np.sqrt(252), 3) if len(neg_returns) > 0 and float(np.std(neg_returns)) > 0 else 0
+
+    cum = np.cumprod(1 + returns)
+    peak = np.maximum.accumulate(cum)
+    dd = (peak - cum) / peak
+    max_dd = round(float(np.max(dd)) * 100, 1) if len(dd) > 0 else 0
+
+    annual_return = round(float((closes[-1] / closes[0]) ** (252 / total_days) - 1) * 100, 1) if total_days > 1 and closes[0] > 0 else 0
+
+    gains = returns[returns > 0]
+    losses = returns[returns < 0]
+    avg_win = round(float(np.mean(gains)) * 100, 2) if len(gains) > 0 else 0
+    avg_loss = round(float(np.mean(losses)) * 100, 2) if len(losses) > 0 else 0
+
+    profit_factor = round(float(np.sum(gains) / abs(np.sum(losses))), 2) if len(losses) > 0 and np.sum(losses) != 0 else 0
+
+    max_streak_wins = 0
+    max_streak_losses = 0
+    streak = 0
+    for r in returns:
+        if r > 0:
+            streak = streak + 1 if streak > 0 else 1
+            max_streak_wins = max(max_streak_wins, streak)
+        elif r < 0:
+            streak = streak - 1 if streak < 0 else -1
+            max_streak_losses = max(max_streak_losses, abs(streak))
+        else:
+            streak = 0
+
+    volatility = round(std_ret * np.sqrt(252) * 100, 1)
+
+    return jsonify({
+        "total_days": total_days,
+        "win_rate": win_rate,
+        "avg_1d_return": round(avg_ret * 100, 3),
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_dd,
+        "annual_return": annual_return,
+        "profit_factor": profit_factor,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "best_day": round(float(np.max(returns)) * 100, 2),
+        "worst_day": round(float(np.min(returns)) * 100, 2),
+        "max_streak_wins": max_streak_wins,
+        "max_streak_losses": max_streak_losses,
+        "volatility": volatility,
+        "total_return": round(float((closes[-1] / closes[0] - 1) * 100), 2) if closes[0] > 0 else 0
+    })
+
+
+@api_bp.route("/portfolio/<int:pid>/detail")
+def api_portfolio_full_detail(pid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        port = conn.execute("SELECT * FROM portfolios WHERE id=?", (pid,)).fetchone()
+        if not port:
+            return jsonify({"error": "Portfolio not found"}), 404
+        pd_ = dict(port)
+
+        strings = conn.execute(
+            "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY status='running' DESC, created_at DESC", (pid,)
+        ).fetchall()
+        pd_["strings"] = []
+        booked_profit = 0
+        running_value = 0
+        running_invested = 0
+        running_unrealised = 0
+        running_prob_num = 0
+        running_prob_den = 0
+        running_chg_num = 0
+        closed_count = 0
+        running_count = 0
+        win_count = 0
+        total_return_pct_list = []
+
+        for s in strings:
+            sd = dict(s)
+            syms = conn.execute(
+                "SELECT symbol, qty, weight FROM portfolio_string_symbols WHERE portfolio_string_id=?",
+                (s["id"],)
+            ).fetchall()
+            sd["num_stocks"] = len(syms)
+            is_running = sd.get("status") != "closed"
+
+            if syms:
+                placeholders = ",".join(["?"] * len(syms))
+                sym_list = [x["symbol"] for x in syms]
+                stats_rows = conn.execute(
+                    f"SELECT symbol, price, prob_up_1d, change_pct FROM stats WHERE symbol IN ({placeholders})", sym_list
+                ).fetchall()
+                stats_map = {r["symbol"]: dict(r) for r in stats_rows}
+
+                sv = sum(stats_map.get(x["symbol"], {}).get("price", 0) * float(x["qty"]) for x in syms)
+                sd["current_value"] = sv
+                sd["total_value"] = sv
+
+                # Day change weighted average
+                total_weight = sum(stats_map.get(x["symbol"], {}).get("price", 0) * float(x["qty"]) for x in syms if stats_map.get(x["symbol"], {}).get("price", 0) > 0)
+                if total_weight > 0:
+                    sd["prob_1up"] = round(sum(stats_map.get(x["symbol"], {}).get("prob_up_1d", 0) * stats_map.get(x["symbol"], {}).get("price", 0) * float(x["qty"]) for x in syms if stats_map.get(x["symbol"], {}).get("price", 0) > 0) / total_weight, 4)
+                    sd["change_pct"] = round(sum(stats_map.get(x["symbol"], {}).get("change_pct", 0) * stats_map.get(x["symbol"], {}).get("price", 0) * float(x["qty"]) for x in syms if stats_map.get(x["symbol"], {}).get("price", 0) > 0) / total_weight, 4)
+                else:
+                    sd["prob_1up"] = 0
+                    sd["change_pct"] = 0
+
+                entry_total = float(sd.get("entry_price") or 0)
+                sd["entry_value"] = entry_total
+
+                if is_running:
+                    # Running string: unrealised P&L
+                    sd["realised_pnl"] = 0
+                    sd["unrealised_pnl"] = sv - entry_total if entry_total else 0
+                    sd["pnl_pct"] = ((sv / entry_total - 1) * 100) if entry_total > 0 else 0
+                    running_value += sv
+                    running_invested += entry_total
+                    running_unrealised += sd["unrealised_pnl"]
+                    running_count += 1
+                    if total_weight > 0:
+                        running_prob_num += sd["prob_1up"] * sv
+                        running_prob_den += sv
+                        running_chg_num += sd["change_pct"] * sv
+                else:
+                    # Closed string: booked P&L from stored realised_pnl
+                    rp_raw = sd.get("realised_pnl")
+                    if rp_raw is None or str(rp_raw) in ('None', 'null', ''):
+                        xp = float(sd.get("exit_price") or 0)
+                        rp = xp - entry_total
+                        sd["realised_pnl"] = rp
+                    else:
+                        rp = float(rp_raw)
+                    sd["unrealised_pnl"] = 0
+                    sd["pnl_pct"] = ((float(sd.get("exit_price") or 0) / entry_total - 1) * 100) if entry_total > 0 else 0
+                    booked_profit += rp
+                    closed_count += 1
+                    if rp > 0:
+                        win_count += 1
+                    if entry_total > 0:
+                        total_return_pct_list.append((float(sd.get("exit_price") or 0) / entry_total - 1) * 100)
+            else:
+                sd["total_value"] = 0
+                sd["current_value"] = 0
+                sd["realised_pnl"] = 0
+                sd["unrealised_pnl"] = 0
+                sd["entry_value"] = 0
+                sd["pnl_pct"] = 0
+
+            pd_["strings"].append(sd)
+
+        # Broker-style totals
+        total_value = running_value + booked_profit
+        pd_["total_value"] = round(total_value, 2)
+        pd_["booked_profit"] = round(booked_profit, 2)
+        pd_["running_value"] = round(running_value, 2)
+        pd_["running_invested"] = round(running_invested, 2)
+        pd_["total_unrealised_pnl"] = round(running_unrealised, 2)
+        pd_["total_realised_pnl"] = round(booked_profit, 2)
+        pd_["total_pnl"] = round(booked_profit + running_unrealised, 2)
+        pd_["num_strings"] = len(strings)
+        pd_["running_strings"] = running_count
+        pd_["closed_strings"] = closed_count
+
+        # Total invested = only running strings
+        pd_["total_invested"] = round(running_invested, 2)
+
+        # Prob(Up) weighted by running string values
+        pd_["prob_1up"] = round(running_prob_num / running_prob_den, 4) if running_prob_den > 0 else 0
+
+        # Day change weighted by running string values only
+        pd_["change_pct"] = round(running_chg_num / running_prob_den, 4) if running_prob_den > 0 else 0
+        pd_["day_change"] = round((running_value * pd_["change_pct"] / 100) if pd_["change_pct"] else 0, 2)
+
+        # Win rate
+        pd_["win_rate"] = round((win_count / closed_count * 100), 1) if closed_count > 0 else 0
+
+        # Trade stats
+        if total_return_pct_list:
+            import numpy as np
+            returns_arr = np.array(total_return_pct_list)
+            pd_["avg_return_pct"] = round(float(np.mean(returns_arr)), 2)
+            pd_["median_return_pct"] = round(float(np.median(returns_arr)), 2)
+            pd_["best_trade_pct"] = round(float(np.max(returns_arr)), 2)
+            pd_["worst_trade_pct"] = round(float(np.min(returns_arr)), 2)
+            # Sharpe (annualized, assuming monthly trades as rough estimate)
+            if len(returns_arr) > 1 and float(np.std(returns_arr)) > 0:
+                pd_["sharpe_ratio"] = round(float(np.mean(returns_arr) / np.std(returns_arr) * (12 ** 0.5)), 2)
+            else:
+                pd_["sharpe_ratio"] = 0
+        else:
+            pd_["avg_return_pct"] = 0
+            pd_["median_return_pct"] = 0
+            pd_["best_trade_pct"] = 0
+            pd_["worst_trade_pct"] = 0
+            pd_["sharpe_ratio"] = 0
+
+        return jsonify(pd_)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/portfolio/string/validate", methods=["POST"])
+def api_portfolio_string_validate():
+    data = request.json
+    market = data.get("market", "US")
+    raw = data.get("symbols", "")
+
+    parsed = []
+    for part in raw.replace("+", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "*" in part:
+            parts = part.split("*", 1)
+            sym = parts[0].strip().upper()
+            try:
+                qty = float(parts[1].strip())
+            except (ValueError, IndexError):
+                qty = 0
+            parsed.append({"symbol": sym, "qty": qty})
+        else:
+            sym = part.strip().upper()
+            if sym:
+                parsed.append({"symbol": sym, "qty": 0})
+
+    if not parsed:
+        return jsonify({"error": "No valid symbols parsed"}), 400
+
+    conn = get_db(market)
+    try:
+        found = []
+        not_found = []
+        for item in parsed:
+            row = conn.execute(
+                "SELECT symbol, name, price, change_pct, volume, weighted_alpha FROM stats WHERE symbol=?",
+                (item["symbol"],)
+            ).fetchone()
+            if row:
+                item["name"] = row["name"] or item["symbol"]
+                item["price"] = float(row["price"] or 0)
+                item["change_pct"] = float(row["change_pct"] or 0)
+                item["volume"] = float(row["volume"] or 0)
+                item["weighted_alpha"] = float(row["weighted_alpha"] or 0)
+                found.append(item)
+            else:
+                not_found.append(item["symbol"])
+
+        return jsonify({"found": found, "not_found": not_found})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/parse")
+def api_parse_string():
+    raw = request.args.get("raw", "")
+    symbols = [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
+    return jsonify({"symbols": symbols})
+
+
+@api_bp.route("/strings/generate", methods=["POST"])
+def api_generate_string():
+    data = request.json
+    market = data.get("market", "US")
+    name = data.get("name", "New String")
+    symbols = data.get("symbols", [])
+    raw_string = ",".join(symbols)
+
+    conn = get_db(market)
+    try:
+        conn.execute(
+            "INSERT INTO strings (name, raw_string) VALUES (?, ?)", (name, raw_string)
+        )
+        sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for sym in symbols:
+            conn.execute(
+                "INSERT INTO string_symbols (string_id, symbol) VALUES (?, ?)", (sid, sym)
+            )
+        conn.commit()
+        return jsonify({"id": sid, "name": name, "symbols": symbols})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/<int:sid>", methods=["DELETE"])
+def api_delete_string(sid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        conn.execute("DELETE FROM strings WHERE id=?", (sid,))
+        conn.execute("DELETE FROM string_symbols WHERE string_id=?", (sid,))
+        conn.commit()
+        return jsonify({"deleted": True})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/<int:sid>/detail")
+def api_string_detail_info(sid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        row = conn.execute("SELECT id, name FROM strings WHERE id=?", (sid,)).fetchone()
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        symbols = [r[0] for r in conn.execute(
+            "SELECT symbol FROM string_symbols WHERE string_id=?", (sid,)
+        ).fetchall()]
+        stats_rows = []
+        if symbols:
+            placeholders = ",".join("?" * len(symbols))
+            stats_rows = conn.execute(
+                f"SELECT symbol, price, change_pct, weighted_alpha FROM stats WHERE symbol IN ({placeholders})",
+                symbols
+            ).fetchall()
+        price = sum(r["price"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
+        chg = sum(r["change_pct"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
+        wa = sum(r["weighted_alpha"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
+        return jsonify({
+            "id": row["id"], "name": row["name"],
+            "price": round(price, 2), "change_pct": round(chg, 2),
+            "weighted_alpha": round(wa, 2), "num_stocks": len(symbols),
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/<int:sid>/ohlc")
+def api_string_ohlc(sid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        symbols = [r[0] for r in conn.execute(
+            "SELECT symbol FROM string_symbols WHERE string_id=?", (sid,)
+        ).fetchall()]
+        if not symbols:
+            return jsonify([])
+        combined = _combined_ohlc_for_symbols(conn, symbols)
+        if combined is None:
+            return jsonify([])
+        return jsonify(combined.to_dict("records") if not combined.empty else [])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/<int:sid>/supertrend")
+def api_string_supertrend(sid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        symbols = [r[0] for r in conn.execute(
+            "SELECT symbol FROM string_symbols WHERE string_id=?", (sid,)
+        ).fetchall()]
+        if not symbols:
+            return jsonify([])
+        combined = _combined_ohlc_for_symbols(conn, symbols)
+        if combined is None:
+            return jsonify([])
+        import pandas as pd
+        from dumbmoney.indicators import supertrend as compute_st
+        st = compute_st(combined)
+        result = []
+        for i, (_, row) in enumerate(st.iterrows()):
+            result.append({
+                "date": combined.iloc[i]["date"] if i < len(combined) else "",
+                "supertrend": round(float(row["supertrend"]), 4) if pd.notna(row["supertrend"]) else None,
+                "trend": int(row["trend"]),
+                "signal": int(row["signal"]),
+            })
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/strings/<int:sid>/accel")
+def api_string_accel(sid):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        symbols = [r[0] for r in conn.execute(
+            "SELECT symbol FROM string_symbols WHERE string_id=?", (sid,)
+        ).fetchall()]
+        combined = _combined_ohlc_for_symbols(conn, symbols)
+        return jsonify(_accel_payload(combined))
+    finally:
+        conn.close()
+
+
+@api_bp.route("/string-screener/strategies")
+def api_ss_strategies():
+    market = request.args.get("market", "US")
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    sort = request.args.get("sort", "sharpe_1d")
+    sort_dir = request.args.get("sort_dir", "desc")
+    search = request.args.get("search", "")
+    min_win = request.args.get("min_win", "")
+    min_prob = request.args.get("min_prob", "")
+    min_avg = request.args.get("min_avg", "")
+    min_entries = request.args.get("min_entries", "")
+    hide_random = request.args.get("hide_random", "") in ("1", "true", "yes")
+    from dumbmoney.string_screener import get_strategies
+    result = get_strategies(
+        market, page, per_page, sort, sort_dir, search,
+        min_win=min_win, min_prob=min_prob, min_avg=min_avg,
+        min_entries=min_entries, hide_random=hide_random,
+    )
+    return jsonify(result)
+
+
+@api_bp.route("/string-screener/strategy/<int:sid>/data")
+def api_ss_strategy_data(sid):
+    market = request.args.get("market", "US")
+    from dumbmoney.string_screener import get_strategy_detail
+    result = get_strategy_detail(sid, market)
+    return jsonify(result)
+
+
+@api_bp.route("/string-screener/strategy/<int:sid>/current")
+def api_ss_strategy_current(sid):
+    market = request.args.get("market", "US")
+    from dumbmoney.string_screener import get_current_basket
+    result = get_current_basket(sid, market)
+    return jsonify(result)
+
+
+@api_bp.route("/string-screener/backtest/run", methods=["POST"])
+def api_ss_backtest_run():
+    data = request.json if request.is_json else {}
+    market = (data or {}).get("market", "US")
+    from dumbmoney.string_screener import run_string_backtest
+    success = run_string_backtest(market)
+    return jsonify({"started": success})
+
+
+@api_bp.route("/string-screener/backtest/cancel", methods=["POST"])
+def api_ss_backtest_cancel():
+    from dumbmoney.string_screener import cancel_string_backtest
+    cancel_string_backtest()
+    return jsonify({"cancelled": True})
+
+
+@api_bp.route("/string-screener/backtest/status")
+def api_ss_backtest_status():
+    from dumbmoney.string_screener import get_ss_status
+    return jsonify(get_ss_status())
+
+
+@api_bp.route("/btst-dashboard")
+def api_btst_dashboard():
+    market = request.args.get("market", "US")
+    limit = min(int(request.args.get("limit", 25)), 100)
+    conn = get_db(market)
+    try:
+        stock_rows = conn.execute(
+            """
+            SELECT s.symbol, s.name, s.price, s.volume, s.change_pct, s.next_day_return,
+                   s.weighted_alpha, s.prob_up_1d, s.prob_up_5d, s.confluence,
+                   s.atr_signal, s.atr_crossed_above, s.atr_crossed_below, s.atr_streak,
+                   s.accel_signal, s.accel_crossed_up, s.accel_crossed_down, s.accel_streak,
+                   COALESCE(a.overall_score, 0) AS ai_overall_score,
+                   COALESCE(a.conclusion, 'HOLD') AS ai_conclusion,
+                   s.streak, s.exchange, s.asset_class
+            FROM stats s
+            LEFT JOIN ai_analysis a ON s.symbol = a.symbol
+            WHERE s.price > 0
+              AND COALESCE(s.volume, 0) >= 0
+              AND (s.asset_class IS NULL OR LOWER(COALESCE(s.asset_class,'')) = 'stock')
+            ORDER BY (
+                COALESCE(s.prob_up_1d, 0) * 0.30 +
+                COALESCE(s.confluence, 0) * 0.18 +
+                COALESCE(a.overall_score, 0) * 0.15 +
+                CAST(MIN(100, MAX(0, 50 + COALESCE(s.weighted_alpha, 0) / 2.0)) AS REAL) * 0.12 +
+                CAST(MIN(100, MAX(0, LOG(COALESCE(s.volume, 0) + 1) / LOG(10.0) * 100.0 / 7.0)) AS REAL) * 0.10 +
+                2.5 +
+                CASE COALESCE(s.atr_signal, 0) WHEN 1 THEN 8 WHEN -1 THEN -5 ELSE 0 END +
+                CASE COALESCE(s.accel_signal, 0) WHEN 1 THEN 7 WHEN -1 THEN -4 ELSE 0 END +
+                COALESCE(s.atr_crossed_above, 0) * 8 +
+                COALESCE(s.accel_crossed_up, 0) * 8 -
+                COALESCE(s.atr_crossed_below, 0) * 8 -
+                COALESCE(s.accel_crossed_down, 0) * 8
+            ) DESC
+            LIMIT ?
+            """,
+            (limit * 4,)
+        ).fetchall()
+
+        stock_picks = []
+        for row in stock_rows:
+            r = dict(row)
+            prob = float(r.get("prob_up_1d") or 0)
+            conf = float(r.get("confluence") or 0)
+            ai = float(r.get("ai_overall_score") or 0)
+            wa = float(r.get("weighted_alpha") or 0)
+            volume = max(float(r.get("volume") or 0), 0)
+            liquidity = min(np.log10(volume + 1) / 7 * 100, 100) if volume > 0 else 0
+            trend_bonus = 8 if r.get("atr_signal") == 1 else -5 if r.get("atr_signal") == -1 else 0
+            accel_bonus = 7 if r.get("accel_signal") == 1 else -4 if r.get("accel_signal") == -1 else 0
+            cross_bonus = 0
+            if r.get("atr_crossed_above"):
+                cross_bonus += 8
+            if r.get("accel_crossed_up"):
+                cross_bonus += 8
+            if r.get("atr_crossed_below"):
+                cross_bonus -= 8
+            if r.get("accel_crossed_down"):
+                cross_bonus -= 8
+            wa_score = max(0, min(100, 50 + wa / 2))
+            score = (
+                prob * 0.30 + conf * 0.18 + ai * 0.15 + wa_score * 0.12 +
+                liquidity * 0.10 + 50 * 0.05 + trend_bonus + accel_bonus + cross_bonus
+            )
+            r["btst_score"] = round(max(0, min(100, score)), 2)
+            r["why"] = []
+            if prob >= 55:
+                r["why"].append(f"P(Up) {prob:.1f}%")
+            if conf >= 60:
+                r["why"].append(f"Confluence {conf:.0f}")
+            if r.get("atr_crossed_above"):
+                r["why"].append("ST cross up")
+            elif r.get("atr_signal") == 1:
+                r["why"].append("ST up")
+            if r.get("accel_crossed_up"):
+                r["why"].append("Accel cross up")
+            elif r.get("accel_signal") == 1:
+                r["why"].append("Accel up")
+            if wa > 0:
+                r["why"].append(f"WA {wa:.1f}")
+            stock_picks.append(r)
+        stock_picks.sort(key=lambda x: x["btst_score"], reverse=True)
+
+        string_rows = conn.execute(
+            """
+            SELECT id, name, sharpe_1d, win_rate, avg_1d_return, prob_up_1d,
+                   prob_up_1pct, prob_up_2pct, prob_down_2pct, total_entries,
+                   current_count, current_symbols, sort_field, top_n, is_random
+            FROM ss_strategies
+            WHERE COALESCE(total_entries, 0) > 0 AND COALESCE(current_count, 0) > 0
+            ORDER BY prob_up_1d DESC, sharpe_1d DESC
+            LIMIT ?
+            """,
+            (limit * 4,),
+        ).fetchall()
+        string_picks = []
+        for row in string_rows:
+            r = dict(row)
+            prob = float(r.get("prob_up_1d") or 0)
+            sharpe = float(r.get("sharpe_1d") or 0)
+            avg = float(r.get("avg_1d_return") or 0)
+            wr = float(r.get("win_rate") or 0)
+            entries = float(r.get("total_entries") or 0)
+            sample_score = min(np.log10(entries + 1) / 3 * 100, 100)
+            score = prob * 0.35 + wr * 0.20 + max(0, min(100, 50 + avg * 10)) * 0.15 + max(0, min(100, 50 + sharpe * 25)) * 0.15 + sample_score * 0.15
+            r["btst_score"] = round(max(0, min(100, score)), 2)
+            r["symbols"] = [s for s in (r.get("current_symbols") or "").split(",") if s]
+            string_picks.append(r)
+        string_picks.sort(key=lambda x: x["btst_score"], reverse=True)
+
+        return jsonify({
+            "market": market,
+            "stocks": stock_picks[:limit],
+            "strings": string_picks[:limit],
+            "notes": {
+                "stocks": "Scores use current stats only: probability, confluence, AI, weighted alpha, SuperTrend, Accel, and liquidity.",
+                "strings": "String picks require generated ss_strategies from String Screener backtest; empty means run that backtest first."
+            }
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/ai-discovered")
+def api_ai_discovered():
+    market = request.args.get("market", "US")
+    from dumbmoney.ai_discovery import get_discovered_portfolios
+    return jsonify(get_discovered_portfolios(market))
+
+
+@api_bp.route("/ai-discovered/<int:pid>")
+def api_ai_discovered_detail(pid):
+    market = request.args.get("market", "US")
+    from dumbmoney.ai_discovery import get_discovered_detail
+    return jsonify(get_discovered_detail(pid, market))
+
+
+@api_bp.route("/ai-discovered/run", methods=["POST"])
+def api_ai_run():
+    market = request.json.get("market", "US") if request.is_json else "US"
+    from dumbmoney.ai_discovery import run_ai_discovery
+    success = run_ai_discovery(market)
+    return jsonify({"started": success})
+
+
+@api_bp.route("/ai-discovered/kill", methods=["POST"])
+def api_ai_kill():
+    from dumbmoney.ai_discovery import kill_ai_discovery
+    kill_ai_discovery()
+    return jsonify({"killed": True})
+
+
+@api_bp.route("/ai-discovered/status")
+def api_ai_status():
+    from dumbmoney.ai_discovery import get_ai_status
+    return jsonify(get_ai_status())
+
+
+@api_bp.route("/trigger-ai-analysis", methods=["POST"])
+def api_trigger_ai():
+    market = request.json.get("market", "US") if request.is_json else "US"
+    from dumbmoney.engine import vectorized_stats_pass
+    n = vectorized_stats_pass(market)
+    return jsonify({"updated": n})
+
+
+@api_bp.route("/paper/strategies")
+def api_paper_strategies():
+    market = request.args.get("market", "US")
+    from dumbmoney.paper_trading import get_paper_strategies
+    return jsonify(get_paper_strategies(market))
+
+
+@api_bp.route("/paper/strategies", methods=["POST"])
+def api_create_paper_strategy():
+    data = request.json
+    from dumbmoney.paper_trading import create_paper_strategy
+    sid = create_paper_strategy(
+        data["name"], data["rules"], data.get("num_stocks", 10),
+        data.get("allocation_type", "equal"), data.get("rebalance_time", "09:35"),
+        data.get("market", "US")
+    )
+    return jsonify({"id": sid})
+
+
+@api_bp.route("/paper/strategies/<int:sid>/activate", methods=["POST"])
+def api_activate_paper(sid):
+    market = request.json.get("market", "US") if request.is_json else "US"
+    from dumbmoney.paper_trading import activate_strategy
+    result = activate_strategy(sid, market)
+    return jsonify(result)
+
+
+@api_bp.route("/paper/strategies/<int:sid>/pause", methods=["POST"])
+def api_pause_paper(sid):
+    market = request.json.get("market", "US") if request.is_json else "US"
+    from dumbmoney.paper_trading import pause_strategy
+    pause_strategy(sid, market)
+    return jsonify({"paused": True})
+
+
+@api_bp.route("/paper/positions")
+def api_paper_positions():
+    from dumbmoney.paper_trading import get_paper_positions
+    return jsonify(get_paper_positions())
+
+
+@api_bp.route("/paper/trades")
+def api_paper_trades():
+    market = request.args.get("market", "US")
+    strategy_id = request.args.get("strategy_id")
+    from dumbmoney.paper_trading import get_paper_trades
+    return jsonify(get_paper_trades(strategy_id, market))
+
+
+@api_bp.route("/basket-screener")
+def api_basket_screener():
+    market = request.args.get("market", "US")
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    sort = request.args.get("sort", "weighted_alpha")
+    sort_dir = request.args.get("sort_dir") or request.args.get("order", "desc")
+    search = request.args.get("search", "")
+    exchange = request.args.get("exchange", "")
+    asset_type = request.args.get("asset_type", "")
+    date_cutoff = request.args.get("date_cutoff", "")
+    from dumbmoney.basket_screener import get_string_screener
+    result = get_string_screener(market, page, per_page, sort, sort_dir, search, exchange,
+                                 asset_type, date_cutoff, request.args, string_id_like="S%")
+    return jsonify(result)
+
+
+@api_bp.route("/basket-screener/columns")
+def api_basket_screener_columns():
+    from dumbmoney.basket_screener import STRING_COLUMN_REFERENCE
+    return jsonify({"columns": STRING_COLUMN_REFERENCE})
+
+
+@api_bp.route("/basket-screener/detail/<string_id>")
+def api_basket_screener_detail(string_id):
+    market = request.args.get("market", "US")
+    from dumbmoney.basket_screener import get_string_detail
+    detail = get_string_detail(string_id, market)
+    if detail is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(detail)
+
+
+def _basket_constituents(string_id, market):
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT symbol, weight FROM string_constituents WHERE string_id=?",
+            (string_id,)).fetchall()
+        return [(r[0], r[1]) for r in rows], conn
+    except Exception:
+        return [], conn
+
+
+@api_bp.route("/basket-screener/<string_id>/ohlc")
+def api_basket_ohlc(string_id):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 200))
+    timeframe = request.args.get("timeframe", "1D")
+    cons, conn = _basket_constituents(string_id, market)
+    try:
+        if not cons:
+            return jsonify([])
+        symbols = [c[0] for c in cons]
+        raw_weights = {c[0]: c[1] for c in cons}
+        all_data = {}
+        for sym in symbols:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close, volume FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+                (sym,)
+            ).fetchall()
+            if rows:
+                all_data[sym] = pd.DataFrame([dict(r) for r in rows])
+        if not all_data:
+            return jsonify([])
+        all_dates = set()
+        for df in all_data.values():
+            if "date" in df.columns:
+                all_dates.update(df["date"].tolist())
+            else:
+                all_dates.update(df.index.tolist())
+        all_dates = sorted(all_dates)
+        basket_raw = pd.DataFrame({"date": all_dates}).set_index("date")
+        for sym, df in all_data.items():
+            if "date" in df.columns:
+                df = df.set_index("date")
+            w = raw_weights.get(sym, 0)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    if col not in basket_raw.columns:
+                        basket_raw[col] = 0.0
+                    basket_raw[col] += df[col].reindex(basket_raw.index).ffill().fillna(0) * w
+        basket_raw["volume"] = 0
+        for sym, df in all_data.items():
+            if "date" in df.columns:
+                df = df.set_index("date")
+            if "volume" in df.columns:
+                basket_raw["volume"] += df["volume"].reindex(basket_raw.index).fillna(0).astype(int)
+        basket_raw = basket_raw.reset_index()
+        import numpy as np
+        close_arr = basket_raw["close"].values.astype(np.float64)
+        basket_min = np.nanmin(close_arr)
+        basket_range = np.nanmax(close_arr) - basket_min
+        if basket_range == 0:
+            basket_range = 1.0
+        norm = ((close_arr - basket_min) / basket_range) * 900.0 + 100.0
+        for col in ["open", "high", "low", "close"]:
+            raw = basket_raw[col].values.astype(np.float64)
+            basket_raw[col] = ((raw - basket_min) / basket_range) * 900.0 + 100.0
+        basket_raw = _resample_ohlc(basket_raw, timeframe)
+        basket_raw = basket_raw.tail(limit)
+        return jsonify([dict(r) for _, r in basket_raw.iterrows()])
+    finally:
+        conn.close()
+
+
+@api_bp.route("/basket-screener/<string_id>/supertrend")
+def api_basket_supertrend(string_id):
+    market = request.args.get("market", "US")
+    period = int(request.args.get("period", 14))
+    multiplier = float(request.args.get("multiplier", 1.0))
+    timeframe = request.args.get("timeframe", "1D")
+    cons, conn = _basket_constituents(string_id, market)
+    try:
+        if not cons:
+            return jsonify([])
+        symbols = [c[0] for c in cons]
+        raw_weights = {c[0]: c[1] for c in cons}
+        all_data = {}
+        for sym in symbols:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+                (sym,)
+            ).fetchall()
+            if rows:
+                all_data[sym] = pd.DataFrame([dict(r) for r in rows])
+        if not all_data:
+            return jsonify([])
+        all_dates = set()
+        for df in all_data.values():
+            if "date" in df.columns:
+                all_dates.update(df["date"].tolist())
+            else:
+                all_dates.update(df.index.tolist())
+        all_dates = sorted(all_dates)
+        basket_raw = pd.DataFrame({"date": all_dates}).set_index("date")
+        for sym, df in all_data.items():
+            if "date" in df.columns:
+                df = df.set_index("date")
+            w = raw_weights.get(sym, 0)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    if col not in basket_raw.columns:
+                        basket_raw[col] = 0.0
+                    basket_raw[col] += df[col].reindex(basket_raw.index).ffill().fillna(0) * w
+        basket_raw = basket_raw.reset_index()
+        import numpy as np
+        close_arr = basket_raw["close"].values.astype(np.float64)
+        basket_min = np.nanmin(close_arr)
+        basket_range = np.nanmax(close_arr) - basket_min
+        if basket_range == 0:
+            basket_range = 1.0
+        for col in ["open", "high", "low", "close"]:
+            raw = basket_raw[col].values.astype(np.float64)
+            basket_raw[col] = ((raw - basket_min) / basket_range) * 900.0 + 100.0
+        basket_raw = _resample_ohlc(basket_raw, timeframe)
+        from dumbmoney.indicators import supertrend as compute_st
+        st = compute_st(basket_raw, period=period, multiplier=multiplier)
+        result = []
+        for i, (_, row) in enumerate(st.iterrows()):
+            result.append({
+                "date": basket_raw.iloc[i]["date"] if i < len(basket_raw) else "",
+                "supertrend": round(float(row["supertrend"]), 4) if pd.notna(row["supertrend"]) else None,
+                "trend": int(row["trend"]),
+                "signal": int(row["signal"]),
+                "stop": round(float(row["stop"]), 4) if pd.notna(row["stop"]) else None,
+                "atr_value": round(float(row["atr_value"]), 4) if pd.notna(row["atr_value"]) else None,
+            })
+        return jsonify(result)
+    finally:
+        conn.close()
+
+
+@api_bp.route("/basket-screener/<string_id>/accel")
+def api_basket_accel(string_id):
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1D")
+    cons, conn = _basket_constituents(string_id, market)
+    try:
+        if not cons:
+            return jsonify([])
+        symbols = [c[0] for c in cons]
+        raw_weights = {c[0]: c[1] for c in cons}
+        all_data = {}
+        for sym in symbols:
+            rows = conn.execute(
+                "SELECT date, open, high, low, close FROM bars WHERE symbol=? AND timeframe='1Day' ORDER BY date",
+                (sym,)
+            ).fetchall()
+            if rows:
+                all_data[sym] = pd.DataFrame([dict(r) for r in rows])
+        if not all_data:
+            return jsonify([])
+        all_dates = set()
+        for df in all_data.values():
+            if "date" in df.columns:
+                all_dates.update(df["date"].tolist())
+            else:
+                all_dates.update(df.index.tolist())
+        all_dates = sorted(all_dates)
+        basket_raw = pd.DataFrame({"date": all_dates}).set_index("date")
+        for sym, df in all_data.items():
+            if "date" in df.columns:
+                df = df.set_index("date")
+            w = raw_weights.get(sym, 0)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    if col not in basket_raw.columns:
+                        basket_raw[col] = 0.0
+                    basket_raw[col] += df[col].reindex(basket_raw.index).ffill().fillna(0) * w
+        basket_raw = basket_raw.reset_index()
+        import numpy as np
+        close_arr = basket_raw["close"].values.astype(np.float64)
+        basket_min = np.nanmin(close_arr)
+        basket_range = np.nanmax(close_arr) - basket_min
+        if basket_range == 0:
+            basket_range = 1.0
+        for col in ["open", "high", "low", "close"]:
+            raw = basket_raw[col].values.astype(np.float64)
+            basket_raw[col] = ((raw - basket_min) / basket_range) * 900.0 + 100.0
+        basket_raw = _resample_ohlc(basket_raw, timeframe)
+        return jsonify(_accel_payload(basket_raw))
+    finally:
+        conn.close()
+
+
+@api_bp.route("/basket-screener/<string_id>/stats")
+def api_basket_stats(string_id):
+    market = request.args.get("market", "US")
+    cons, conn = _basket_constituents(string_id, market)
+    try:
+        if not cons:
+            return jsonify({})
+        symbols = [c[0] for c in cons]
+        weights = {c[0]: c[1] for c in cons}
+        wsum = sum(weights.values()) or 1.0
+        weights = {k: v / wsum for k, v in weights.items()}
+        ohlc_df = _combined_ohlc_for_symbols(conn, symbols, weights=weights)
+        if ohlc_df is None or ohlc_df.empty:
+            return jsonify({})
+        import pandas as pd
+        import numpy as np
+        c = ohlc_df["close"].astype(float)
+        returns = c.pct_change().dropna()
+        if len(returns) < 2:
+            return jsonify({})
+        wins = returns[returns > 0]
+        losses = returns[returns < 0]
+        win_rate = len(wins) / len(returns) * 100
+        avg_return = float(returns.mean()) * 100
+        avg_win = float(wins.mean()) * 100 if len(wins) > 0 else 0
+        avg_loss = float(losses.mean()) * 100 if len(losses) > 0 else 0
+        profit_factor = abs(float(wins.sum()) / float(losses.sum())) if len(losses) > 0 and losses.sum() != 0 else 0
+        sharpe = float(returns.mean() / (returns.std() + 1e-10)) * np.sqrt(252)
+        sortino_denom = returns[returns < 0].std()
+        sortino = float(returns.mean() / (sortino_denom + 1e-10)) * np.sqrt(252) if sortino_denom > 0 else 0
+        cum = (1 + returns).cumprod()
+        running_max = cum.cummax()
+        drawdown = np.where(running_max > 0, (cum - running_max) / running_max, 0)
+        max_dd = float(np.min(drawdown)) * 100
+        best = float(returns.max()) * 100
+        worst = float(returns.min()) * 100
+        streak_w, streak_l = 0, 0
+        max_streak_w, max_streak_l = 0, 0
+        for r in returns:
+            if r > 0:
+                streak_w += 1; streak_l = 0
+                max_streak_w = max(max_streak_w, streak_w)
+            elif r < 0:
+                streak_l += 1; streak_w = 0
+                max_streak_l = max(max_streak_l, streak_l)
+            else:
+                streak_w = 0; streak_l = 0
+        total_days = len(returns)
+        cum_total = float((1 + returns).prod())
+        if cum_total > 0:
+            ann_ret = float((cum_total ** (252 / max(total_days, 1)) - 1)) * 100
+        else:
+            ann_ret = -100.0
+        calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
+
+        volatility = float(returns.std()) * np.sqrt(252) * 100
+
+        def _trend_view(window):
+            if len(returns) < window:
+                return {"return": 0, "win_rate": 50, "signal": "neutral", "strength": 0}
+            w = returns.tail(window)
+            cum_ret = float(((1 + w).prod() - 1) * 100)
+            wr = float((w > 0).mean() * 100)
+            avg_r = float(w.mean()) * 100
+            vol = float(w.std()) * np.sqrt(252) * 100 if len(w) > 1 else 1
+            score = 0
+            if cum_ret > 2: score += 1
+            elif cum_ret < -2: score -= 1
+            if wr > 55: score += 1
+            elif wr < 45: score -= 1
+            if avg_r > 0.1: score += 1
+            elif avg_r < -0.1: score -= 1
+            signal = "BUY" if score >= 2 else ("SELL" if score <= -2 else "HOLD")
+            return {"return": round(cum_ret, 2), "win_rate": round(wr, 1), "signal": signal, "strength": abs(score)}
+
+        short = _trend_view(5)
+        medium = _trend_view(20)
+        long_v = _trend_view(60)
+
+        monthly = {}
+        if "date" in ohlc_df.columns:
+            ohlc_df["date"] = pd.to_datetime(ohlc_df["date"])
+            ohlc_df["month"] = ohlc_df["date"].dt.to_period("M")
+            monthly_rets = ohlc_df.groupby("month")["close"].apply(lambda x: float((x.iloc[-1]/x.iloc[0]-1)*100) if len(x)>1 else 0)
+            best_month = monthly_rets.idxmax()
+            worst_month = monthly_rets.idxmin()
+            pos_months = int((monthly_rets > 0).sum())
+            total_months = len(monthly_rets)
+        else:
+            best_month = worst_month = None
+            pos_months = total_months = 0
+
+        insights = []
+        if win_rate > 55: insights.append(f"Strong win rate of {win_rate:.1f}% — consistent edge.")
+        elif win_rate < 45: insights.append(f"Win rate {win_rate:.1f}% below 50 — needs strong winners.")
+        if sharpe > 1.5: insights.append(f"Excellent risk-adjusted return (Sharpe {sharpe:.2f}).")
+        elif sharpe < 0: insights.append(f"Negative Sharpe ({sharpe:.2f}) — risk exceeds return.")
+        if profit_factor > 1.5: insights.append(f"Profit factor {profit_factor:.2f} — wins outsize losses.")
+        if max_dd < -20: insights.append(f"Max drawdown {max_dd:.1f}% — high risk profile.")
+        if volatility > 40: insights.append(f"High annualized volatility ({volatility:.0f}%) — volatile basket.")
+        elif volatility < 15: insights.append(f"Low volatility ({volatility:.0f}%) — stable basket.")
+        if max_streak_w >= 5: insights.append(f"Best winning streak: {max_streak_w} consecutive days.")
+        if short["signal"] == "BUY" and medium["signal"] == "BUY":
+            insights.append("Aligned bullish across short and medium term.")
+        if short["signal"] == "SELL" and medium["signal"] == "SELL":
+            insights.append("Aligned bearish — caution advised.")
+
+        return jsonify({
+            "total_days": total_days,
+            "win_rate": round(win_rate, 2),
+            "avg_return": round(avg_return, 4),
+            "avg_win": round(avg_win, 4),
+            "avg_loss": round(avg_loss, 4),
+            "profit_factor": round(profit_factor, 2),
+            "sharpe": round(sharpe, 2),
+            "sortino": round(sortino, 2),
+            "max_drawdown": round(max_dd, 2),
+            "best_day": round(best, 2),
+            "worst_day": round(worst, 2),
+            "max_streak_wins": max_streak_w,
+            "max_streak_losses": max_streak_l,
+            "annual_return": round(ann_ret, 2),
+            "calmar": round(calmar, 2),
+            "volatility": round(volatility, 2),
+            "short_term": short,
+            "medium_term": medium,
+            "long_term": long_v,
+            "best_month": str(best_month) if best_month else None,
+            "worst_month": str(worst_month) if worst_month else None,
+            "positive_months": pos_months,
+            "total_months": total_months,
+            "insights": insights,
+        })
+    finally:
+        conn.close()
+
+
+import threading
+_BUILD_PROGRESS = {}
+_BUILD_LOCK = threading.Lock()
+
+def _update_progress(market, pct, stage, detail="", elapsed=0, total_dates=0, done_dates=0, rows=0):
+    _BUILD_PROGRESS[market] = {
+        "pct": pct, "stage": stage, "detail": detail,
+        "elapsed": round(elapsed, 1), "total_dates": total_dates,
+        "done_dates": done_dates, "rows": rows,
+        "eta": round((elapsed / max(done_dates, 1)) * (total_dates - done_dates), 1) if done_dates > 0 and total_dates > 0 else 0,
+    }
+
+
+@api_bp.route("/basket-screener/progress")
+def api_basket_progress():
+    market = request.args.get("market", "US")
+    return jsonify(_BUILD_PROGRESS.get(market, {"pct": 0, "stage": "idle", "detail": ""}))
+
+
+@api_bp.route("/basket-screener/generate", methods=["POST"])
+def api_basket_generate():
+    data = request.json or {}
+    market = data.get("market", "US")
+    with _BUILD_LOCK:
+        if _BUILD_PROGRESS.get(market, {}).get("stage") in ("universe", "cache", "metrics", "historical"):
+            return jsonify({"error": "Already running"}), 409
+
+    def _run():
+        import time as _time
+        t0 = _time.time()
+        try:
+            _update_progress(market, 0, "universe", "Generating string universe...")
+            from dumbmoney.basket_screener import generate_string_universe, compute_current_metrics, update_historical_string_screener, build_close_pivot_cache
+            n = generate_string_universe(market, n=25000, force=True)
+            _update_progress(market, 3, "cache", f"Universe ready: {n} strings. Building close pivot cache...", elapsed=_time.time()-t0)
+            build_close_pivot_cache(market)
+            _update_progress(market, 8, "metrics", "Cache built. Computing metrics...", elapsed=_time.time()-t0)
+            compute_current_metrics(market)
+            _update_progress(market, 12, "historical", "Metrics done. Building historical data...", elapsed=_time.time()-t0)
+
+            def _hist_progress(pct, detail):
+                elapsed = _time.time() - t0
+                done_d, total_d = 0, 0
+                if "dates" in detail:
+                    try:
+                        part = detail.split(":")[-1].strip().split(" ")[0]
+                        done_d, total_d = [int(x) for x in part.split("/")]
+                    except Exception:
+                        pass
+                _update_progress(market, 10 + pct * 0.9, "historical", detail,
+                                 elapsed=elapsed, total_dates=total_d, done_dates=done_d)
+
+            update_historical_string_screener(market, force_rebuild=True, progress_callback=_hist_progress)
+            _update_progress(market, 100, "done", f"Complete! {n} strings, historical built.", elapsed=_time.time()-t0)
+        except Exception as e:
+            _update_progress(market, 0, "error", str(e), elapsed=_time.time()-t0)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True, "market": market})
+
+
+@api_bp.route("/basket-screener/cache", methods=["POST"])
+def api_basket_cache():
+    data = request.json or {}
+    market = data.get("market", "US")
+    from dumbmoney.basket_screener import build_close_pivot_cache
+    syms, dates, matrix = build_close_pivot_cache(market)
+    return jsonify({"symbols": len(syms), "dates": len(dates), "shape": list(matrix.shape), "market": market})
+
+
+@api_bp.route("/basket-screener/build", methods=["POST"])
+def api_basket_build():
+    data = request.json or {}
+    market = data.get("market", "US")
+    n = int(data.get("n", 25000))
+    force = bool(data.get("force", False))
+    from dumbmoney.basket_screener import generate_string_universe, compute_current_metrics
+    generated = generate_string_universe(market, n=n, force=force)
+    compute_current_metrics(market)
+    return jsonify({"generated": generated, "market": market})
+
+
+@api_bp.route("/basket-screener/recompute", methods=["POST"])
+def api_basket_recompute():
+    data = request.json or {}
+    market = data.get("market", "US")
+    from dumbmoney.basket_screener import compute_current_metrics
+    n = compute_current_metrics(market)
+    return jsonify({"updated": n, "market": market})
+
+
+@api_bp.route("/basket-screener/historical", methods=["POST"])
+def api_basket_historical():
+    data = request.json or {}
+    market = data.get("market", "US")
+    force = bool(data.get("force", True))
+    date_limit = data.get("date_limit")
+    string_id_like = data.get("string_id_like")
+    from dumbmoney.basket_screener import update_historical_string_screener
+    rows = update_historical_string_screener(market, force_rebuild=force, date_limit=date_limit,
+                                              string_id_like=string_id_like)
+    return jsonify({"rows": rows, "market": market})
+
+
+@api_bp.route("/basket-screener/timeframe-returns")
+def api_basket_timeframe_returns():
+    """Compute 1W and 1M returns for basket strings from cached OHLC data."""
+    market = request.args.get("market", "US")
+    timeframe = request.args.get("timeframe", "1W")
+
+    conn = get_db(market)
+    try:
+        from dumbmoney.basket_screener import _load_composition, _load_close_pivot, _gather_einsum
+        sids, sym_list, indices, weights = _load_composition(market)
+        if not sids:
+            return jsonify({"returns": {}, "timeframe": timeframe})
+
+        _, dates, close = _load_close_pivot(market, sym_list)
+        if close.shape[1] == 0:
+            return jsonify({"returns": {}, "timeframe": timeframe})
+
+        V = _gather_einsum(close, indices, weights)
+        n_strings, n_dates = V.shape
+
+        if timeframe == "1W":
+            lookback = min(5, n_dates)
+        elif timeframe == "1M":
+            lookback = min(22, n_dates)
+        else:
+            lookback = min(1, n_dates)
+
+        returns = {}
+        for i, sid in enumerate(sids):
+            if n_dates >= lookback + 1:
+                cur = float(V[i, -1])
+                prev = float(V[i, -1 - lookback])
+                if prev > 0:
+                    returns[sid] = round((cur / prev - 1) * 100, 4)
+                else:
+                    returns[sid] = 0.0
+            else:
+                returns[sid] = 0.0
+
+        return jsonify({"returns": returns, "timeframe": timeframe, "strings": len(sids)})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/basket-screener/leaderboard")
+def api_basket_leaderboard():
+    market = request.args.get("market", "US")
+    sort_by = request.args.get("sort", "total_return")
+    top_n = min(int(request.args.get("top", 50)), 200)
+
+    conn = get_db(market)
+    try:
+        sort_map = {
+            "total_return": "weighted_alpha", "win_rate": "prob_up_1d", "sharpe": "confluence",
+            "avg_return": "change_pct", "best_day": "ai_matrix",
+        }
+        sql_sort = sort_map.get(sort_by, "weighted_alpha")
+
+        rows = conn.execute(f"""
+            SELECT m.string_id, m.name, m.price, m.change_pct, m.weighted_alpha,
+                   m.prob_up_1d, m.prob_up_5d, m.streak, m.confluence,
+                   m.ai_matrix, m.atr_signal, m.accel_signal, m.volume
+            FROM string_screener_metrics m
+            WHERE m.market = ? AND m.price > 0
+            ORDER BY m.{sql_sort} DESC
+            LIMIT ?
+        """, (market, top_n)).fetchall()
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM string_screener_metrics WHERE market=? AND price > 0", (market,)
+        ).fetchone()[0]
+
+        data = []
+        for r in rows:
+            prob = float(r[5]) if r[5] else 50
+            chg = float(r[3]) if r[3] else 0
+            wa = float(r[4]) if r[4] else 0
+            conf = float(r[8]) if r[8] else 50
+            ai = float(r[9]) if r[9] else 50
+            data.append({
+                "string_id": r[0], "expression": (r[1] or r[0])[:60], "n_dates": 0,
+                "win_rate": round(prob, 2), "avg_return": round(chg, 4),
+                "total_return": round(wa, 2), "sharpe": round(conf, 2),
+                "max_drawdown": 0, "best_day": round(chg, 2),
+                "worst_day": 0, "avg_ai": round(ai, 1),
+            })
+
+        return jsonify({"data": data, "total": total, "sort": sort_by, "market": market})
+    finally:
+        conn.close()
+
+
+@api_bp.route("/basket-screener/rebalance")
+def api_basket_rebalance():
+    market = request.args.get("market", "US")
+    string_id = request.args.get("string_id", "")
+    if not string_id:
+        return jsonify({"error": "string_id required"}), 400
+
+    conn = get_db(market)
+    try:
+        cons = conn.execute(
+            "SELECT sc.symbol, sc.weight FROM string_constituents sc "
+            "WHERE sc.string_id=?", (string_id,)
+        ).fetchall()
+        if not cons:
+            return jsonify({"error": "String not found"}), 404
+
+        symbols = [c[0] for c in cons]
+        total_weight = sum(c[1] for c in cons)
+        target_pct = {c[0]: (c[1] / total_weight * 100) if total_weight > 0 else 0 for c in cons}
+
+        placeholders = ",".join("?" * len(symbols))
+        stats_rows = conn.execute(
+            f"SELECT symbol, price, change_pct, weighted_alpha, atr_signal, "
+            f"prob_up_1d, atr_crossed_above, atr_crossed_below, accel_signal, "
+            f"accel_crossed_up, accel_crossed_down FROM stats "
+            f"WHERE symbol IN ({placeholders})", symbols
+        ).fetchall()
+        current = {r[0]: dict(r) for r in stats_rows}
+
+        recommendations = []
+        for sym, weight in cons:
+            cur = current.get(sym, {})
+            price = float(cur.get("price") or 0)
+            chg = float(cur.get("change_pct") or 0)
+            wa = float(cur.get("weighted_alpha") or 0)
+            atr = int(cur.get("atr_signal") or 0)
+            accel = int(cur.get("accel_signal") or 0)
+            prob = float(cur.get("prob_up_1d") or 50)
+            cross_up = bool(cur.get("atr_crossed_above"))
+            cross_down = bool(cur.get("atr_crossed_below"))
+            accel_up = bool(cur.get("accel_crossed_up"))
+            accel_down = bool(cur.get("accel_crossed_down"))
+
+            current_pct = target_pct.get(sym, 0)
+            action = "HOLD"
+            urgency = 0
+            reasons = []
+
+            if cross_down or accel_down:
+                action = "REDUCE"
+                urgency = 3
+                reasons.append("SuperTrend/Accel cross down")
+            elif atr == -1 and wa < 0:
+                action = "REDUCE"
+                urgency = 2
+                reasons.append("Bearish trend + negative WA")
+            elif prob < 40:
+                action = "REDUCE"
+                urgency = 1
+                reasons.append(f"Low probability ({prob:.0f}%)")
+            elif cross_up and accel_up:
+                action = "ADD"
+                urgency = 3
+                reasons.append("Both SuperTrend & Accel crossed up")
+            elif atr == 1 and accel == 1 and wa > 20:
+                action = "ADD"
+                urgency = 2
+                reasons.append("Strong uptrend + high WA")
+            elif prob > 60 and wa > 10:
+                action = "ADD"
+                urgency = 1
+                reasons.append(f"High probability ({prob:.0f}%) + positive WA")
+            else:
+                action = "HOLD"
+                reasons.append("No strong signal")
+
+            recommendations.append({
+                "symbol": sym, "weight": round(weight, 4),
+                "current_pct": round(current_pct, 2),
+                "price": price, "change_pct": round(chg, 2),
+                "weighted_alpha": round(wa, 2),
+                "atr_signal": atr, "accel_signal": accel,
+                "prob_up_1d": round(prob, 2),
+                "action": action, "urgency": urgency,
+                "reasons": reasons,
+            })
+
+        recommendations.sort(key=lambda x: x["urgency"], reverse=True)
+        adds = sum(1 for r in recommendations if r["action"] == "ADD")
+        reduces = sum(1 for r in recommendations if r["action"] == "REDUCE")
+        holds = sum(1 for r in recommendations if r["action"] == "HOLD")
+
+        return jsonify({
+            "string_id": string_id, "market": market,
+            "recommendations": recommendations,
+            "summary": {"adds": adds, "reduces": reduces, "holds": holds,
+                        "total_stocks": len(recommendations)},
+        })
+    finally:
+        conn.close()
+
+
+# Page routes for the basket string screener (parallel to stock screener).
+app.add_url_rule("/basket-screener/", "basket_screener_list",
+                 lambda: render_template("basket_screener.html", market="US"))
+app.add_url_rule("/india/basket-screener/", "india_basket_screener_list",
+                 lambda: render_template("basket_screener.html", market="INDIA"))
+app.add_url_rule("/basket-screener/string/<string_id>", "basket_string_detail",
+                 lambda string_id: render_template("string_detail_basket.html", string_id=string_id, market="US"))
+app.add_url_rule("/india/basket-screener/string/<string_id>", "india_basket_string_detail",
+                 lambda string_id: render_template("string_detail_basket.html", string_id=string_id, market="INDIA"))
+app.add_url_rule("/basket-screener/leaderboard", "basket_leaderboard",
+                 lambda: render_template("basket_leaderboard.html", market="US"))
+app.add_url_rule("/india/basket-screener/leaderboard", "india_basket_leaderboard",
+                 lambda: render_template("basket_leaderboard.html", market="INDIA"))
+
+app.add_url_rule("/long-short-screener/", "long_short_screener_list",
+                 lambda: render_template("basket_screener.html", market="US", long_short=True))
+app.add_url_rule("/long-short-screener/string/<string_id>", "long_short_string_detail",
+                 lambda string_id: render_template("string_detail_basket.html", string_id=string_id, market="US", long_short=True))
+
+
+@api_bp.route("/long-short-screener")
+def api_long_short_screener():
+    market = request.args.get("market", "US")
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    sort = request.args.get("sort", "weighted_alpha")
+    sort_dir = request.args.get("sort_dir") or request.args.get("order", "desc")
+    search = request.args.get("search", "")
+    exchange = request.args.get("exchange", "")
+    asset_type = request.args.get("asset_type", "")
+    date_cutoff = request.args.get("date_cutoff", "")
+    from dumbmoney.basket_screener import get_string_screener
+    result = get_string_screener(market, page, per_page, sort, sort_dir, search, exchange,
+                                 asset_type, date_cutoff, request.args, string_id_like="LS%")
+    return jsonify(result)
+
+
+@api_bp.route("/long-short-screener/generate", methods=["POST"])
+def api_long_short_generate():
+    data = request.json or {}
+    market = data.get("market", "US")
+    n = int(data.get("n", 100))
+    from dumbmoney.basket_screener import generate_long_short_strings, compute_current_metrics
+    count = generate_long_short_strings(market, n=n)
+    compute_current_metrics(market)
+    return jsonify({"generated": count, "market": market})
+
+
+# ── Leverage ETF Screener ─────────────────────────────────────────────────────
+
+_LEV_BUILD_PROGRESS = {}
+_LEV_BUILD_LOCK = threading.Lock()
+
+def _update_lev_progress(market, pct, stage, detail="", elapsed=0, total_dates=0, done_dates=0, rows=0):
+    _LEV_BUILD_PROGRESS[market] = {
+        "pct": round(pct, 1), "stage": stage, "detail": detail,
+        "elapsed": round(elapsed, 1), "total_dates": total_dates,
+        "done_dates": done_dates, "rows": rows,
+    }
+
+
+@api_bp.route("/leverage-etf-screener")
+def api_lev_screener():
+    market = request.args.get("market", "US")
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    sort = request.args.get("sort", "weighted_alpha")
+    sort_dir = request.args.get("sort_dir") or request.args.get("order", "desc")
+    search = request.args.get("search", "")
+    date_cutoff = request.args.get("date_cutoff", "")
+    from dumbmoney.leverage_etf_screener import get_lev_screener
+    return jsonify(get_lev_screener(market, page, per_page, sort, sort_dir, search, date_cutoff, request.args))
+
+
+@api_bp.route("/leverage-etf-screener/columns")
+def api_lev_screener_columns():
+    from dumbmoney.basket_screener import STRING_COLUMN_REFERENCE
+    return jsonify({"columns": STRING_COLUMN_REFERENCE})
+
+
+@api_bp.route("/leverage-etf-screener/detail/<string_id>")
+def api_lev_detail(string_id):
+    market = request.args.get("market", "US")
+    from dumbmoney.leverage_etf_screener import get_lev_detail
+    return jsonify(get_lev_detail(string_id, market))
+
+
+@api_bp.route("/leverage-etf-screener/<string_id>/ohlc")
+def api_lev_ohlc(string_id):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    timeframe = request.args.get("timeframe", "1Day")
+    from dumbmoney.basket_screener import _load_composition, _load_close_pivot, _load_ohlc_pivots, _gather_einsum
+    sids, sym_list, indices, weights = _load_composition(market, string_ids=[string_id])
+    if not sids:
+        return jsonify({"error": "String not found"}), 404
+    _, dates, close = _load_close_pivot(market, sym_list)
+    high, low, open_p = _load_ohlc_pivots(market, sym_list)
+    if high is None:
+        return jsonify({"error": "OHLC cache missing"}), 404
+    V = _gather_einsum(close, indices, weights)
+    H = _gather_einsum(high, indices, weights)
+    L = _gather_einsum(low, indices, weights)
+    O = _gather_einsum(open_p, indices, weights)
+    n_dates = min(limit, len(dates))
+    d = dates[-n_dates:]
+    return jsonify({
+        "dates": list(d),
+        "open": [round(float(O[0, -n_dates + i]), 4) for i in range(n_dates)],
+        "high": [round(float(H[0, -n_dates + i]), 4) for i in range(n_dates)],
+        "low": [round(float(L[0, -n_dates + i]), 4) for i in range(n_dates)],
+        "close": [round(float(V[0, -n_dates + i]), 4) for i in range(n_dates)],
+    })
+
+
+@api_bp.route("/leverage-etf-screener/<string_id>/supertrend")
+def api_lev_supertrend(string_id):
+    market = request.args.get("market", "US")
+    period = int(request.args.get("period", 14))
+    multiplier = float(request.args.get("multiplier", 1.0))
+    limit = int(request.args.get("limit", 500))
+    from dumbmoney.basket_screener import (
+        _load_composition, _load_close_pivot, _load_ohlc_pivots,
+        _gather_einsum, _compute_basket_ohlc, _compute_basket_indicators
+    )
+    sids, sym_list, indices, weights = _load_composition(market, string_ids=[string_id])
+    if not sids:
+        return jsonify({"error": "String not found"}), 404
+    _, dates, close = _load_close_pivot(market, sym_list)
+    high, low, open_p = _load_ohlc_pivots(market, sym_list)
+    if high is None:
+        return jsonify({"error": "OHLC cache missing"}), 404
+    basket_ohlc = _compute_basket_ohlc(close, high, low, open_p, indices, weights)
+    ind = _compute_basket_indicators(basket_ohlc, period=period, multiplier=multiplier)
+    n_dates = min(limit, len(dates))
+    d = dates[-n_dates:]
+    return jsonify({
+        "dates": list(d),
+        "atr_signal": [int(ind["atr_signal"][0, -n_dates + i]) for i in range(n_dates)],
+        "atr_stop": [round(float(ind["atr_stop"][0, -n_dates + i]), 4) for i in range(n_dates)],
+        "atr_value": [round(float(ind["atr_value"][0, -n_dates + i]), 4) for i in range(n_dates)],
+        "atr_crossed_above": [int(ind["atr_crossed_above"][0, -n_dates + i]) for i in range(n_dates)],
+        "atr_crossed_below": [int(ind["atr_crossed_below"][0, -n_dates + i]) for i in range(n_dates)],
+    })
+
+
+@api_bp.route("/leverage-etf-screener/<string_id>/accel")
+def api_lev_accel(string_id):
+    market = request.args.get("market", "US")
+    limit = int(request.args.get("limit", 500))
+    from dumbmoney.basket_screener import (
+        _load_composition, _load_close_pivot, _load_ohlc_pivots,
+        _gather_einsum, _compute_basket_ohlc, _compute_basket_indicators
+    )
+    sids, sym_list, indices, weights = _load_composition(market, string_ids=[string_id])
+    if not sids:
+        return jsonify({"error": "String not found"}), 404
+    _, dates, close = _load_close_pivot(market, sym_list)
+    high, low, open_p = _load_ohlc_pivots(market, sym_list)
+    if high is None:
+        return jsonify({"error": "OHLC cache missing"}), 404
+    basket_ohlc = _compute_basket_ohlc(close, high, low, open_p, indices, weights)
+    ind = _compute_basket_indicators(basket_ohlc)
+    n_dates = min(limit, len(dates))
+    d = dates[-n_dates:]
+    return jsonify({
+        "dates": list(d),
+        "accel_a": [round(float(ind["accel_a"][0, -n_dates + i]), 6) for i in range(n_dates)],
+        "accel_base": [round(float(ind["accel_base"][0, -n_dates + i]), 6) for i in range(n_dates)],
+        "accel_signal": [int(ind["accel_signal"][0, -n_dates + i]) for i in range(n_dates)],
+    })
+
+
+@api_bp.route("/leverage-etf-screener/<string_id>/stats")
+def api_lev_stats(string_id):
+    market = request.args.get("market", "US")
+    conn = get_db(market)
+    try:
+        rows = conn.execute(
+            "SELECT date, price, change_pct, next_day_return FROM historical_string_screener "
+            "WHERE string_id=? ORDER BY date", (string_id,)).fetchall()
+        if not rows:
+            return jsonify({})
+        prices = [r[1] for r in rows if r[1]]
+        returns = [r[3] for r in rows if r[3] is not None]
+        win_rate = sum(1 for r in returns if r > 0) / len(returns) * 100 if returns else 0
+        avg_ret = sum(returns) / len(returns) if returns else 0
+        import numpy as np
+        std_ret = float(np.std(returns)) if returns else 0
+        sharpe = (avg_ret / std_ret * (252 ** 0.5)) if std_ret > 0 else 0
+        total_return = ((prices[-1] / prices[0] - 1) * 100) if prices and prices[0] > 0 else 0
+        peak = prices[0] if prices else 0
+        max_dd = 0
+        for p in prices:
+            if p > peak:
+                peak = p
+            dd = (peak - p) / peak * 100 if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+        return jsonify({
+            "total_entries": len(returns),
+            "win_rate": round(win_rate, 2),
+            "avg_1d_return": round(avg_ret, 4),
+            "sharpe_1d": round(sharpe, 2),
+            "total_return": round(total_return, 2),
+            "max_drawdown": round(max_dd, 2),
+        })
+    finally:
+        conn.close()
+
+
+@api_bp.route("/leverage-etf-screener/progress")
+def api_lev_progress():
+    market = request.args.get("market", "US")
+    return jsonify(_LEV_BUILD_PROGRESS.get(market, {"pct": 0, "stage": "idle", "detail": ""}))
+
+
+@api_bp.route("/leverage-etf-screener/generate", methods=["POST"])
+def api_lev_generate():
+    data = request.json or {}
+    market = data.get("market", "US")
+    with _LEV_BUILD_LOCK:
+        if _LEV_BUILD_PROGRESS.get(market, {}).get("stage") in ("universe", "cache", "metrics", "historical"):
+            return jsonify({"error": "Already running"}), 409
+
+    def _run():
+        import time as _time
+        t0 = _time.time()
+        try:
+            _update_lev_progress(market, 0, "universe", "Generating leveraged ETF universe...")
+            from dumbmoney.leverage_etf_screener import (
+                generate_leveraged_etf_universe, compute_leveraged_etf_current_metrics,
+                update_leveraged_etf_historical)
+            from dumbmoney.basket_screener import build_close_pivot_cache
+            n = generate_leveraged_etf_universe(market, n=25000, force=True)
+            _update_lev_progress(market, 3, "cache", f"Universe ready: {n} strings. Building cache...", elapsed=_time.time()-t0)
+            build_close_pivot_cache(market)
+            _update_lev_progress(market, 8, "metrics", "Cache built. Computing metrics...", elapsed=_time.time()-t0)
+            compute_leveraged_etf_current_metrics(market)
+            _update_lev_progress(market, 12, "historical", "Metrics done. Building historical...", elapsed=_time.time()-t0)
+
+            def _hist_progress(pct, detail):
+                elapsed = _time.time() - t0
+                done_d, total_d = 0, 0
+                if "dates" in detail:
+                    try:
+                        part = detail.split(":")[-1].strip().split(" ")[0]
+                        done_d, total_d = [int(x) for x in part.split("/")]
+                    except Exception:
+                        pass
+                _update_lev_progress(market, 10 + pct * 0.9, "historical", detail,
+                                     elapsed=elapsed, total_dates=total_d, done_dates=done_d)
+
+            update_leveraged_etf_historical(market, force_rebuild=True, progress_callback=_hist_progress)
+            _update_lev_progress(market, 100, "done", f"Complete! {n} LEV strings built.", elapsed=_time.time()-t0)
+        except Exception as e:
+            _update_lev_progress(market, 0, "error", str(e), elapsed=_time.time()-t0)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True, "market": market})
+
+
+# Page routes for leverage ETF screener
+app.add_url_rule("/leverage-etf-screener/", "lev_screener_list",
+                 lambda: render_template("leverage_etf_screener.html", market="US"))
+app.add_url_rule("/leverage-etf-screener/string/<string_id>", "lev_string_detail",
+                 lambda string_id: render_template("lev_string_detail.html", string_id=string_id, market="US"))
+
+
+app.register_blueprint(screener_bp)
+app.register_blueprint(stock_bp)
+app.register_blueprint(portfolio_bp)
+app.register_blueprint(string_bp)
+app.register_blueprint(string_screener_bp)
+app.register_blueprint(ai_bp)
+app.register_blueprint(paper_bp)
+app.register_blueprint(api_bp, url_prefix="/api")
+
+# Intraday Agent Backtester (separate module)
+from intraday_backtest.routes import bp as intraday_bp
+app.register_blueprint(intraday_bp)
+
+app.add_url_rule("/intraday-backtest/", "intraday_backtest_page",
+                 lambda: render_template("intraday_backtest.html", market="US", other_market="INDIA"),
+                 methods=["GET"])
+
+
+def create_app():
+    init_all_dbs()
+    for db_path in DB_PATHS.values():
+        ensure_schema(db_path)
+        migrate_nulls(db_path)
+    from dumbmoney.refresh import reset_stale_status
+    reset_stale_status()
+    # Sync crypto products if not already present
+    try:
+        from dumbmoney.db import get_db
+        from dumbmoney.data_crypto import fetch_products, get_all_symbols
+        conn = get_db("CRYPTO")
+        count = conn.execute("SELECT COUNT(*) FROM crypto_products").fetchone()[0]
+        if count == 0:
+            fetch_products()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Crypto product sync failed at startup: {e}")
+    # Start WebSocket for live tickers
+    try:
+        from dumbmoney.crypto_ws import start as start_crypto_ws
+        import threading
+        threading.Thread(target=start_crypto_ws, daemon=True).start()
+    except Exception as e:
+        logger.warning(f"Crypto WebSocket failed to start: {e}")
+    # Pre-compute crypto stats in background on startup
+    try:
+        import threading
+        def _warm_crypto_stats():
+            try:
+                from dumbmoney.engine import compute_crypto_stats_batch
+                compute_crypto_stats_batch()
+            except Exception as e:
+                logger.warning(f"Crypto stats batch compute failed: {e}")
+            try:
+                from dumbmoney.engine import update_crypto_historical_screener
+                update_crypto_historical_screener()
+            except Exception as e:
+                logger.warning(f"Crypto historical screener build failed: {e}")
+        threading.Thread(target=_warm_crypto_stats, daemon=True).start()
+    except Exception as e:
+        logger.warning(f"Crypto stats warmup failed: {e}")
+    return app
+
+
 if __name__ == "__main__":
-    import threading
-    import os
-    init_db()
-    # Schema migrations are fast — run synchronously.
-    # Heavy data backfills (oldest_data) run in background.
-    migrate_db()
-    # Recompute streaks at startup to ensure no stocks show streak=0 with >=2 bars
-    t = threading.Thread(target=recompute_all_streaks, daemon=True)
-    t.start()
-    print()
-    print("=" * 55)
-    print(f"  DumbMoney Server #{SERVER_ID}")
-    print(f"  http://localhost:{PORT}")
-    print(f"  Database: {DB_PATH}")
-    print(f"  Alpaca Paper Trading")
-    if 'websockets' in dir():
-        print(f"  Live Prices: Enabled (IEX WebSocket)")
-    print("=" * 55)
-    print()
-
-    # Start live WebSocket background thread
-    def _run_live():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_alpaca_ws_loop())
-    t = threading.Thread(target=_run_live, daemon=True)
-    t.start()
-
-    # Quick-start
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) as cnt FROM stats WHERE price > 0").fetchone()["cnt"]
-    asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-    conn.close()
-
-    if count == 0 or asset_count == 0:
-        _quick_start()
-
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, use_reloader=False)
+    create_app()
+    app.run(host="0.0.0.0", port=8474, debug=False)

@@ -1,0 +1,457 @@
+{% extends "base.html" %}
+{% block title %}Screener - {{ market }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Stock Screener <span class="badge badge-info">{{ market }}</span></h1>
+  <div class="flex-row">
+    <button class="btn btn-sm" onclick="openColumnReference()">Columns</button>
+    <button class="btn btn-sm" onclick="exportCSV()">Export CSV</button>
+  </div>
+</div>
+
+<div class="card mb-16" id="emptyState" style="display:none">
+  <div class="empty-state">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+    <h3>No data loaded yet</h3>
+    <p>Click Refresh to download stock data from Alpaca (US) and yfinance (India).<br>This will fetch assets, daily bars, compute all indicators, and populate the screener.</p>
+    <button class="btn btn-primary" onclick="startRefresh()">Run First Refresh</button>
+  </div>
+</div>
+
+<div class="market-breadth" id="breadthPanel">
+  <div class="card breadth-card"><div class="num" id="breadthAdv">-</div><div class="lbl">Advancers</div></div>
+  <div class="card breadth-card"><div class="num text-down" id="breadthDec">-</div><div class="lbl">Decliners</div></div>
+  <div class="card breadth-card"><div class="num" id="breadthTotal">-</div><div class="lbl">Total</div></div>
+  <div class="card breadth-card"><div class="num text-up" id="breadthPct">-</div><div class="lbl">% Up</div></div>
+</div>
+
+<div class="filter-rail" id="filterRail">
+  <label>Search:</label>
+  <input type="text" id="fSearch" placeholder="Symbol or name..." style="width:150px">
+  <label>Exchange:</label>
+  <select id="fExchange"><option value="">All</option></select>
+  <label>Type:</label>
+  <select id="fType"><option value="">All</option><option value="stock">Stock</option><option value="etf">ETF</option></select>
+  <label>Leveraged:</label>
+  <select id="fLeveraged"><option value="">All</option><option value="yes">Leveraged Only</option></select>
+  <label>Min Price:</label>
+  <input type="number" id="fMinPrice" style="width:70px" placeholder="0">
+  <label>Max Price:</label>
+  <input type="number" id="fMaxPrice" style="width:70px" placeholder="9999">
+  <label>Min WA:</label>
+  <input type="number" id="fMinWA" style="width:70px" placeholder="-999">
+  <label>Max WA:</label>
+  <input type="number" id="fMaxWA" style="width:70px" placeholder="999">
+  <label>Min Chg%:</label>
+  <input type="number" id="fMinChg" style="width:70px" step="0.1" placeholder="-100">
+  <label>Max Chg%:</label>
+  <input type="number" id="fMaxChg" style="width:70px" step="0.1" placeholder="100">
+  <label>Min Streak:</label>
+  <input type="number" id="fMinStreak" style="width:60px" placeholder="-99">
+  <label>SuperTrend:</label>
+  <select id="fATRStatus"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>ST Weekly:</label>
+  <select id="fATRStatusW"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>ST Monthly:</label>
+  <select id="fATRStatusM"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>Accel:</label>
+  <select id="fAccelStatus"><option value="">All</option><option value="up">Up</option><option value="down">Down</option><option value="crossed-up">Cross Up</option><option value="crossed-down">Cross Down</option></select>
+  <label>Min ST Bars Below:</label>
+  <input type="number" id="fMinSTBarsBelow" style="width:60px" placeholder="0">
+  <label>Min ST Bars Above:</label>
+  <input type="number" id="fMinSTBarsAbove" style="width:60px" placeholder="0">
+  <label>Min Accel Bars Below:</label>
+  <input type="number" id="fMinAccelBarsBelow" style="width:60px" placeholder="0">
+  <label>Min Accel Bars Above:</label>
+  <input type="number" id="fMinAccelBarsAbove" style="width:60px" placeholder="0">
+  <label>Min Retest Score:</label>
+  <input type="number" id="fMinRetestScore" style="width:60px" placeholder="0" min="0" max="100">
+  <label>Min Vol:</label>
+  <input type="number" id="fMinVol" style="width:80px" placeholder="0">
+  <label>Fractionable:</label>
+  <select id="fFractionable"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label id="lblIndex">Index:</label>
+  <select id="fIndex"><option value="">All</option></select>
+  <label>Profit:</label>
+  <select id="fProfitStatus"><option value="">All</option><option value="beat">Beat</option><option value="miss">Miss</option><option value="in-line">In-Line</option></select>
+  <label>Date (As Of):</label>
+  <input type="date" id="fDateCutoff" style="width:140px">
+  <button class="btn btn-sm" onclick="loadScreener()">Apply</button>
+  <button class="btn btn-sm" onclick="clearFilters()">Clear</button>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="screener-table" id="screenerTable">
+    <div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>
+  </div>
+  <div class="action-bar" id="actionBar" style="display:none">
+    <span id="selectedCount">0</span> selected
+    <button class="btn btn-sm btn-primary" onclick="btstSelected()">Next-day return (BTST)</button>
+    <button class="btn btn-sm" onclick="saveAsString()">Save as String</button>
+    <button class="btn btn-sm" onclick="addToPortfolio()">Add to Portfolio</button>
+  </div>
+</div>
+
+<div class="pagination" id="pagination"></div>
+
+<div class="card-grid" style="grid-template-columns:1fr 1fr 1fr;margin-top:16px">
+  <div class="top-list" id="topGainers"><h4>Top Gainers</h4><div class="loading"><div class="spinner"></div></div></div>
+  <div class="top-list" id="topVolume"><h4>Top by Volume</h4><div class="loading"><div class="spinner"></div></div></div>
+  <div class="top-list" id="topWA"><h4>Top by Weighted Alpha</h4><div class="loading"><div class="spinner"></div></div></div>
+</div>
+
+<div class="modal-overlay" id="columnModal" style="display:none">
+  <div class="modal" style="max-width:920px;max-height:82vh;overflow:auto">
+    <div class="flex-between mb-16">
+      <h3 style="margin:0">Screener Columns</h3>
+      <button class="btn btn-sm" onclick="closeColumnReference()">Close</button>
+    </div>
+    <div class="screener-table">
+      <table>
+        <thead><tr><th>Column</th><th>Current source</th><th>Date source</th><th>Meaning</th></tr></thead>
+        <tbody id="columnReferenceBody">
+          <tr><td colspan="4" style="padding:20px;text-align:center"><div class="spinner"></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentPage = 1, currentSort = 'weighted_alpha', currentDir = 'desc', selectedSymbols = new Set();
+let refreshPollTimer = null;
+const PRICE_PREFIX = MARKET === 'INDIA' ? 'Rs ' : '$';
+let columnReferenceLoaded = false;
+
+// Populate Index filter based on market
+const idxLabel = document.getElementById('lblIndex');
+const idxSelect = document.getElementById('fIndex');
+if (MARKET === 'INDIA') {
+  if (idxLabel) idxLabel.style.display = '';
+  if (idxSelect) {
+    idxSelect.style.display = '';
+    idxSelect.innerHTML = '<option value="">All</option><option value="nifty500">Nifty 500</option><option value="nifty50">Nifty 50</option><option value="fo">F&O Stocks</option>';
+  }
+} else if (MARKET === 'US') {
+  if (idxLabel) idxLabel.style.display = '';
+  if (idxSelect) {
+    idxSelect.style.display = '';
+    idxSelect.innerHTML = '<option value="">All</option><option value="sp500">S&P 500</option><option value="nasdaq100">Nasdaq 100</option><option value="russell2000">Russell 2000</option><option value="dow30">Dow Jones 30</option>';
+  }
+} else {
+  if (idxLabel) idxLabel.style.display = 'none';
+  if (idxSelect) idxSelect.style.display = 'none';
+}
+
+const COLUMNS = [
+  {key:'_check', label:'<input type="checkbox" class="row-check" onclick="toggleAll(this)">', width:40},
+  {key:'symbol', label:'Symbol', width:120, sort:true},
+  {key:'name', label:'Name', width:140},
+  {key:'exchange', label:'Exchange', width:80},
+  {key:'asset_class', label:'Type', width:70},
+  {key:'price', label:'Price', width:80, sort:true, num:true},
+  {key:'change_pct', label:'Chg%', width:75, sort:true, num:true},
+  {key:'next_day_return', label:'Next Day %', width:90, sort:true, num:true},
+  {key:'prob_up_1d', label:'P(Up) 1D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_5d', label:'P(Up) 5D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_1w', label:'P(Up) 1W', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_1m', label:'P(Up) 1M', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_st_cross', label:'P(Up) ST Cross', width:105, sort:true, num:true, heat:true},
+  {key:'weighted_alpha', label:'Wtd Alpha', width:90, sort:true, num:true},
+  {key:'volume', label:'Volume', width:85, sort:true, num:true},
+  {key:'streak', label:'Streak', width:70, sort:true, num:true},
+  {key:'confluence', label:'Confluence', width:95, sort:true, num:true, heat:true},
+  {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
+  {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
+  {key:'ai_trendline_score', label:'Trend Score', width:95, sort:true, num:true},
+  {key:'ai_sentiment_score', label:'Sentiment', width:90, sort:true, num:true},
+  {key:'ai_conclusion', label:'Conclusion', width:90, sort:true},
+  {key:'ai_matrix', label:'AI Matrix', width:90, sort:true, num:true, heat:true},
+  {key:'atr_signal', label:'ST Signal', width:80, sort:true},
+  {key:'atr_crossed_above', label:'Cross Up', width:85, sort:true},
+  {key:'atr_crossed_below', label:'Cross Down', width:90, sort:true},
+  {key:'atr_stop', label:'ST Stop 14x1', width:105, sort:true, num:true},
+  {key:'atr_signal_w', label:'ST W', width:60, sort:true},
+  {key:'atr_crossed_above_w', label:'Cross Up W', width:90, sort:true},
+  {key:'atr_crossed_below_w', label:'Cross Down W', width:100, sort:true},
+  {key:'atr_stop_w', label:'ST Stop W', width:90, sort:true, num:true},
+  {key:'atr_signal_m', label:'ST M', width:60, sort:true},
+  {key:'atr_crossed_above_m', label:'Cross Up M', width:90, sort:true},
+  {key:'atr_crossed_below_m', label:'Cross Down M', width:100, sort:true},
+  {key:'atr_stop_m', label:'ST Stop M', width:90, sort:true, num:true},
+  {key:'atrp', label:'ATR%', width:70, sort:true, num:true},
+  {key:'accel_signal', label:'Accel', width:70, sort:true},
+  {key:'accel_crossed_up', label:'Accel Up', width:85, sort:true},
+  {key:'accel_crossed_down', label:'Accel Down', width:95, sort:true},
+  {key:'st_bars_below', label:'ST Bars Below', width:95, sort:true, num:true},
+  {key:'st_bars_above', label:'ST Bars Above', width:95, sort:true, num:true},
+  {key:'accel_bars_below', label:'Accel Bars Below', width:105, sort:true, num:true},
+  {key:'accel_bars_above', label:'Accel Bars Above', width:105, sort:true, num:true},
+  {key:'marginable', label:'Margin', width:65},
+  {key:'fractionable', label:'Frac', width:55},
+  {key:'profit_status', label:'Profit', width:80},
+  {key:'pre_change_pct', label:'Pre %', width:70, num:true},
+  {key:'post_change_pct', label:'Post %', width:70, num:true},
+  {key:'last_updated', label:'Updated', width:110},
+];
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function formatSignedPercent(raw) {
+  if (raw == null || raw === '') return {html: '-', cls: ''};
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return {html: '-', cls: ''};
+  return {html: (n >= 0 ? '+' : '') + n.toFixed(2) + '%', cls: n >= 0 ? 'text-up' : 'text-down'};
+}
+
+function openColumnReference() {
+  document.getElementById('columnModal').style.display = 'flex';
+  if (columnReferenceLoaded) return;
+  fetch('/api/screener/columns').then(r => r.json()).then(d => {
+    const rows = (d.columns || []).map(c => (
+      `<tr><td><strong>${escHtml(c.label)}</strong><br><span class="text-muted">${escHtml(c.key)}</span></td>` +
+      `<td><code>${escHtml(c.current)}</code></td><td><code>${escHtml(c.historical)}</code></td>` +
+      `<td>${escHtml(c.meaning)}</td></tr>`
+    )).join('');
+    document.getElementById('columnReferenceBody').innerHTML = rows || '<tr><td colspan="4">No column reference found.</td></tr>';
+    columnReferenceLoaded = true;
+  }).catch(() => {
+    document.getElementById('columnReferenceBody').innerHTML = '<tr><td colspan="4">Failed to load column reference.</td></tr>';
+  });
+}
+
+function closeColumnReference() {
+  document.getElementById('columnModal').style.display = 'none';
+}
+
+function getFilters() {
+  return {
+    market: MARKET, page: currentPage, per_page: 50,
+    sort: currentSort, sort_dir: currentDir,
+    search: document.getElementById('fSearch').value,
+    exchange: document.getElementById('fExchange').value,
+    asset_type: document.getElementById('fType').value,
+    leveraged: document.getElementById('fLeveraged').value,
+    min_price: document.getElementById('fMinPrice').value,
+    max_price: document.getElementById('fMaxPrice').value,
+    min_wa: document.getElementById('fMinWA').value,
+    max_wa: document.getElementById('fMaxWA').value,
+    min_change: document.getElementById('fMinChg').value,
+    max_change: document.getElementById('fMaxChg').value,
+    min_streak: document.getElementById('fMinStreak').value,
+    atr_status: document.getElementById('fATRStatus').value,
+    atr_status_w: document.getElementById('fATRStatusW') ? document.getElementById('fATRStatusW').value : '',
+    atr_status_m: document.getElementById('fATRStatusM') ? document.getElementById('fATRStatusM').value : '',
+    accel_status: document.getElementById('fAccelStatus').value,
+    min_volume: document.getElementById('fMinVol').value,
+    fractionable: document.getElementById('fFractionable').value,
+    index: document.getElementById('fIndex') ? document.getElementById('fIndex').value : '',
+    profit_status: document.getElementById('fProfitStatus').value,
+    min_st_bars_below: document.getElementById('fMinSTBarsBelow') ? document.getElementById('fMinSTBarsBelow').value : '',
+    min_st_bars_above: document.getElementById('fMinSTBarsAbove') ? document.getElementById('fMinSTBarsAbove').value : '',
+    min_accel_bars_below: document.getElementById('fMinAccelBarsBelow') ? document.getElementById('fMinAccelBarsBelow').value : '',
+    min_accel_bars_above: document.getElementById('fMinAccelBarsAbove') ? document.getElementById('fMinAccelBarsAbove').value : '',
+    min_retest_score: document.getElementById('fMinRetestScore') ? document.getElementById('fMinRetestScore').value : '',
+    date_cutoff: document.getElementById('fDateCutoff').value,
+  };
+}
+
+function loadScreener() {
+  const params = new URLSearchParams(getFilters());
+  document.getElementById('screenerTable').innerHTML = '<div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>';
+  fetch('/api/screener?' + params).then(r => r.json()).then(d => {
+    if (!d.data || d.data.length === 0) {
+      document.getElementById('emptyState').style.display = 'block';
+    } else {
+      document.getElementById('emptyState').style.display = 'none';
+    }
+    renderTable(d.data, d.total, d.page, d.total_pages, d.historical, d.date);
+  }).catch(() => {
+    document.getElementById('screenerTable').innerHTML = '<div class="empty-state"><h3>Failed to load</h3><p>Check server connection.</p></div>';
+  });
+}
+
+function renderTable(data, total, page, totalPages, historical, histDate) {
+  let html = '<table><thead><tr>';
+  COLUMNS.forEach(col => {
+    if (col.key === '_check') { html += `<th style="width:${col.width}px">${col.label}</th>`; return; }
+    const sorted = currentSort === col.key;
+    const arrow = sorted ? (currentDir === 'desc' ? ' v' : ' ^') : '';
+    html += `<th style="width:${col.width}px;${sorted?'color:var(--brand)':''}" onclick="sort('${col.key}')">${col.label}<span class="sort-icon">${col.sort ? arrow : ''}</span></th>`;
+  });
+  html += '</tr></thead><tbody>';
+  if (!data || data.length === 0) {
+    html += `<tr><td colspan="${COLUMNS.length}" style="text-align:center;padding:40px;color:var(--text-muted)">No stocks found. Run a Refresh to download data.</td></tr>`;
+  }
+  (data || []).forEach(row => {
+    const checked = selectedSymbols.has(row.symbol) ? 'checked' : '';
+    html += `<tr>`;
+    html += `<td><input type="checkbox" class="row-check" ${checked} onchange="toggleSelect('${row.symbol}')"></td>`;
+    COLUMNS.forEach(col => {
+      if (col.key === '_check') return;
+      let val = row[col.key];
+      let cls = '';
+      if (col.key === 'symbol') { val = `<a href="/${MARKET === 'INDIA' ? 'india/' : ''}stock/${row.symbol}" target="_blank">${row.symbol}</a>`; }
+      else if (col.key === 'name') { val = val || '-'; }
+      else if (col.key === 'change_pct' || col.key === 'next_day_return') {
+        const pct = formatSignedPercent(val);
+        val = pct.html;
+        cls = pct.cls;
+      }
+      else if (col.key === 'pre_change_pct' || col.key === 'post_change_pct') {
+        const pct = formatSignedPercent(val);
+        val = pct.html;
+        cls = pct.cls;
+      }
+      else if (col.key === 'weighted_alpha') {
+        const n = Number(val);
+        val = Number.isFinite(n) ? n.toFixed(2) : '-';
+        cls = Number.isFinite(n) ? (n >= 0 ? 'text-up' : 'text-down') : '';
+      }
+      else if (col.key === 'volume') { val = val != null ? parseInt(val).toLocaleString() : '-'; }
+      else if (col.key === 'price') { val = val != null ? PRICE_PREFIX + parseFloat(val).toFixed(2) : '-'; }
+      else if (col.key === 'atr_stop' || col.key === 'atrp') { val = val != null ? parseFloat(val).toFixed(2) : '-'; }
+      else if (col.key === 'atr_stop_w' || col.key === 'atr_stop_m') { val = val != null ? parseFloat(val).toFixed(2) : '-'; }
+      else if (col.key === 'atr_crossed_above') { val = val ? '<span class="cross-chip cross-up">Crossed Up</span>' : (row.atr_signal === 1 ? '<span class="badge badge-up">Above</span>' : '-'); }
+      else if (col.key === 'atr_crossed_below') { val = val ? '<span class="cross-chip cross-down">Crossed Down</span>' : (row.atr_signal === -1 ? '<span class="badge badge-down">Below</span>' : '-'); }
+      else if (col.key === 'atr_crossed_above_w') { val = val ? '<span class="cross-chip cross-up">Crossed Up</span>' : (row.atr_signal_w === 1 ? '<span class="badge badge-up">Above</span>' : '-'); }
+      else if (col.key === 'atr_crossed_below_w') { val = val ? '<span class="cross-chip cross-down">Crossed Down</span>' : (row.atr_signal_w === -1 ? '<span class="badge badge-down">Below</span>' : '-'); }
+      else if (col.key === 'atr_crossed_above_m') { val = val ? '<span class="cross-chip cross-up">Crossed Up</span>' : (row.atr_signal_m === 1 ? '<span class="badge badge-up">Above</span>' : '-'); }
+      else if (col.key === 'atr_crossed_below_m') { val = val ? '<span class="cross-chip cross-down">Crossed Down</span>' : (row.atr_signal_m === -1 ? '<span class="badge badge-down">Below</span>' : '-'); }
+      else if (col.key === 'atr_signal') { val = val === 1 ? '<span class="badge badge-up">Above ST</span>' : val === -1 ? '<span class="badge badge-down">Below ST</span>' : '-'; }
+      else if (col.key === 'atr_signal_w') { val = val === 1 ? '<span class="badge badge-up">Above</span>' : val === -1 ? '<span class="badge badge-down">Below</span>' : '-'; }
+      else if (col.key === 'atr_signal_m') { val = val === 1 ? '<span class="badge badge-up">Above</span>' : val === -1 ? '<span class="badge badge-down">Below</span>' : '-'; }
+      else if (col.key === 'streak') { const sn = Number(val); cls = (val != null && sn > 0) ? 'text-up' : (val != null && sn < 0) ? 'text-down' : ''; val = val != null ? (sn > 0 ? '+' + val : val) : '-'; }
+      else if (col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m') {
+        const v = parseFloat(val);
+        val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';
+      }
+      else if (col.key === 'ai_conclusion') {
+        val = val || '-';
+        const cls2 = val === 'BUY' ? 'badge-up' : val === 'SELL' ? 'badge-down' : 'badge-info';
+        val = `<span class="badge ${cls2}">${val}</span>`;
+      }
+      else if (col.key === 'accel_signal') { val = val === 1 ? '<span class="badge badge-up">UP</span>' : val === -1 ? '<span class="badge badge-down">DOWN</span>' : '-'; }
+      else if (col.key === 'accel_crossed_up') { val = val ? '<span class="cross-chip cross-up">UP</span>' : '-'; }
+      else if (col.key === 'accel_crossed_down') { val = val ? '<span class="cross-chip cross-down">DOWN</span>' : '-'; }
+      else if (col.key === 'marginable' || col.key === 'fractionable') { val = val ? 'Yes' : 'No'; }
+      else if (col.key === 'last_updated') { val = val ? new Date(val).toLocaleDateString() : '-'; }
+      else { val = val != null ? val : '-'; }
+      html += `<td class="${col.num ? 'numeric' : ''} ${cls}">${val}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById('screenerTable').innerHTML = html;
+
+  let ph = '';
+  for (let i = 1; i <= totalPages; i++) {
+    if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
+      ph += `<button class="${i===page?'active':''}" onclick="goPage(${i})">${i}</button>`;
+    } else if (Math.abs(i - page) === 3) {
+      ph += '<span>...</span>';
+    }
+  }
+  document.getElementById('pagination').innerHTML = ph;
+
+  let countHtml = `<div class="screener-count">Showing ${(page-1)*50+1}-${Math.min(page*50, total)} of ${total.toLocaleString()} stocks`;
+  if (historical) countHtml += ` <span style="color:var(--brand);font-weight:600">as of ${histDate}</span>`;
+  else if (total < 10464) countHtml += ` (filtered from ${MARKET === 'US' ? '10,464' : '2,381'})`;
+  countHtml += '</div>';
+  document.getElementById('pagination').innerHTML = countHtml + ph;
+}
+
+function sort(key) {
+  if (currentSort === key) { currentDir = currentDir === 'desc' ? 'asc' : 'desc'; }
+  else { currentSort = key; currentDir = 'desc'; }
+  loadScreener();
+}
+
+function goPage(p) { currentPage = p; loadScreener(); }
+
+function clearFilters() {
+  ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinRetestScore','fDateCutoff'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  currentPage = 1;
+  loadScreener();
+}
+
+function toggleSelect(sym) {
+  if (selectedSymbols.has(sym)) selectedSymbols.delete(sym); else selectedSymbols.add(sym);
+  document.getElementById('actionBar').style.display = selectedSymbols.size > 0 ? 'flex' : 'none';
+  document.getElementById('selectedCount').textContent = selectedSymbols.size;
+}
+
+function toggleAll(cb) {
+  document.querySelectorAll('.screener-table .row-check').forEach(c => { c.checked = cb.checked; });
+  if (cb.checked) { document.querySelectorAll('.screener-table tbody tr').forEach(r => { const a = r.querySelector('a'); if (a) selectedSymbols.add(a.textContent); }); }
+  else { selectedSymbols.clear(); }
+  document.getElementById('actionBar').style.display = selectedSymbols.size > 0 ? 'flex' : 'none';
+  document.getElementById('selectedCount').textContent = selectedSymbols.size;
+}
+
+function btstSelected() { showToast('BTST analysis: ' + [...selectedSymbols].join(', ')); }
+
+function saveAsString() {
+  const name = prompt('String name:');
+  if (!name) return;
+  fetch('/api/strings/generate', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({market: MARKET, name, symbols: [...selectedSymbols]})
+  }).then(r => r.json()).then(d => { showToast('String created: ' + d.id); });
+}
+
+function addToPortfolio() {
+  const pid = prompt('Portfolio ID:');
+  if (!pid) return;
+  [...selectedSymbols].forEach(sym => {
+    fetch('/api/portfolio/add', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({market: MARKET, portfolio_id: parseInt(pid), symbol: sym})
+    });
+  });
+  showToast('Added to portfolio');
+}
+
+function exportCSV() { showToast('Exporting CSV...'); }
+
+function loadBreadth() {
+  fetch('/api/market-breadth?market=' + MARKET).then(r => r.json()).then(d => {
+    document.getElementById('breadthAdv').textContent = d.advancers || 0;
+    document.getElementById('breadthDec').textContent = d.decliners || 0;
+    document.getElementById('breadthTotal').textContent = d.total || 0;
+    document.getElementById('breadthPct').textContent = (d.pct_up || 0) + '%';
+  });
+}
+
+function loadTopLists() {
+  fetch('/api/top-lists?market=' + MARKET).then(r => r.json()).then(d => {
+    ['topGainers','topVolume','topWA'].forEach((id, idx) => {
+      const items = idx === 0 ? d.gainers : idx === 1 ? d.by_volume : d.by_weighted_alpha;
+      if (!items || items.length === 0) {
+        document.getElementById(id).innerHTML = `<h4>${idx===0?'Top Gainers':idx===1?'Top by Volume':'Top by Wtd Alpha'}</h4><p class="text-muted" style="font-size:12px;padding:8px">No data yet.</p>`;
+        return;
+      }
+      let html = `<h4>${idx===0?'Top Gainers':idx===1?'Top by Volume':'Top by Wtd Alpha'}</h4><table>`;
+      items.slice(0,5).forEach(r => {
+        const val = idx === 0 ? (r.change_pct||0).toFixed(2)+'%' : idx === 1 ? (r.volume||0).toLocaleString() : (r.weighted_alpha||0).toFixed(2);
+        const cls = idx === 0 ? (r.change_pct >= 0 ? 'text-up' : 'text-down') : '';
+        html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}stock/${r.symbol}" target="_blank">${r.symbol}</a></td><td class="${cls} numeric">${val}</td></tr>`;
+      });
+      html += '</table>';
+      document.getElementById(id).innerHTML = html;
+    });
+  });
+}
+
+/* ---- Refresh persistence ---- */
+/* Refresh panel and polling now in base.html */
+
+/* ---- Init ---- */
+loadScreener();
+loadBreadth();
+loadTopLists();
+</script>
+{% endblock %}

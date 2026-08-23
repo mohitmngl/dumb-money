@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Portfolio Inside{% endblock %}
+{% block content %}
+<div class="page-header"><h1 id="portName">Portfolio</h1></div>
+<div class="card mb-16"><div id="holdingsTable"><div class="loading"><div class="spinner"></div></div></div></div>
+<script>
+const PID = {{ pid }};
+fetch(`/api/portfolios?market=${MARKET}`).then(r=>r.json()).then(data => {
+  const p = data.find(x => x.id === PID);
+  if (!p) { document.getElementById('holdingsTable').innerHTML = '<p>Not found</p>'; return; }
+  document.getElementById('portName').textContent = p.name + ' - Holdings';
+  const syms = p.symbols || [];
+  if (!syms.length) { document.getElementById('holdingsTable').innerHTML = '<p class="text-muted">No holdings.</p>'; return; }
+  let html = '<table><thead><tr><th>Symbol</th><th>Name</th><th>Price</th><th>Chg%</th><th>Next Day%</th><th>Wtd Alpha</th><th>Streak</th></tr></thead><tbody>';
+  const fetches = syms.map(s => fetch(`/api/stock/${s.symbol}?market=${MARKET}`).then(r=>r.json()));
+  Promise.all(fetches).then(results => {
+    results.forEach(d => {
+      const s = d.stats || {};
+      const chg = s.change_pct || 0;
+      html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}stock/${s.symbol}">${s.symbol}</a></td><td>${s.name||''}</td><td class="numeric">$${(s.price||0).toFixed(2)}</td><td class="numeric ${chg>=0?'text-up':'text-down'}">${chg>=0?'+':''}${chg.toFixed(2)}%</td><td class="numeric">${(s.next_day_return||0).toFixed(2)}%</td><td class="numeric">${(s.weighted_alpha||0).toFixed(2)}</td><td class="numeric">${s.streak||0}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('holdingsTable').innerHTML = html;
+  });
+});
+</script>
+{% endblock %}

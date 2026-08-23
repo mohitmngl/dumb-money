@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realistic 3D Solar System Explorer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <h1>Solar System Explorer</h1>
+      <div id="search-container">
+        <input type="text" id="search-input" placeholder="Search celestial body..." autocomplete="off">
+        <div id="search-results" class="hidden"></div>
+      </div>
+    </header>
+
+    <div id="canvas-container"></div>
+    <div id="label-container"></div>
+
+    <div id="info-panel" class="hidden">
+      <div id="info-header">
+        <h2 id="info-name"></h2>
+        <button id="info-close">&times;</button>
+      </div>
+      <div id="info-content"></div>
+    </div>
+
+    <div id="controls-bar">
+      <div class="control-group">
+        <button id="pause-btn" title="Pause/Resume animation">Pause</button>
+        <div class="slider-group">
+          <label for="speed-slider">Speed</label>
+          <input type="range" id="speed-slider" min="0" max="5" step="0.1" value="1">
+          <span id="speed-label">1x</span>
+        </div>
+      </div>
+      <div class="control-group">
+        <button id="toggle-orbits" class="active" title="Toggle orbit path visibility">Orbits</button>
+        <button id="toggle-labels" class="active" title="Toggle label visibility">Labels</button>
+        <button id="reset-camera" title="Reset camera to default view">Reset</button>
+        <button id="focus-btn" title="Focus camera on selected body">Focus</button>
+      </div>
+      <div class="control-group">
+        <select id="env-selector" title="Select environment background">
+          <option value="starfield">Starfield</option>
+          <option value="deepspace">Deep Space</option>
+          <option value="nebula">Nebula</option>
+        </select>
+        <label class="checkbox-label" title="Auto-rotate the camera">
+          <input type="checkbox" id="auto-rotate-toggle"> Auto-Rotate
+        </label>
+        <button id="about-btn">About</button>
+      </div>
+    </div>
+
+    <div id="error-banner" class="hidden">
+      Failed to load the 3D scene. Make sure you are running through a local HTTP server (see README.md) and not opening index.html directly.
+    </div>
+  </div>
+
+  <div id="about-modal" class="modal hidden">
+    <div class="modal-content">
+      <span class="modal-close">&times;</span>
+      <h2>Realistic 3D Solar System Explorer</h2>
+      <p>An interactive 3D visualization of our Solar System built with Three.js.</p>
+      <h3>Controls</h3>
+      <ul>
+        <li><strong>Drag</strong> to rotate the camera around the scene</li>
+        <li><strong>Scroll</strong> to zoom in and out</li>
+        <li><strong>Right-click drag</strong> to pan</li>
+        <li><strong>Click</strong> any planet, moon, or the Sun to view detailed information</li>
+        <li>Use the <strong>Search</strong> bar to quickly find and focus on any celestial body</li>
+        <li>Adjust <strong>Speed</strong> to control orbital animation rate</li>
+        <li>Toggle <strong>Orbits</strong>, <strong>Labels</strong>, and <strong>Auto-Rotate</strong></li>
+        <li>Choose different <strong>Environment</strong> backgrounds</li>
+      </ul>
+      <h3>Notes</h3>
+      <p>Planet sizes and orbital distances are not to scale — they are adjusted for visual clarity and educational purposes.</p>
+      <p>Moon counts represent known confirmed natural satellites. Many outer planets have additional small moons not individually rendered here.</p>
+      <p>Built with <a href="https://threejs.org" target="_blank" rel="noopener">Three.js</a> loaded via CDN.</p>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script>
+    document.getElementById('error-banner').classList.remove('hidden');
+  </script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

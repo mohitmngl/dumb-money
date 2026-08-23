@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}AI Strategies - {{ market }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>AI Discovered Strategies</h1>
+  <div class="flex-row">
+    <button class="btn btn-primary btn-sm" onclick="runAI()">Run Discovery</button>
+    <button class="btn btn-sm" onclick="killAI()">Kill</button>
+  </div>
+</div>
+<div class="card mb-16" id="aiStatus" style="display:none"><div class="flex-row"><div class="spinner"></div><span id="aiStatusText"></span></div></div>
+<div id="aiList"><div class="loading" style="padding:40px"><div class="spinner"></div></div></div>
+<div class="page-header mt-16"><h2>Rule Portfolios</h2></div>
+<div id="ruleList"><div class="loading" style="padding:40px"><div class="spinner"></div></div></div>
+<script>
+function loadAI(){
+  fetch(`/api/ai-discovered?market=${MARKET}`).then(r=>r.json()).then(data=>{
+    if(!data.length){document.getElementById('aiList').innerHTML='<div class="empty-state"><h3>No strategies discovered yet</h3><p>Click "Run Discovery" to auto-generate and backtest rule strategies.</p></div>';return;}
+    let html='<div class="card-grid" style="grid-template-columns:repeat(auto-fill,minmax(300px,1fr))">';
+    data.forEach(p=>{
+      html+=`<div class="card"><div class="flex-between mb-8"><a href="/${MARKET==='INDIA'?'india/':''}portfolio/ai-discovered/${p.id}" style="font-weight:700">${p.name}</a><span class="badge badge-up">${(p.score||0).toFixed(1)}%</span></div>`;
+      html+=`<p class="text-muted" style="font-size:12px">Win Rate: ${(p.win_rate||0).toFixed(1)}% | Return: ${(p.avg_return||0).toFixed(3)}%</p>`;
+      html+=`<p style="font-size:11px;color:var(--text-muted)">Rules: ${p.rules}</p>`;
+      html+=`<div class="mt-16"><a href="/${MARKET==='INDIA'?'india/':''}portfolio/ai-discovered/${p.id}" class="btn btn-sm">Detail</a></div></div>`;
+    });
+    html+='</div>';
+    document.getElementById('aiList').innerHTML=html;
+  });
+  document.getElementById('ruleList').innerHTML='<p class="text-muted">Rule portfolios will appear here after creation.</p>';
+}
+function runAI(){
+  document.getElementById('aiStatus').style.display='block';
+  document.getElementById('aiStatusText').textContent='Running discovery...';
+  fetch('/api/ai-discovered/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:MARKET})}).then(r=>r.json()).then(d=>{
+    if(d.started){showToast('Discovery started');setInterval(pollAI,3000);}
+  });
+}
+function pollAI(){
+  fetch('/api/ai-discovered/status').then(r=>r.json()).then(d=>{
+    document.getElementById('aiStatusText').textContent=d.progress||d.status||'Running...';
+    if(d.status==='complete'){document.getElementById('aiStatus').style.display='none';loadAI();}
+  });
+}
+function killAI(){fetch('/api/ai-discovered/kill',{method:'POST'});document.getElementById('aiStatus').style.display='none';}
+loadAI();
+</script>
+{% endblock %}

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realistic 3D Solar System Explorer</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="ui-overlay">
+    <header id="top-bar">
+      <div class="brand">
+        <span class="brand-icon">☀</span>
+        <h1>Solar System Explorer</h1>
+      </div>
+      <div class="time-controls">
+        <label class="speed-control">
+          <span class="speed-label">Speed</span>
+          <input type="range" id="speed-slider" min="0" max="5" step="0.1" value="1">
+          <span id="speed-value" class="speed-value">1.0x</span>
+        </label>
+        <button id="pause-btn" class="btn-icon" title="Pause/Resume (Space)">
+          <span class="icon-pause">⏸</span>
+          <span class="icon-play" hidden>▶</span>
+        </button>
+        <button id="reset-btn" class="btn-icon" title="Reset View (R)">
+          ↺
+        </button>
+      </div>
+    </header>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <h2>Celestial Bodies</h2>
+        <button id="sidebar-toggle" class="btn-icon" aria-label="Toggle sidebar">☰</button>
+      </div>
+      <nav class="planet-list" id="planet-list">
+      </nav>
+      <div class="sidebar-footer">
+        <div class="legend">
+          <span class="legend-item"><span class="legend-dot" style="background:#ffd700"></span>Sun</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#b5b5b5"></span>Rocky</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#d4a574"></span>Gas Giants</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#4fd0e7"></span>Ice Giants</span>
+        </div>
+      </div>
+    </aside>
+
+    <div id="info-panel" class="info-panel hidden">
+      <button id="close-info" class="btn-close" aria-label="Close">×</button>
+      <div class="info-content" id="info-content"></div>
+    </div>
+
+    <div id="hud" class="hud hidden">
+      <div class="hud-row">
+        <span class="hud-label">Focus:</span>
+        <span id="hud-target" class="hud-value">Sun</span>
+      </div>
+      <div class="hud-row">
+        <span class="hud-label">Distance:</span>
+        <span id="hud-distance" class="hud-value">0 AU</span>
+      </div>
+      <div class="hud-row">
+        <span class="hud-label">Speed:</span>
+        <span id="hud-speed" class="hud-value">1.0x</span>
+      </div>
+      <div class="hud-row">
+        <span class="hud-label">Paused:</span>
+        <span id="hud-paused" class="hud-value">No</span>
+      </div>
+    </div>
+
+    <div id="help-tooltip" class="help-tooltip hidden">
+      <div class="help-content">
+        <h3>Controls</h3>
+        <ul class="controls-list">
+          <li><kbd>Click</kbd> planet to focus</li>
+          <li><kbd>Drag</kbd> to orbit camera</li>
+          <li><kbd>Scroll</kbd> / <kbd>Pinch</kbd> to zoom</li>
+          <li><kbd>Space</kbd> pause/resume</li>
+          <li><kbd>R</kbd> reset camera</li>
+          <li><kbd>H</kbd> toggle help</li>
+          <li><kbd>1-8</kbd> focus planets</li>
+          <li><kbd>0</kbd> focus Sun</li>
+          <li><kbd>←/→</kbd> prev/next planet</li>
+        </ul>
+      </div>
+    </div>
+
+    <button id="help-btn" class="btn-help" aria-label="Show controls (H)">?</button>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.164.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.164.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

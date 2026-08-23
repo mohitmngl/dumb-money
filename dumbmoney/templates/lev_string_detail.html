@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+{% block title %}LEV {{ string_id }} - {{ market }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Leverage ETF Basket <span class="badge badge-info">{{ string_id }}</span> <span class="badge badge-info">{{ market }}</span></h1>
+  <div class="flex-row">
+    <a class="btn btn-sm" href="/leverage-etf-screener/">Back to Leverage ETF Screener</a>
+  </div>
+</div>
+
+<div class="card mb-16" id="loadingState"><div class="loading" style="padding:40px"><div class="spinner"></div> Loading string...</div></div>
+
+<div id="detailBody" style="display:none">
+  <div class="card chart-card mb-16" style="overflow:hidden">
+    <div class="chart-toolbar" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap">
+      <div id="tfBtns" style="display:flex;gap:4px">
+        <button class="tf-btn active" data-tf="1D">1D</button>
+        <button class="tf-btn" data-tf="1W">1W</button>
+        <button class="tf-btn" data-tf="1M">1M</button>
+      </div>
+      <div style="width:1px;height:20px;background:var(--border)"></div>
+      <button id="togST" class="ind-btn active"><span style="color:#10b981">&#9632;</span> ST</button>
+      <button id="togVol" class="ind-btn active">Vol</button>
+      <div style="width:1px;height:20px;background:var(--border)"></div>
+      <label style="font-size:11px;color:var(--text-muted)">Period</label>
+      <input id="stPeriod" type="number" min="1" max="50" value="14" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+      <label style="font-size:11px;color:var(--text-muted)">Mult</label>
+      <input id="stMult" type="number" min="0.1" max="5" step="0.1" value="1.0" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+      <button id="stApply" class="btn btn-sm" style="font-size:11px">Apply</button>
+      <div style="flex:1"></div>
+      <span style="font-size:11px;color:var(--text-muted)" id="barCount"></span>
+    </div>
+    <div id="mainChartWrap" style="position:relative;height:500px">
+      <div id="mainChartBox" style="width:100%;height:100%"></div>
+      <div id="chartTooltip" style="position:absolute;top:8px;left:12px;z-index:20;pointer-events:none;font-size:11px;font-family:monospace;padding:6px 10px;border-radius:6px;background:rgba(0,0,0,.82);color:#fff;display:none;white-space:nowrap;max-width:100%;overflow:hidden"></div>
+    </div>
+  </div>
+
+  <div class="card chart-card mb-16" style="overflow:hidden">
+    <div class="chart-toolbar" style="display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--border)">
+      <button id="togAccel" class="ind-btn active"><span style="color:#2563eb">&#9632;</span> Accel A</button>
+      <span style="font-size:11px;color:var(--text-muted)">|</span>
+      <span style="font-size:11px;color:#f97316">&#9632; Base</span>
+      <div style="flex:1"></div>
+      <span style="font-size:10px;color:var(--text-muted)">Scroll = zoom, drag = pan</span>
+    </div>
+    <div id="accelChartBox" style="height:170px"></div>
+  </div>
+
+  <div class="card mb-16">
+    <h4>Basket Definition</h4>
+    <div id="exprBox" style="font-family:monospace;font-size:13px;word-break:break-all;background:rgba(255,255,255,0.04);padding:10px;border-radius:8px"></div>
+    <div id="metaBox" class="text-muted" style="font-size:12px;margin-top:8px"></div>
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px" id="metricsGrid"></div>
+
+  <div class="card mb-16" id="statsCard" style="display:none">
+    <h4>Performance Stats</h4>
+    <div class="card-grid" style="grid-template-columns:repeat(5,1fr);gap:8px" id="statsGrid"></div>
+  </div>
+
+  <div class="card mb-16">
+    <h4>Constituents (<span id="consCount">0</span> ETFs)</h4>
+    <div class="screener-table" id="consTable"></div>
+  </div>
+</div>
+
+<style>
+  .tf-btn,.ind-btn{font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text-muted);cursor:pointer;transition:all .15s}
+  .tf-btn:hover,.ind-btn:hover{border-color:#666;color:var(--text)}
+  .tf-btn.active{background:var(--accent,#2563eb);color:#fff;border-color:var(--accent,#2563eb)}
+  .ind-btn.active{background:rgba(37,99,235,.12);color:var(--accent,#2563eb);border-color:var(--accent,#2563eb)}
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const SID = "{{ string_id }}";
+const { createChart, CandlestickSeries, LineSeries, HistogramSeries } = LightweightCharts;
+
+let mainChart = null, accelChart = null;
+let candleSeries = null, volSeries = null, stSeries = null;
+let accelSeries = null, accelBaseSeries = null;
+let currentTF = '1D';
+let showST = true, showAccel = true, showVol = true;
+
+function fmt(n,d=2){return(n==null||n==='')?'-':Number(n).toFixed(d)}
+function signedPct(n){n=Number(n);if(!Number.isFinite(n))return'-';return(n>=0?'+':'')+n.toFixed(2)+'%'}
+
+function loadDetail(){
+  fetch('/api/leverage-etf-screener/detail/'+SID+'?market='+MARKET).then(r=>r.json()).then(d=>{
+    if(d.error){document.getElementById('loadingState').innerHTML='<div class="empty-state"><h3>String not found</h3></div>';return}
+    document.getElementById('loadingState').style.display='none';
+    document.getElementById('detailBody').style.display='block';
+    const u=d.universe||{};
+    document.getElementById('exprBox').textContent=u.expression||SID;
+    document.getElementById('metaBox').innerHTML='Constituents: <b>'+(u.num_stocks||0)+'</b> leveraged ETFs &nbsp;|&nbsp; Created: '+(u.created_at||'');
+    const m=d.metrics||{};
+    const cards=[
+      ['AI Matrix',fmt(m.ai_matrix),'heat'],['AI Conclusion',m.ai_conclusion||'-','badge'],
+      ['Value (index)',fmt(m.price),'num'],['Chg%',signedPct(m.change_pct),Number(m.change_pct)>=0?'up':'down'],
+      ['Next Day %',signedPct(m.next_day_return),Number(m.next_day_return)>=0?'up':'down'],
+      ['Wtd Alpha',fmt(m.weighted_alpha),Number(m.weighted_alpha)>=0?'up':'down'],
+      ['ST Signal',m.atr_signal==1?'Above':m.atr_signal==-1?'Below':'Neutral','badge'],
+      ['Accel',m.accel_signal==1?'UP':m.accel_signal==-1?'DOWN':'Neutral','badge'],
+      ['ATR%',fmt(m.atrp),'num'],['Streak',fmt(m.streak,0),Number(m.streak)>=0?'up':'down'],
+      ['P(Up) 1D',fmt(m.prob_up_1d),'heat'],['Volume',(m.volume||0).toLocaleString(),'num'],
+    ];
+    document.getElementById('metricsGrid').innerHTML=cards.map(c=>{
+      let v=c[1];
+      if(c[2]==='heat')v='<span class="heat-pill">'+v+'</span>';
+      else if(c[2]==='badge'){var b=c[1]==='BUY'||c[1]==='Above'||c[1]==='UP'?'badge-up':(c[1]==='SELL'||c[1]==='Below'||c[1]==='DOWN')?'badge-down':'badge-info';v='<span class="badge '+b+'">'+c[1]+'</span>'}
+      else if(c[2]==='up')v='<span class="text-up">'+c[1]+'</span>';
+      else if(c[2]==='down')v='<span class="text-down">'+c[1]+'</span>';
+      return'<div class="card" style="padding:12px"><div class="lbl" style="font-size:11px;color:#888">'+c[0]+'</div><div style="font-size:18px;font-weight:600;margin-top:4px">'+v+'</div></div>';
+    }).join('');
+    renderConstituents(d.contributions||[]);
+    loadStats();
+    loadChart();
+  }).catch(function(){document.getElementById('loadingState').innerHTML='<div class="empty-state"><h3>Failed to load</h3></div>'});
+}
+
+function loadStats(){
+  fetch('/api/leverage-etf-screener/'+SID+'/stats?market='+MARKET).then(function(r){return r.json()}).then(function(s){
+    if(!s||s.total_entries<2)return;
+    document.getElementById('statsCard').style.display='block';
+    var items=[
+      ['Win Rate',s.win_rate.toFixed(1)+'%',s.win_rate>=50?'up':'down'],
+      ['Sharpe',fmt(s.sharpe_1d),s.sharpe_1d>=1?'up':s.sharpe_1d<0?'down':''],
+      ['Total Return',s.total_return.toFixed(2)+'%',s.total_return>=0?'up':'down'],
+      ['Max Drawdown',s.max_drawdown.toFixed(2)+'%','down'],
+      ['Avg 1D Return',s.avg_1d_return.toFixed(4)+'%',s.avg_1d_return>=0?'up':'down'],
+      ['Total Entries',s.total_entries.toLocaleString(),''],
+    ];
+    document.getElementById('statsGrid').innerHTML=items.map(function(it){
+      var cls='';
+      if(it[2]==='up')cls='text-up';else if(it[2]==='down')cls='text-down';
+      return'<div class="card" style="padding:10px"><div class="lbl" style="font-size:10px;color:#888">'+it[0]+'</div><div class="'+cls+'" style="font-size:15px;font-weight:600;margin-top:3px">'+it[1]+'</div></div>';
+    }).join('');
+  }).catch(function(){});
+}
+
+function loadChart(){
+  var params=new URLSearchParams({market:MARKET,timeframe:currentTF});
+  var stP=document.getElementById('stPeriod').value||14;
+  var stM=document.getElementById('stMult').value||1.0;
+  var box=document.getElementById('mainChartBox');
+  box.innerHTML='<div class="loading" style="padding:40px"><div class="spinner"></div> Loading chart data...</div>';
+  Promise.all([
+    fetch('/api/leverage-etf-screener/'+SID+'/ohlc?'+params+'&limit=500').then(function(r){return r.json()}),
+    fetch('/api/leverage-etf-screener/'+SID+'/supertrend?'+params+'&period='+stP+'&multiplier='+stM).then(function(r){return r.json()}),
+    fetch('/api/leverage-etf-screener/'+SID+'/accel?'+params).then(function(r){return r.json()}),
+  ]).then(function(res){
+    var ohlc=res[0], st=res[1], acc=res[2];
+    box.innerHTML='';
+    document.getElementById('barCount').textContent=(ohlc.dates?ohlc.dates.length:0)+' bars';
+    try{renderMainChart(ohlc,st)}catch(e){console.error('renderMainChart error:',e);box.innerHTML='<div class="empty-state"><p>Chart error: '+e.message+'</p></div>';return}
+    try{renderAccelChart(ohlc,acc)}catch(e){console.error('renderAccelChart error:',e)}
+  }).catch(function(err){document.getElementById('mainChartBox').innerHTML='<div class="empty-state"><p>Chart data unavailable</p></div>'});
+}
+
+function getThemeColors(){
+  var isDark=document.documentElement.getAttribute('data-theme')==='dark';
+  return{bg:isDark?'#131722':'#ffffff',txt:isDark?'#d1d4dc':'#333',grid:isDark?'rgba(42,46,57,.6)':'rgba(0,0,0,.06)'};
+}
+
+function renderMainChart(ohlc,st){
+  if(!ohlc||!ohlc.dates||!ohlc.dates.length){document.getElementById('mainChartBox').innerHTML='<div class="empty-state"><h3>No chart data</h3></div>';return}
+  if(mainChart){mainChart.remove();mainChart=null}
+  var tc=getThemeColors();
+  var box=document.getElementById('mainChartBox');
+  var tip=document.getElementById('chartTooltip');
+
+  mainChart=createChart(box,{
+    width:box.clientWidth,height:500,autoSize:true,
+    layout:{background:{type:'solid',color:tc.bg},textStyle:{color:tc.txt,fontFamily:'system-ui'}},
+    grid:{vertLines:{color:tc.grid},horzLines:{color:tc.grid}},
+    crosshair:{mode:0},
+    rightPriceScale:{borderVisible:false,autoScale:true,scaleMargins:{top:0.08,bottom:0.18}},
+    timeScale:{timeVisible:false,secondsVisible:false,borderVisible:false},
+    handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:true},
+    handleScale:{axisPressedMouseMove:true,mouseWheel:true,pinch:true},
+  });
+
+  candleSeries=mainChart.addSeries(CandlestickSeries,{
+    upColor:'#10b981',downColor:'#ef4444',borderVisible:false,
+    wickUpColor:'#10b981',wickDownColor:'#ef4444',
+  });
+  var candleData=ohlc.dates.map(function(d,i){return{time:d,open:ohlc.open[i],high:ohlc.high[i],low:ohlc.low[i],close:ohlc.close[i]}});
+  candleSeries.setData(candleData);
+
+  if(ohlc.volume){
+    volSeries=mainChart.addSeries(HistogramSeries,{priceFormat:{type:'volume'},priceScaleId:'vol'});
+    mainChart.priceScale('vol').applyOptions({scaleMargins:{top:0.85,bottom:0}});
+    volSeries.setData(ohlc.dates.map(function(d,i){return{time:d,value:ohlc.volume[i]||0,color:'rgba(100,100,100,.3)'}}));
+  }
+
+  if(st&&st.dates&&st.dates.length){
+    var ohlcDates={};ohlc.dates.forEach(function(d){ohlcDates[d]=1});
+    stSeries=mainChart.addSeries(LineSeries,{color:'#10b981',lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+    stSeries.setData(st.dates.filter(function(d){return st.atr_stop[st.dates.indexOf(d)]!=null&&ohlcDates[d]}).map(function(d,i){var idx=st.dates.indexOf(d);return{time:d,value:st.atr_stop[idx]}}));
+  }
+
+  var lastIdx=Math.max(0,ohlc.dates.length-60);
+  setTimeout(function(){try{mainChart.timeScale().setVisibleLogicalRange({from:lastIdx,to:ohlc.dates.length-1})}catch(e){}},200);
+
+  var ohlcMap={};ohlc.dates.forEach(function(d,i){ohlcMap[d]=i});
+  mainChart.subscribeCrosshairMove(function(param){
+    if(!param||!param.time){tip.style.display='none';return}
+    var idx=ohlcMap[param.time];
+    if(idx==null){tip.style.display='none';return}
+    var chg=idx>0?((ohlc.close[idx]/ohlc.close[idx-1]-1)*100):0;
+    var col=ohlc.close[idx]>=ohlc.open[idx]?'#10b981':'#ef4444';
+    tip.innerHTML='<span style="color:'+col+';font-weight:700">'+param.time+'</span> &nbsp; O: '+ohlc.open[idx].toFixed(2)+' &nbsp; H: '+ohlc.high[idx].toFixed(2)+' &nbsp; L: '+ohlc.low[idx].toFixed(2)+' &nbsp; C: <b>'+ohlc.close[idx].toFixed(2)+'</b> &nbsp; '+(chg>=0?'+':'')+chg.toFixed(2)+'%';
+    tip.style.display='block';
+  });
+  updateMainVisibility();
+}
+
+function renderAccelChart(ohlc,acc){
+  if(!ohlc||!ohlc.dates||!acc||!acc.dates||!acc.dates.length){return}
+  if(accelChart){accelChart.remove();accelChart=null}
+  var tc=getThemeColors();
+  var box=document.getElementById('accelChartBox');
+  accelChart=createChart(box,{
+    width:box.clientWidth,height:170,
+    layout:{background:{type:'solid',color:tc.bg},textStyle:{color:tc.txt,fontFamily:'system-ui'}},
+    grid:{vertLines:{color:tc.grid},horzLines:{color:tc.grid}},
+    crosshair:{mode:0},rightPriceScale:{borderVisible:false,autoScale:true},
+    timeScale:{timeVisible:false,secondsVisible:false,borderVisible:false},
+    handleScroll:{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:true},
+    handleScale:{axisPressedMouseMove:true,mouseWheel:true,pinch:true},
+  });
+  accelSeries=accelChart.addSeries(LineSeries,{color:'#2563eb',lineWidth:1.5,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+  accelBaseSeries=accelChart.addSeries(LineSeries,{color:'#f97316',lineWidth:1.5,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+  var ohlcDates={};ohlc.dates.forEach(function(d){ohlcDates[d]=1});
+  accelSeries.setData(acc.dates.filter(function(d){return acc.accel_a[acc.dates.indexOf(d)]!=null&&ohlcDates[d]}).map(function(d,i){var idx=acc.dates.indexOf(d);return{time:d,value:acc.accel_a[idx]}}));
+  accelBaseSeries.setData(acc.dates.filter(function(d){return acc.accel_base[acc.dates.indexOf(d)]!=null&&ohlcDates[d]}).map(function(d,i){var idx=acc.dates.indexOf(d);return{time:d,value:acc.accel_base[idx]}}));
+  var lastIdx=Math.max(0,ohlc.dates.length-60);
+  setTimeout(function(){try{accelChart.timeScale().setVisibleLogicalRange({from:lastIdx,to:ohlc.dates.length-1})}catch(e){}},200);
+}
+
+function updateMainVisibility(){
+  if(volSeries)volSeries.applyOptions({visible:showVol});
+  if(stSeries)try{stSeries.applyOptions({visible:showST})}catch(e){}
+}
+
+document.addEventListener('click',function(e){
+  var tf=e.target.closest('.tf-btn');
+  if(tf){
+    document.querySelectorAll('.tf-btn').forEach(function(b){b.classList.remove('active')});
+    tf.classList.add('active');
+    currentTF=tf.dataset.tf;
+    loadChart();
+  }
+});
+
+document.getElementById('togST').addEventListener('click',function(){showST=!showST;this.classList.toggle('active');updateMainVisibility()});
+document.getElementById('togVol').addEventListener('click',function(){showVol=!showVol;this.classList.toggle('active');updateMainVisibility()});
+document.getElementById('togAccel').addEventListener('click',function(){
+  showAccel=!showAccel;this.classList.toggle('active');
+  var box=document.getElementById('accelChartBox');
+  if(box)box.style.display=showAccel?'block':'none';
+});
+document.getElementById('stApply').addEventListener('click',function(){loadChart()});
+
+window.addEventListener('resize',function(){
+  if(mainChart){var el=document.getElementById('mainChartBox');if(el&&el.clientWidth>0)mainChart.applyOptions({width:el.clientWidth})}
+  if(accelChart){var el2=document.getElementById('accelChartBox');if(el2&&el2.clientWidth>0)accelChart.applyOptions({width:el2.clientWidth})}
+});
+
+function renderConstituents(cons){
+  document.getElementById('consCount').textContent=cons.length;
+  if(!cons.length){document.getElementById('consTable').innerHTML='<p class="text-muted">No constituents.</p>';return}
+  var html='<table><thead><tr><th>Symbol</th><th>Weight</th><th>Price</th><th>Chg%</th><th>Wtd Alpha</th><th>ST</th><th>P(Up)1D</th><th>AI Matrix</th></tr></thead><tbody>';
+  cons.forEach(function(c){
+    var st2=c.atr_signal==1?'<span class="badge badge-up">Above</span>':c.atr_signal==-1?'<span class="badge badge-down">Below</span>':'-';
+    var cls=Number(c.change_pct)>=0?'text-up':'text-down';
+    html+='<tr><td><a href="/stock/'+c.symbol+'" target="_blank">'+c.symbol+'</a></td>'+
+      '<td>'+c.weight+'</td><td>'+fmt(c.price)+'</td>'+
+      '<td class="'+cls+'">'+signedPct(c.change_pct)+'</td><td>'+fmt(c.weighted_alpha)+'</td>'+
+      '<td>'+st2+'</td><td>'+fmt(c.prob_up_1d)+'</td><td><span class="heat-pill">'+fmt(c.ai_matrix)+'</span></td></tr>';
+  });
+  html+='</tbody></table>';
+  document.getElementById('consTable').innerHTML=html;
+}
+
+loadDetail();
+</script>
+{% endblock %}

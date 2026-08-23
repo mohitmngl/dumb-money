@@ -1,0 +1,7 @@
+2026-07-20 15:03:00,225 Starting US historical_string_screener rebuild...
+2026-07-20 15:03:00,245 Before: 0 rows
+2026-07-20 15:03:07,092 [US] close_pivot loaded: (3969, 1500), dates=1500, sids=50000, sym_list=3969
+2026-07-20 15:03:07,094 [US] computing basket values: 50000 strings x 1500 dates
+2026-07-20 15:03:45,812 [US] computing basket OHLC and indicators (SuperTrend + Accel on basket value)
+2026-07-20 15:07:24,236   Basket indicators: 5000/50000
+2026-07-20 15:10:30,121   Basket indicators: 10000/50000

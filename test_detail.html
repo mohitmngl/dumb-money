@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DumbMoney - String S018209 - US</title>
+  <link rel="stylesheet" href="/static/css/theme.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script>
+  const MARKET = 'US';
+  const OTHER_MARKET = 'INDIA';
+  </script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <a href="/">
+        <span>D</span>umb<span>Money</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      <a class="sidebar-item " href="/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
+        <span>Screener</span>
+      </a>
+      <a class="sidebar-item " href="/portfolio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
+        <span>Portfolios</span>
+      </a>
+      <a class="sidebar-item " href="/string-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        <span>String Screener</span>
+      </a>
+      <a class="sidebar-item active" href="/basket-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg>
+        <span>Basket Strings</span>
+      </a>
+      <a class="sidebar-item " href="/portfolio/ai-discovered">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+        <span>AI Strategies</span>
+      </a>
+      <a class="sidebar-item " href="/btst-dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3-3 3 2 5-7"/></svg>
+        <span>BTST Dashboard</span>
+      </a>
+      <a class="sidebar-item " href="/paper-trading">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+        <span>Paper Trading</span>
+      </a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="sidebar-stats" id="sidebarStats" style="padding:8px 16px;font-size:11px;color:#888;border-top:1px solid rgba(255,255,255,0.08)">
+        <div id="statTotal" style="margin-bottom:3px"></div>
+        <div id="statBars" style="margin-bottom:3px"></div>
+        <div id="statOldest" style="margin-bottom:3px"></div>
+        <div id="statLatest" style="margin-bottom:3px"></div>
+        <div id="statNew" style="margin-bottom:3px"></div>
+        <div id="statRefresh" style="margin-bottom:3px"></div>
+      </div>
+      <a class="sidebar-item" href="/settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        <span>Settings</span>
+      </a>
+    </div>
+  </aside>
+  <main class="main" id="main">
+    <header class="navbar">
+      <div class="market-switch">
+        <button class="market-btn active" onclick="window.location.href='/'">USA</button>
+        <button class="market-btn " onclick="window.location.href='/india/'">IN</button>
+      </div>
+      <div class="navbar-search">
+        <input type="text" id="globalSearch" placeholder="Search symbol..." autocomplete="off">
+      </div>
+      <div class="navbar-refresh">
+        <button class="btn btn-primary btn-sm" id="refreshBtn" onclick="startRefresh()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+          Refresh
+        </button>
+        <span id="refreshProgress" class="text-muted" style="font-size:12px;display:none"></span>
+      </div>
+    </header>
+    <div class="content">
+      
+<div class="page-header">
+  <h1>String <span class="badge badge-info">S018209</span> <span class="badge badge-info">US</span></h1>
+  <div class="flex-row">
+    <a class="btn btn-sm" href="/basket-screener/">Back to Basket Screener</a>
+  </div>
+</div>
+
+<div class="card mb-16" id="loadingState"><div class="loading" style="padding:40px"><div class="spinner"></div> Loading string...</div></div>
+
+<div id="detailBody" style="display:none">
+  <div class="card mb-16">
+    <h4>Basket Definition</h4>
+    <div id="exprBox" style="font-family:monospace;font-size:13px;word-break:break-all;background:rgba(255,255,255,0.04);padding:10px;border-radius:8px"></div>
+    <div id="metaBox" class="text-muted" style="font-size:12px;margin-top:8px"></div>
+  </div>
+
+  <div class="card-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px" id="metricsGrid"></div>
+
+  <div class="card mb-16">
+    <h4>Basket Performance History</h4>
+    <div id="chartBox" style="width:100%;height:300px"></div>
+  </div>
+
+  <div class="card">
+    <h4>Constituents (<span id="consCount">0</span> stocks)</h4>
+    <div class="screener-table" id="consTable"></div>
+  </div>
+</div>
+
+    </div>
+  </main>
+</div>
+
+<div class="card mb-16" id="refreshPanel" style="display:none;position:fixed;top:70px;right:20px;z-index:1000;width:340px;box-shadow:0 4px 20px rgba(0,0,0,0.15)">
+  <div class="flex-between">
+    <div class="flex-row">
+      <div class="spinner" id="refreshSpinner"></div>
+      <div>
+        <div style="font-weight:600" id="refreshStep">Starting...</div>
+        <div class="text-muted" style="font-size:12px" id="refreshPhase"></div>
+      </div>
+    </div>
+    <div class="flex-row">
+      <span class="text-muted" style="font-size:12px" id="refreshETA"></span>
+      <button class="btn btn-sm btn-danger" id="cancelBtn" onclick="cancelRefresh()">Cancel</button>
+    </div>
+  </div>
+  <div class="progress-bar mt-16" style="height:8px">
+    <div class="progress-fill" id="refreshBar" style="width:0%"></div>
+  </div>
+  <div class="flex-between mt-16" style="font-size:12px">
+    <span class="text-muted" id="refreshSymbols"></span>
+    <span class="text-muted" id="refreshElapsed"></span>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+<script>
+document.getElementById('globalSearch').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && this.value.trim()) {
+    window.location.href = '/' + (MARKET === 'INDIA' ? 'india/' : '') + 'stock/' + this.value.trim().toUpperCase();
+  }
+});
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+let refreshInterval;
+function startRefresh() {
+  fetch('/api/refresh', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({market: MARKET})
+  }).then(r => r.json()).then(d => {
+    if (d.started) {
+      showToast('Refresh started');
+      document.getElementById('refreshPanel').style.display = 'block';
+      document.getElementById('refreshSpinner').style.display = 'block';
+      document.getElementById('refreshStep').textContent = 'Starting refresh...';
+      if (!refreshInterval) refreshInterval = setInterval(pollRefresh, 2000);
+    }
+  }).catch(() => {});
+}
+
+function pollRefresh() {
+  fetch('/api/refresh/status?market=' + encodeURIComponent(MARKET)).then(r => r.json()).then(d => {
+    updateRefreshPanel(d);
+    if (d.status === 'complete') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshPanel').style.display = 'none';
+      showToast('Refresh complete!');
+      loadSidebarStats();
+      if (typeof loadScreener === 'function') loadScreener();
+      if (typeof loadBreadth === 'function') loadBreadth();
+      if (typeof loadTopLists === 'function') loadTopLists();
+      setTimeout(() => location.reload(), 1500);
+    } else if (d.status === 'running') {
+      var nc = d.new_stocks_count || 0;
+      if (nc > 0) {
+        document.getElementById('statNew').textContent = 'New IPOs: ' + nc + ' (downloading...)';
+      }
+    } else if (d.status === 'error') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshSpinner').style.display = 'none';
+      showToast('Refresh failed: ' + (d.phase || 'Unknown error'));
+    } else if (d.status === 'cancelled' || d.status === 'idle') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshPanel').style.display = 'none';
+    }
+  }).catch(() => {});
+}
+
+function updateRefreshPanel(d) {
+  const panel = document.getElementById('refreshPanel');
+  const spinner = document.getElementById('refreshSpinner');
+  if (!panel) return;
+  if (d.status === 'complete') {
+    spinner.style.display = 'none';
+    panel.style.display = 'none';
+    return;
+  }
+  spinner.style.display = d.status === 'running' ? 'block' : 'none';
+  panel.style.display = 'block';
+  document.getElementById('refreshStep').textContent = d.step_name || 'Starting...';
+  document.getElementById('refreshPhase').textContent = d.phase || '';
+  document.getElementById('refreshBar').style.width = (d.overall_pct || 0) + '%';
+  const total = d.symbols_total || 0;
+  const done = d.symbols_done || 0;
+  document.getElementById('refreshSymbols').textContent = total > 0 ? done.toLocaleString() + ' / ' + total.toLocaleString() + ' symbols' : '';
+  document.getElementById('refreshElapsed').textContent = d.elapsed_sec ? d.elapsed_sec + 's elapsed' : '';
+  document.getElementById('refreshETA').textContent = d.eta_sec > 0 ? 'ETA: ' + d.eta_sec + 's' : '';
+}
+
+function cancelRefresh() {
+  fetch('/api/refresh/cancel', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({market: MARKET})
+  }).then(() => {
+    document.getElementById('refreshPanel').style.display = 'none';
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    showToast('Refresh cancelled');
+  }).catch(() => {});
+}
+
+function checkRefreshStatus() {
+  fetch('/api/refresh/status?market=' + encodeURIComponent(MARKET)).then(r => r.json()).then(d => {
+    if (d.status === 'running') {
+      updateRefreshPanel(d);
+      document.getElementById('refreshPanel').style.display = 'block';
+      if (!refreshInterval) refreshInterval = setInterval(pollRefresh, 2000);
+    } else {
+      document.getElementById('refreshPanel').style.display = 'none';
+      if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    }
+  }).catch(() => {});
+}
+
+checkRefreshStatus();
+
+function loadSidebarStats() {
+  fetch('/api/market-stats?market=' + MARKET).then(r => r.json()).then(d => {
+    document.getElementById('statTotal').textContent = 'Stocks: ' + (d.total_assets || 0).toLocaleString();
+    document.getElementById('statBars').textContent = 'With bars: ' + (d.with_bars || 0).toLocaleString();
+    document.getElementById('statOldest').textContent = 'Oldest: ' + (d.oldest_date || 'N/A');
+    document.getElementById('statLatest').textContent = 'Latest: ' + (d.latest_date || 'N/A');
+    document.getElementById('statNew').textContent = 'New IPOs: ' + (d.last_refresh.new_stocks || 0) + ' last refresh';
+    var lr = d.last_refresh || {};
+    if (lr.status === 'running') {
+      document.getElementById('statRefresh').textContent = 'Refreshing: ' + (lr.phase || '...');
+    } else if (lr.finished_at) {
+      document.getElementById('statRefresh').textContent = 'Updated: ' + lr.finished_at;
+    } else {
+      document.getElementById('statRefresh').textContent = '';
+    }
+  }).catch(() => {});
+}
+loadSidebarStats();
+</script>
+
+<script>
+const SID = "S018209";
+const MARKET = "US";
+
+function fmt(n, d=2) { return (n==null||n==='') ? '-' : Number(n).toFixed(d); }
+function signedPct(n) {
+  n = Number(n); if (!Number.isFinite(n)) return '-';
+  return (n>=0?'+':'') + n.toFixed(2) + '%';
+}
+
+function loadDetail() {
+  fetch('/api/basket-screener/detail/' + SID + '?market=' + MARKET).then(r => r.json()).then(d => {
+    if (d.error) { document.getElementById('loadingState').innerHTML = '<div class="empty-state"><h3>String not found</h3></div>'; return; }
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('detailBody').style.display = 'block';
+
+    const u = d.universe || {};
+    document.getElementById('exprBox').textContent = u.expression || SID;
+    document.getElementById('metaBox').innerHTML =
+      `Constituents: <b>${u.num_stocks||0}</b> &nbsp;|&nbsp; Created: ${u.created_at||''}`;
+
+    const m = d.metrics || {};
+    const cards = [
+      ['AI Matrix', fmt(m.ai_matrix), 'heat'],
+      ['AI Conclusion', m.ai_conclusion || '-', 'badge'],
+      ['Value (index)', fmt(m.price), 'num'],
+      ['Chg%', signedPct(m.change_pct), Number(m.change_pct)>=0?'up':'down'],
+      ['Next Day %', signedPct(m.next_day_return), Number(m.next_day_return)>=0?'up':'down'],
+      ['Wtd Alpha', fmt(m.weighted_alpha), Number(m.weighted_alpha)>=0?'up':'down'],
+      ['ST Signal', m.atr_signal==1?'Above':m.atr_signal==-1?'Below':'Neutral', 'badge'],
+      ['Accel', m.accel_signal==1?'UP':m.accel_signal==-1?'DOWN':'Neutral', 'badge'],
+      ['ATR%', fmt(m.atrp), 'num'],
+      ['Streak', fmt(m.streak,0), Number(m.streak)>=0?'up':'down'],
+      ['P(Up) 1D', fmt(m.prob_up_1d), 'heat'],
+      ['Volume', (m.volume||0).toLocaleString(), 'num'],
+    ];
+    document.getElementById('metricsGrid').innerHTML = cards.map(c => {
+      let v = c[1];
+      if (c[2]==='heat') v = `<span class="heat-pill">${v}</span>`;
+      else if (c[2]==='badge') {
+        const b = c[1]==='BUY'||c[1]==='Above'||c[1]==='UP' ? 'badge-up' : (c[1]==='SELL'||c[1]==='Below'||c[1]==='DOWN')?'badge-down':'badge-info';
+        v = `<span class="badge ${b}">${c[1]}</span>`;
+      } else if (c[2]==='up') v = `<span class="text-up">${c[1]}</span>`;
+      else if (c[2]==='down') v = `<span class="text-down">${c[1]}</span>`;
+      return `<div class="card" style="padding:12px"><div class="lbl" style="font-size:11px;color:#888">${c[0]}</div><div style="font-size:18px;font-weight:600;margin-top:4px">${v}</div></div>`;
+    }).join('');
+
+    drawChart(d.history || []);
+    renderConstituents(d.contributions || []);
+  }).catch(() => {
+    document.getElementById('loadingState').innerHTML = '<div class="empty-state"><h3>Failed to load</h3></div>';
+  });
+}
+
+function drawChart(history) {
+  if (!history.length) { document.getElementById('chartBox').innerHTML = '<p class="text-muted">No history.</p>'; return; }
+  const W = 1000, H = 280, pad = 30;
+  const prices = history.map(h => parseFloat(h.price) || 0).filter(x => x > 0);
+  const aim = history.map(h => parseFloat(h.ai_matrix) || 0);
+  if (!prices.length) return;
+  const pmin = Math.min(...prices), pmax = Math.max(...prices);
+  const n = prices.length;
+  const x = i => pad + (W - 2*pad) * (n<=1?0.5:i/(n-1));
+  const y = v => H - pad - (H - 2*pad) * ((v - pmin) / (pmax - pmin || 1));
+  let line = prices.map((v,i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  let aimPts = aim.map((v,i) => `${x(i).toFixed(1)},${(H - pad - (H-2*pad)*(v/100)).toFixed(1)}`).join(' ');
+  document.getElementById('chartBox').innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:100%">
+      <polyline points="${line}" fill="none" stroke="#27e08a" stroke-width="2"/>
+      <polyline points="${aimPts}" fill="none" stroke="#4aa3ff" stroke-width="1.5" opacity="0.8"/>
+      <text x="${pad}" y="16" fill="#888" font-size="11">Basket Value (green) / AI Matrix (blue, 0-100)</text>
+    </svg>`;
+}
+
+function renderConstituents(cons) {
+  document.getElementById('consCount').textContent = cons.length;
+  if (!cons.length) { document.getElementById('consTable').innerHTML = '<p class="text-muted">No constituents.</p>'; return; }
+  let html = '<table><thead><tr><th>Symbol</th><th>Weight</th><th>Price</th><th>Chg%</th><th>Wtd Alpha</th><th>ST</th><th>P(Up)1D</th><th>AI Matrix</th></tr></thead><tbody>';
+  cons.forEach(c => {
+    const st = c.atr_signal==1?'<span class="badge badge-up">Above</span>':c.atr_signal==-1?'<span class="badge badge-down">Below</span>':'-';
+    const cls = Number(c.change_pct)>=0?'text-up':'text-down';
+    html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}stock/${c.symbol}">${c.symbol}</a></td>` +
+      `<td>${c.weight}</td><td>${fmt(c.price)}</td>` +
+      `<td class="${cls}">${signedPct(c.change_pct)}</td><td>${fmt(c.weighted_alpha)}</td>` +
+      `<td>${st}</td><td>${fmt(c.prob_up_1d)}</td><td><span class="heat-pill">${fmt(c.ai_matrix)}</span></td></tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('consTable').innerHTML = html;
+}
+
+loadDetail();
+</script>
+
+</body>
+</html>

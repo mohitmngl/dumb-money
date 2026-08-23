@@ -1,0 +1,59 @@
+You are a senior 30+ year veteran software engineer, mathematician, data scientist, and systems architect. You are analyzing a stock screening web application called DumbMoney built with Flask/SQLite.
+
+CRITICAL: Read EVERY file in the project to understand the full codebase before making any recommendations. Read at minimum: app.py, engine.py, db.py, refresh.py, indicators.py, basket_screener.py, string_screener.py, and all templates under dumbmoney/templates/. Read the AGENTS.md and SPEED.md files first.
+
+TASK: Analyze the entire codebase, identify ALL bugs, speed issues, architectural problems, and create a DETAILED atomic-level plan (minimum 2000 lines) covering every issue below. Do NOT write code yet - just analyze and plan.
+
+HERE ARE ALL THE ISSUES TO FIX:
+
+=== SECTION 1: REFRESH FLOW AND SPEED ===
+1. Refresh flow is too slow - needs to be fast enough to use daily before market close
+2. Historical string screener rebuild is extremely slow
+3. String generation (25,000 strings) is too slow
+4. All derived computations need speed optimization
+5. Each market (US/India) must refresh independently and fast
+
+=== SECTION 2: STRING BASKET ISSUES ===
+6. Basket strings currently include SHORT positions but they should be LONG ONLY strings
+7. LS (Long+Short) screener strings must correctly model real PnL: if a short goes UP the short loses, if long goes UP the long gains - the net string return must reflect this correctly
+8. Alpaca does not support fractional SHORTS - the system must: sell integer qty, buy back fractional, net as short exposure
+9. Current string short stock quantities are NOT counted as exposure - they must be
+10. String charts show prices like $2, $3 instead of absolute dollar amounts - must show actual prices
+11. LS screener strings show NEGATIVE prices in charts - impossible, must fix
+
+=== SECTION 3: DATE FILTER BROKEN ===
+12. Date filter does NOT work for ANY screener type on the website - either no data or errors
+13. Date filter must work correctly for all screener modes
+
+=== SECTION 4: ETF FILTERING ===
+14. Remove ALL treasury bonds, bond ETFs, and similar instruments from the entire website
+15. These instruments barely move (0.02% daily) and contaminate results
+
+=== SECTION 5: CHARTS AND UI ===
+16. Chart height is too small on all pages
+17. Charts open at oldest date instead of latest candle - must open at latest
+18. Accel chart is NOT connected/shown with price chart
+19. First fold should show: Price Chart + Accel Chart connected vertically
+20. Add a NEW WTD Alpha chart section similar to Accel chart (below accel)
+21. Stock details page should have EXACTLY the same layout as string details page (price chart + accel + wtd alpha)
+22. String details page must show current price and change_pct at the top, like the stock page does
+
+=== SECTION 6: COMPUTATION CORRECTNESS ===
+23. ALL computation calculations must be verified and correct
+24. Exception: Do NOT touch or modify the WTD Alpha calculation itself - leave it exactly as-is
+25. WTD Alpha values showing in millions for top strings - verify if this is correct or a display bug
+26. LS screener must show TRUE net return accounting for both long and short legs correctly
+
+=== SECTION 7: REFRESH ARCHITECTURE ===
+27. Clicking USA refresh should refresh ALL US screener data
+28. Clicking India refresh should refresh ALL India screener data
+29. Markets must be completely independent
+30. Target: minimum possible refresh time for daily use before market close
+
+=== SECTION 8: STRING DETAILS ===
+31. String details page needs current price and change_pct displayed at top
+32. Same layout as stock details page
+
+DO NOT modify the intraday_backtest section - leave it completely as-is.
+
+Read every relevant file, understand the architecture, identify all bugs and speed bottlenecks, then produce a comprehensive plan organized by priority and dependency order. The plan should be specific enough that a developer can implement each item.

@@ -1,0 +1,46 @@
+You are a senior 30+ year veteran software engineer, mathematician, data scientist, and systems architect. 
+
+FIRST: Read AGENTS.md, SPEED.md, and these key files: dumbmoney/app.py, dumbmoney/engine.py, dumbmoney/db.py, dumbmoney/refresh.py, dumbmoney/indicators.py, dumbmoney/basket_screener.py, dumbmoney/string_screener.py, and ALL templates in dumbmoney/templates/.
+
+Then analyze and create an ATOMIC-LEVEL PLAN for fixing these issues. Do NOT write code - just plan.
+
+ISSUES:
+
+SECTION 1: REFRESH FLOW AND SPEED
+1. Refresh flow too slow for daily use before market close
+2. Historical string screener rebuild extremely slow
+3. String generation (25,000 strings) too slow
+4. Each market (US/India) must refresh independently and fast
+
+SECTION 2: STRING BASKET ISSUES
+5. Basket strings include SHORT positions but should be LONG ONLY
+6. LS screener strings must correctly model real PnL (short UP = loss, long UP = gain)
+7. Alpaca does not support fractional SHORTS - must use integer qty workaround
+8. Current string short stock quantities NOT counted as exposure
+9. String charts show prices like $2 instead of actual prices
+10. LS screener strings show NEGATIVE prices in charts (impossible)
+
+SECTION 3: DATE FILTER BROKEN
+11. Date filter does NOT work for ANY screener type
+
+SECTION 4: ETF FILTERING
+12. Remove ALL treasury bonds, bond ETFs from entire website
+
+SECTION 5: CHARTS AND UI
+13. Chart height too small on all pages
+14. Charts open at oldest date instead of latest candle
+15. Accel chart NOT connected with price chart
+16. First fold: Price Chart + Accel Chart connected vertically
+17. Add WTD Alpha chart below accel
+18. Stock details page must match string details layout
+19. String details page must show current price and change_pct at top
+
+SECTION 6: COMPUTATION
+20. Verify all computations correct
+21. Do NOT touch WTD Alpha calculation itself
+22. WTD Alpha values in millions for top strings - verify if correct
+23. LS screener must show TRUE net return
+
+DO NOT touch intraday_backtest section.
+
+Produce a comprehensive plan organized by priority.

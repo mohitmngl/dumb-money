@@ -1,0 +1,69 @@
+﻿================================================================================
+  SUPER TREND BACKTEST (intraday_backtest.db)
+  SuperTrend(14,3) | No overnight holding
+  Capital per trade: $100
+================================================================================
+
+--- UNIVERSE ---
+  Universe: 219 stocks with vol>0.5M
+  Universe: 219 stocks
+
+--- DATA INFO ---
+  1Min: 1,239,913 bars, 199 stocks, 2026-06-22T12:00:00Z to 2026-07-17T20:54:00Z
+  5Min: 18,189,514 bars, 200 stocks, 2019-06-20T13:30:00Z to 2026-07-17T20:50:00Z
+  15Min: 2,064,902 bars, 200 stocks, 2020-07-27T13:30:00Z to 2026-07-17T20:45:00Z
+
+################################################################################
+  TIMEFRAME: 1Min (219 stocks, max 5000 bars each)
+################################################################################
+  Loaded 199 stocks in 21.3s
+  Sample (RIVN): 5000 bars
+
+--- PROBABILITY ANALYSIS ---
+
+======================================================================
+  PROBABILITY ANALYSIS: 1Min candles
+======================================================================
+  Total ST cross-up signals: 23489
+  Unique stocks with signals: 199
+  Avg signals per stock: 118.0
+
+  PROBABILITY OF CONTINUATION AFTER ST CROSS-UP:
+  Lookahead       Probability     Bar
+  ---------------------------------------------
+  1 candle          37.7%        ##################
+  2 candles         27.8%        #############
+  3 candles         23.0%        ###########
+  5 candles         18.2%        #########
+  10 candles        13.2%        ######
+
+  First candle return:
+    Avg:   -0.006%
+    Median: +0.000%
+
+  Max consecutive candles up distribution:
+     0 candles: 14638 ( 62.3%) ###############################
+     1 candles:  2314 (  9.9%) ####
+     2 candles:  1129 (  4.8%) ##
+     3 candles:   647 (  2.8%) #
+     4 candles:   488 (  2.1%) #
+     5 candles:   347 (  1.5%) 
+     6 candles:   286 (  1.2%) 
+     7 candles:   229 (  1.0%) 
+     8 candles:   164 (  0.7%) 
+     9 candles:   136 (  0.6%) 
+    10 candles:   122 (  0.5%) 
+    11 candles:   106 (  0.5%) 
+    12 candles:    97 (  0.4%) 
+    13 candles:    94 (  0.4%) 
+    14 candles:    80 (  0.3%) 
+    15 candles:    63 (  0.3%) 
+    16 candles:    61 (  0.3%) 
+    17 candles:    84 (  0.4%) 
+    18 candles:    61 (  0.3%) 
+    19 candles:    57 (  0.2%) 
+    20 candles:  2286 (  9.7%) ####
+======================================================================
+
+--- INDIVIDUAL STOCK BACKTEST ---
+  Next Candle Exit         : 500 trades, win=35.2%, PF=0.95 (41.5s)

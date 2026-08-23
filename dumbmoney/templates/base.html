@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DumbMoney - {% block title %}Screener{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/theme.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script>
+  const MARKET = '{{ market }}';
+  const OTHER_MARKET = '{{ other_market }}';
+  </script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <a href="/{{ 'india/' if market == 'INDIA' else '' }}">
+        <span>D</span>umb<span>Money</span>
+      </a>
+    </div>
+    <nav class="sidebar-nav">
+      {% if market == 'CRYPTO' %}
+      <a class="sidebar-item {% if request.path.startswith('/crypto/') %}active{% endif %}" href="/crypto/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        <span>Screener</span>
+      </a>
+      <a class="sidebar-item {% if '/crypto/portfolio' in request.path %}active{% endif %}" href="/crypto/portfolio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
+        <span>Portfolios</span>
+      </a>
+      <a class="sidebar-item {% if '/crypto/paper-trading' in request.path %}active{% endif %}" href="/crypto/paper-trading">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+        <span>Live Trading</span>
+      </a>
+      {% else %}
+      <a class="sidebar-item {% if request.path in ['/', '/india/'] %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
+        <span>Screener</span>
+      </a>
+      <a class="sidebar-item {% if '/portfolio' in request.path and '/ai-discovered' not in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}portfolio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
+        <span>Portfolios</span>
+      </a>
+      <a class="sidebar-item {% if '/string-screener' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}string-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        <span>String Screener</span>
+      </a>
+      <a class="sidebar-item {% if '/basket-screener' in request.path and '/leaderboard' not in request.path and '/long-short' not in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg>
+        <span>Basket Strings</span>
+      </a>
+      {% if market != 'INDIA' %}
+      <a class="sidebar-item {% if '/long-short' in request.path %}active{% endif %}" href="/long-short-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>
+        <span>Long + Short</span>
+      </a>
+      {% endif %}
+      {% if market != 'INDIA' %}
+      <a class="sidebar-item {% if '/leverage-etf' in request.path %}active{% endif %}" href="/leverage-etf-screener/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span>Leverage ETFs</span>
+      </a>
+      {% endif %}
+      <a class="sidebar-item {% if '/basket-screener/leaderboard' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/leaderboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3 7h7l-5.5 4.5 2 7L12 16l-6.5 4.5 2-7L2 9h7z"/></svg>
+        <span>Leaderboard</span>
+      </a>
+      <a class="sidebar-item {% if '/ai-discovered' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}portfolio/ai-discovered">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+        <span>AI Strategies</span>
+      </a>
+      <a class="sidebar-item {% if '/vault' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}vault">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1"/></svg>
+        <span>Vault</span>
+      </a>
+      <a class="sidebar-item {% if '/btst-dashboard' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}btst-dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3-3 3 2 5-7"/></svg>
+        <span>BTST Dashboard</span>
+      </a>
+      <a class="sidebar-item {% if '/paper-trading' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}paper-trading">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+        <span>Paper Trading</span>
+      </a>
+      <a class="sidebar-item {% if '/intraday-backtest' in request.path %}active{% endif %}" href="/intraday-backtest/">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span>Intraday Backtest</span>
+      </a>
+      {% endif %}
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="sidebar-stats" id="sidebarStats" style="padding:8px 16px;font-size:11px;color:#888;border-top:1px solid rgba(255,255,255,0.08)">
+        <div id="statTotal" style="margin-bottom:3px"></div>
+        <div id="statBars" style="margin-bottom:3px"></div>
+        <div id="statOldest" style="margin-bottom:3px"></div>
+        <div id="statLatest" style="margin-bottom:3px"></div>
+        <div id="statNew" style="margin-bottom:3px"></div>
+        <div id="statRefresh" style="margin-bottom:3px"></div>
+      </div>
+      <a class="sidebar-item" href="/{{ 'india/' if market == 'INDIA' else '' }}settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        <span>Settings</span>
+      </a>
+    </div>
+  </aside>
+  <main class="main" id="main">
+    <header class="navbar">
+      <div class="market-switch">
+        <button class="market-btn {% if market == 'US' %}active{% endif %}" onclick="window.location.href='/'">USA</button>
+        <button class="market-btn {% if market == 'INDIA' %}active{% endif %}" onclick="window.location.href='/india/'">IN</button>
+        <button class="market-btn {% if market == 'CRYPTO' %}active{% endif %}" onclick="window.location.href='/crypto/'">CRYPTO</button>
+      </div>
+      <div class="navbar-search">
+        <input type="text" id="globalSearch" placeholder="Search symbol..." autocomplete="off">
+      </div>
+      <div class="navbar-refresh">
+        <button class="btn btn-primary btn-sm" id="refreshBtn" onclick="startRefresh()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+          Refresh
+        </button>
+        <span id="refreshProgress" class="text-muted" style="font-size:12px;display:none"></span>
+      </div>
+    </header>
+    <div class="content">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+
+<div class="card mb-16" id="refreshPanel" style="display:none;position:fixed;top:70px;right:20px;z-index:1000;width:340px;box-shadow:0 4px 20px rgba(0,0,0,0.15)">
+  <div class="flex-between">
+    <div class="flex-row">
+      <div class="spinner" id="refreshSpinner"></div>
+      <div>
+        <div style="font-weight:600" id="refreshStep">Starting...</div>
+        <div class="text-muted" style="font-size:12px" id="refreshPhase"></div>
+      </div>
+    </div>
+    <div class="flex-row">
+      <span class="text-muted" style="font-size:12px" id="refreshETA"></span>
+      <button class="btn btn-sm btn-danger" id="cancelBtn" onclick="cancelRefresh()">Cancel</button>
+    </div>
+  </div>
+  <div class="progress-bar mt-16" style="height:8px">
+    <div class="progress-fill" id="refreshBar" style="width:0%"></div>
+  </div>
+  <div class="flex-between mt-16" style="font-size:12px">
+    <span class="text-muted" id="refreshSymbols"></span>
+    <span class="text-muted" id="refreshElapsed"></span>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+<script>
+document.getElementById('globalSearch').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && this.value.trim()) {
+    var path = '/' + (MARKET === 'INDIA' ? 'india/' : MARKET === 'CRYPTO' ? 'crypto/' : '') + 'stock/' + this.value.trim().toUpperCase();
+    window.location.href = path;
+  }
+});
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+let refreshInterval;
+function startRefresh() {
+  const isCrypto = MARKET === 'CRYPTO';
+  const url = isCrypto ? '/api/crypto/refresh' : '/api/refresh';
+  fetch(url, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({market: MARKET})
+  }).then(r => r.json()).then(d => {
+    if (d.started) {
+      showToast('Refresh started');
+      document.getElementById('refreshPanel').style.display = 'block';
+      document.getElementById('refreshSpinner').style.display = 'block';
+      document.getElementById('refreshStep').textContent = 'Starting refresh...';
+      if (!refreshInterval) refreshInterval = setInterval(pollRefresh, 1000);
+    }
+  }).catch(() => {});
+}
+
+function pollRefresh() {
+  const isCrypto = MARKET === 'CRYPTO';
+  const url = isCrypto ? '/api/crypto/refresh/status' : '/api/refresh/status?market=' + encodeURIComponent(MARKET);
+  fetch(url).then(r => r.json()).then(d => {
+    updateRefreshPanel(d);
+    if (d.status === 'complete') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshPanel').style.display = 'none';
+      showToast('Refresh complete!');
+      loadSidebarStats();
+      if (typeof loadScreener === 'function') loadScreener();
+      if (typeof loadBreadth === 'function') loadBreadth();
+      if (typeof loadTopLists === 'function') loadTopLists();
+      setTimeout(() => location.reload(), 1500);
+    } else if (d.status === 'running') {
+      var nc = d.new_stocks_count || 0;
+      if (nc > 0) {
+        document.getElementById('statNew').textContent = 'New IPOs: ' + nc + ' (downloading...)';
+      }
+    } else if (d.status === 'error') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshSpinner').style.display = 'none';
+      document.getElementById('refreshStep').textContent = 'FAILED: ' + (d.phase || 'Unknown error');
+      document.getElementById('refreshBar').style.width = '100%';
+      document.getElementById('refreshBar').style.background = 'var(--red, #ef4444)';
+      showToast('Refresh failed: ' + (d.phase || 'Unknown error'));
+      setTimeout(() => { document.getElementById('refreshPanel').style.display = 'none'; }, 5000);
+    } else if (d.status === 'cancelled' || d.status === 'idle') {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+      document.getElementById('refreshPanel').style.display = 'none';
+    }
+  }).catch(() => {});
+}
+
+function updateRefreshPanel(d) {
+  const panel = document.getElementById('refreshPanel');
+  const spinner = document.getElementById('refreshSpinner');
+  if (!panel) return;
+  if (d.status === 'complete') {
+    spinner.style.display = 'none';
+    panel.style.display = 'none';
+    return;
+  }
+  if (d.status === 'error') {
+    spinner.style.display = 'none';
+    panel.style.display = 'block';
+    document.getElementById('refreshStep').textContent = 'FAILED: ' + (d.phase || 'Unknown error');
+    document.getElementById('refreshBar').style.width = '100%';
+    document.getElementById('refreshBar').style.background = 'var(--red, #ef4444)';
+    return;
+  }
+  spinner.style.display = d.status === 'running' ? 'block' : 'none';
+  panel.style.display = 'block';
+  document.getElementById('refreshStep').textContent = d.step_detail || d.step_name || 'Starting...';
+  document.getElementById('refreshPhase').textContent = d.phase || '';
+  document.getElementById('refreshBar').style.width = (d.overall_pct || 0) + '%';
+  const total = d.symbols_total || 0;
+  const done = d.symbols_done || 0;
+  document.getElementById('refreshSymbols').textContent = total > 0 ? done.toLocaleString() + ' / ' + total.toLocaleString() + ' symbols' : '';
+  const elapsed = d.elapsed_sec || 0;
+  const em = Math.floor(elapsed / 60);
+  const es = elapsed % 60;
+  document.getElementById('refreshElapsed').textContent = em > 0 ? em + 'm ' + es + 's' : es + 's';
+  const eta = d.eta_sec || 0;
+  if (eta > 0) {
+    const um = Math.floor(eta / 60);
+    const us = eta % 60;
+    document.getElementById('refreshETA').textContent = um > 0 ? 'ETA: ' + um + 'm ' + us + 's' : 'ETA: ' + us + 's';
+  } else {
+    document.getElementById('refreshETA').textContent = '';
+  }
+}
+
+function cancelRefresh() {
+  const isCrypto = MARKET === 'CRYPTO';
+  const url = isCrypto ? '/api/crypto/refresh/cancel' : '/api/refresh/cancel';
+  fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({market: MARKET})
+  }).then(() => {
+    document.getElementById('refreshPanel').style.display = 'none';
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    showToast('Refresh cancelled');
+  }).catch(() => {});
+}
+
+function checkRefreshStatus() {
+  const isCrypto = MARKET === 'CRYPTO';
+  const url = isCrypto ? '/api/crypto/refresh/status' : '/api/refresh/status?market=' + encodeURIComponent(MARKET);
+  fetch(url).then(r => r.json()).then(d => {
+    if (d.status === 'running') {
+      updateRefreshPanel(d);
+      document.getElementById('refreshPanel').style.display = 'block';
+      if (!refreshInterval) refreshInterval = setInterval(pollRefresh, 1000);
+    } else {
+      document.getElementById('refreshPanel').style.display = 'none';
+      if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    }
+  }).catch(() => {});
+}
+
+checkRefreshStatus();
+
+function loadSidebarStats() {
+  fetch('/api/market-stats?market=' + MARKET).then(r => r.json()).then(d => {
+    document.getElementById('statTotal').textContent = 'Stocks: ' + (d.total_assets || 0).toLocaleString();
+    document.getElementById('statBars').textContent = 'With bars: ' + (d.with_bars || 0).toLocaleString();
+    document.getElementById('statOldest').textContent = 'Oldest: ' + (d.oldest_date || 'N/A');
+    document.getElementById('statLatest').textContent = 'Latest: ' + (d.latest_date || 'N/A');
+    var lr = d.last_refresh || {};
+    document.getElementById('statNew').textContent = 'New IPOs: ' + (lr.new_stocks || 0) + ' last refresh';
+    if (lr.status === 'running') {
+      document.getElementById('statRefresh').textContent = 'Refreshing: ' + (lr.phase || '...');
+    } else if (lr.finished_at) {
+      document.getElementById('statRefresh').textContent = 'Updated: ' + lr.finished_at;
+    } else {
+      document.getElementById('statRefresh').textContent = '';
+    }
+  }).catch(() => {});
+}
+loadSidebarStats();
+</script>
+
+    {% if market == 'CRYPTO' %}
+    <div id="liveTradingPanel" style="display:none; position:fixed; top:70px; right:20px; z-index:1000; width:380px; max-height: calc(100vh - 100px); overflow-y:auto; box-shadow: 0 4px 20px rgba(0,0,0,0.2); background: var(--bg-card, #1a1a2e); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px;">
+      <div style="padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.08); display:flex; justify-content:space-between; align-items:center;">
+        <strong style="font-size:14px;">Live Trading</strong>
+        <button class="btn btn-sm" onclick="document.getElementById('liveTradingPanel').style.display='none'">close</button>
+      </div>
+      <div style="padding:12px 16px; font-size:12px; color:var(--text-muted, #888); border-bottom:1px solid rgba(255,255,255,0.05);">
+        <label style="cursor:pointer; display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="liveModeToggle" onchange="toggleLiveMode()"> Live trading (real Delta orders)
+        </label>
+      </div>
+      <div style="padding:12px 16px;">
+        <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted, #888); margin-bottom:6px;">Wallet Balance</div>
+        <div id="ltWallet" style="font-size:13px; min-height:32px;">
+          <div class="loading"><div class="spinner" style="width:14px;height:14px;border-width:2px"></div></div>
+        </div>
+      </div>
+      <div style="padding:0 16px 12px;">
+        <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted, #888); margin-bottom:6px;">Open Positions</div>
+        <div id="ltPositions" style="font-size:13px; min-height:32px;">
+          <div class="loading"><div class="spinner" style="width:14px;height:14px;border-width:2px"></div></div>
+        </div>
+      </div>
+      <div style="padding:0 16px 16px;">
+        <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted, #888); margin-bottom:6px;">Trade History</div>
+        <div id="ltHistory" style="font-size:12px; max-height:240px; overflow:auto; min-height:32px;">
+          <div class="loading"><div class="spinner" style="width:14px;height:14px;border-width:2px"></div></div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if market == 'CRYPTO' %}
+    let _ltMode = false;
+    function toggleLiveMode() {
+      _ltMode = document.getElementById('liveModeToggle').checked;
+      loadLiveTradingData();
+    }
+    function loadLiveTradingPanel() {
+      const panel = document.getElementById('liveTradingPanel');
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+      if (panel.style.display === 'block') loadLiveTradingData();
+    }
+    function loadLiveTradingData() {
+      fetch('/api/crypto/balances').then(r => r.json()).then(data => {
+        const el = document.getElementById('ltWallet');
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<span style="color:var(--text-muted)">No balances</span>'; return;
+        }
+        let html = '';
+        data.forEach(b => {
+          const bal = parseFloat(b.balance || 0);
+          const lock = parseFloat(b.locked || 0);
+          if (bal > 0.000001 || lock > 0.000001) {
+            html += `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04)">
+              <span>${b.asset || b.symbol || '?'}</span>
+              <span>Avail: <b>${bal.toFixed(6)}</b> | Locked: ${lock.toFixed(6)}</span>
+            </div>`;
+          }
+        });
+        el.innerHTML = html || '<span style="color:var(--text-muted)">No balances</span>';
+      }).catch(() => {
+        document.getElementById('ltWallet').innerHTML = '<span style="color:var(--text-muted)">Failed to load</span>';
+      });
+      fetch('/api/crypto/positions').then(r => r.json()).then(data => {
+        const el = document.getElementById('ltPositions');
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<span style="color:var(--text-muted)">No open positions</span>'; return;
+        }
+        let html = '<table style="width:100%;font-size:12px"><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>PnL</th></tr></thead><tbody>';
+        data.forEach(p => {
+          const size = parseFloat(p.size || 0);
+          const side = size > 0 ? 'long' : 'short';
+          const pnl = parseFloat(p.unrealized_pnl || 0);
+          html += `<tr>
+            <td>${p.symbol || '?'}</td>
+            <td class="${size >= 0 ? 'text-up' : 'text-down'}">${side.toUpperCase()}</td>
+            <td>${Math.abs(size).toFixed(4)}</td>
+            <td>${parseFloat(p.entry_price || 0).toFixed(4)}</td>
+            <td class="${pnl >= 0 ? 'text-up' : 'text-down'}">${pnl.toFixed(2)}</td>
+          </tr>`;
+        });
+        html += '</tbody></table>';
+        el.innerHTML = html;
+      }).catch(() => {
+        document.getElementById('ltPositions').innerHTML = '<span style="color:var(--text-muted)">Failed to load</span>';
+      });
+      fetch('/api/crypto/history?limit=30').then(r => r.json()).then(data => {
+        const el = document.getElementById('ltHistory');
+        if (!Array.isArray(data) || !data.length) {
+          el.innerHTML = '<span style="color:var(--text-muted)">No trade history</span>'; return;
+        }
+        let html = '<table style="width:100%"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Size</th><th>Status</th></tr></thead><tbody>';
+        data.slice(0, 30).forEach(o => {
+          const side = (o.side || '').toLowerCase();
+          html += `<tr>
+            <td>${new Date(o.created_at || Date.now()).toLocaleTimeString()}</td>
+            <td>${o.symbol || '?'}</td>
+            <td class="${side === 'buy' ? 'text-up' : side === 'sell' ? 'text-down' : ''}">${(side || '?').toUpperCase()}</td>
+            <td>${parseFloat(o.size || 0).toFixed(4)}</td>
+            <td>${o.state || '?'}</td>
+          </tr>`;
+        });
+        html += '</tbody></table>';
+        el.innerHTML = html;
+      }).catch(() => {
+        document.getElementById('ltHistory').innerHTML = '<span style="color:var(--text-muted)">Failed to load</span>';
+      });
+    }
+    setInterval(() => {
+      const panel = document.getElementById('liveTradingPanel');
+      if (panel && panel.style.display !== 'none') loadLiveTradingData();
+    }, 30000);
+    {% endif %}
+{% block scripts %}{% endblock %}
+</body>
+</html>

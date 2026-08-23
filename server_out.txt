@@ -1,0 +1,2 @@
+ * Serving Flask app 'dumbmoney.app'
+ * Debug mode: off

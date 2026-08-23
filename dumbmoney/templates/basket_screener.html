@@ -1,0 +1,407 @@
+{% extends "base.html" %}
+{% block title %}String Basket Screener - {{ market }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>String Basket Screener <span class="badge badge-info">{{ market }}</span></h1>
+  <div class="flex-row">
+    <button class="btn btn-sm btn-primary" id="btnGenerateUS" onclick="startGenerate('US')">Generate US</button>
+    <button class="btn btn-sm btn-primary" id="btnGenerateINDIA" onclick="startGenerate('INDIA')">Generate India</button>
+    <a href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/leaderboard" class="btn btn-sm" style="text-decoration:none">Leaderboard</a>
+    <button class="btn btn-sm" onclick="openColumnReference()">Columns</button>
+    <button class="btn btn-sm" onclick="exportCSV()">Export CSV</button>
+  </div>
+</div>
+
+<div id="buildProgressUS" style="display:none" class="card mb-16">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <strong id="buildStageUS">Generating US...</strong>
+    <span id="buildEtaUS" style="font-size:12px;color:#888"></span>
+  </div>
+  <div style="background:#1a1a2e;border-radius:6px;height:8px;overflow:hidden;margin-bottom:6px">
+    <div id="buildBarUS" style="height:100%;width:0%;background:linear-gradient(90deg,#4f8cff,#6c5ce7);transition:width .4s"></div>
+  </div>
+  <div id="buildDetailUS" style="font-size:12px;color:#aaa"></div>
+</div>
+
+<div id="buildProgressINDIA" style="display:none" class="card mb-16">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <strong id="buildStageINDIA">Generating India...</strong>
+    <span id="buildEtaINDIA" style="font-size:12px;color:#888"></span>
+  </div>
+  <div style="background:#1a1a2e;border-radius:6px;height:8px;overflow:hidden;margin-bottom:6px">
+    <div id="buildBarINDIA" style="height:100%;width:0%;background:linear-gradient(90deg,#ff6b6b,#ee5a24);transition:width .4s"></div>
+  </div>
+  <div id="buildDetailINDIA" style="font-size:12px;color:#aaa"></div>
+</div>
+
+<div class="card mb-16" id="emptyState" style="display:none">
+  <div class="empty-state">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+    <h3>No string baskets yet</h3>
+    <p>This screener screens pre-generated fixed stock baskets (e.g. <code>AAPL*2.5 + MSFT*1.8 + NVDA*0.7</code>).<br>
+    Click <b>Generate US</b> or <b>Generate India</b> above to create 25,000 fresh strings with full historical data.</p>
+  </div>
+</div>
+
+<div class="market-breadth" id="breadthPanel">
+  <div class="card breadth-card"><div class="num" id="breadthAdv">-</div><div class="lbl">Advancers</div></div>
+  <div class="card breadth-card"><div class="num text-down" id="breadthDec">-</div><div class="lbl">Decliners</div></div>
+  <div class="card breadth-card"><div class="num" id="breadthTotal">-</div><div class="lbl">Total</div></div>
+  <div class="card breadth-card"><div class="num text-up" id="breadthPct">-</div><div class="lbl">% Up</div></div>
+</div>
+
+<div class="filter-rail" id="filterRail">
+  <label>Search:</label>
+  <input type="text" id="fSearch" placeholder="String ID or expression..." style="width:170px">
+  <label>Min Price (Value):</label>
+  <input type="number" id="fMinPrice" style="width:80px" placeholder="0">
+  <label>Max Price:</label>
+  <input type="number" id="fMaxPrice" style="width:80px" placeholder="9999">
+  <label>Min WA:</label>
+  <input type="number" id="fMinWA" style="width:70px" placeholder="-999">
+  <label>Max WA:</label>
+  <input type="number" id="fMaxWA" style="width:70px" placeholder="999">
+  <label>Min Chg%:</label>
+  <input type="number" id="fMinChg" style="width:70px" step="0.1" placeholder="-100">
+  <label>Max Chg%:</label>
+  <input type="number" id="fMaxChg" style="width:70px" step="0.1" placeholder="100">
+  <label>Min Streak:</label>
+  <input type="number" id="fMinStreak" style="width:60px" placeholder="-99">
+  <label>SuperTrend:</label>
+  <select id="fATRStatus"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>Accel:</label>
+  <select id="fAccelStatus"><option value="">All</option><option value="up">Up</option><option value="down">Down</option><option value="crossed-up">Cross Up</option><option value="crossed-down">Cross Down</option></select>
+  <label>Min Vol:</label>
+  <input type="number" id="fMinVol" style="width:80px" placeholder="0">
+  <label>Date (As Of):</label>
+  <input type="date" id="fDateCutoff" style="width:140px">
+  <label>Timeframe:</label>
+  <select id="fTimeframe" onchange="loadScreener()">
+    <option value="1D">Daily</option>
+    <option value="1W">Weekly</option>
+    <option value="1M">Monthly</option>
+  </select>
+  <button class="btn btn-sm" onclick="loadScreener()">Apply</button>
+  <button class="btn btn-sm" onclick="clearFilters()">Clear</button>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="screener-table" id="screenerTable">
+    <div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>
+  </div>
+</div>
+
+<div class="pagination" id="pagination"></div>
+
+<div class="card-grid" style="grid-template-columns:1fr 1fr 1fr;margin-top:16px">
+  <div class="top-list" id="topGainers"><h4>Top Gainers</h4><div class="loading"><div class="spinner"></div></div></div>
+  <div class="top-list" id="topVolume"><h4>Top by Volume</h4><div class="loading"><div class="spinner"></div></div></div>
+  <div class="top-list" id="topWA"><h4>Top by Weighted Alpha</h4><div class="loading"><div class="spinner"></div></div></div>
+</div>
+
+<div class="modal-overlay" id="columnModal" style="display:none">
+  <div class="modal" style="max-width:920px;max-height:82vh;overflow:auto">
+    <div class="flex-between mb-16">
+      <h3 style="margin:0">Basket Screener Columns</h3>
+      <button class="btn btn-sm" onclick="closeColumnReference()">Close</button>
+    </div>
+    <div class="screener-table">
+      <table>
+        <thead><tr><th>Column</th><th>Current source</th><th>Date source</th><th>Meaning</th></tr></thead>
+        <tbody id="columnReferenceBody">
+          <tr><td colspan="4" style="padding:20px;text-align:center"><div class="spinner"></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentPage = 1, currentSort = 'weighted_alpha', currentDir = 'desc';
+const PRICE_PREFIX = MARKET === 'INDIA' ? 'Rs ' : '$';
+let columnReferenceLoaded = false;
+
+const COLUMNS = [
+  {key:'symbol', label:'String ID', width:120, sort:true},
+  {key:'name', label:'Expression', width:200},
+  {key:'exchange', label:'Type', width:70},
+  {key:'asset_class', label:'Class', width:70},
+  {key:'price', label:'Value', width:80, sort:true, num:true},
+  {key:'change_pct', label:'Chg%', width:75, sort:true, num:true},
+  {key:'next_day_return', label:'Next Day %', width:90, sort:true, num:true},
+  {key:'next_5d_return', label:'Next 5D %', width:90, sort:true, num:true},
+  {key:'week_return', label:'1W Ret', width:75, sort:true, num:true},
+  {key:'month_return', label:'1M Ret', width:75, sort:true, num:true},
+  {key:'prob_up_1d', label:'P(Up) 1D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_5d', label:'P(Up) 5D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_st_cross', label:'P(Up) ST Cross', width:105, sort:true, num:true, heat:true},
+  {key:'weighted_alpha', label:'Wtd Alpha', width:90, sort:true, num:true},
+  {key:'volume', label:'Volume', width:85, sort:true, num:true},
+  {key:'streak', label:'Streak', width:70, sort:true, num:true},
+  {key:'confluence', label:'Confluence', width:95, sort:true, num:true, heat:true},
+  {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
+  {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
+  {key:'ai_trendline_score', label:'Trend Score', width:95, sort:true, num:true},
+  {key:'ai_sentiment_score', label:'Sentiment', width:90, sort:true, num:true},
+  {key:'ai_conclusion', label:'Conclusion', width:90, sort:true},
+  {key:'ai_matrix', label:'AI Matrix', width:90, sort:true, num:true, heat:true},
+  {key:'atr_signal', label:'ST Signal', width:80, sort:true},
+  {key:'atr_crossed_above', label:'Cross Up', width:85, sort:true},
+  {key:'atr_crossed_below', label:'Cross Down', width:90, sort:true},
+  {key:'atr_stop', label:'ST Stop', width:90, sort:true, num:true},
+  {key:'atrp', label:'ATR%', width:70, sort:true, num:true},
+  {key:'accel_signal', label:'Accel', width:70, sort:true},
+  {key:'accel_crossed_up', label:'Accel Up', width:85, sort:true},
+  {key:'accel_crossed_down', label:'Accel Down', width:95, sort:true},
+  {key:'st_bars_below', label:'ST Bars Below', width:95, sort:true, num:true},
+  {key:'st_bars_above', label:'ST Bars Above', width:95, sort:true, num:true},
+  {key:'accel_bars_below', label:'Accel Bars Below', width:105, sort:true, num:true},
+  {key:'accel_bars_above', label:'Accel Bars Above', width:105, sort:true, num:true},
+  {key:'last_updated', label:'Updated', width:110},
+];
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function formatSignedPercent(raw) {
+  if (raw == null || raw === '') return {html: '-', cls: ''};
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return {html: '-', cls: ''};
+  return {html: (n >= 0 ? '+' : '') + n.toFixed(2) + '%', cls: n >= 0 ? 'text-up' : 'text-down'};
+}
+
+function openColumnReference() {
+  document.getElementById('columnModal').style.display = 'flex';
+  if (columnReferenceLoaded) return;
+  fetch('/api/basket-screener/columns').then(r => r.json()).then(d => {
+    const rows = (d.columns || []).map(c => (
+      `<tr><td><strong>${escHtml(c.label)}</strong><br><span class="text-muted">${escHtml(c.key)}</span></td>` +
+      `<td><code>${escHtml(c.current)}</code></td><td><code>${escHtml(c.historical)}</code></td>` +
+      `<td>${escHtml(c.meaning)}</td></tr>`
+    )).join('');
+    document.getElementById('columnReferenceBody').innerHTML = rows || '<tr><td colspan="4">No column reference found.</td></tr>';
+    columnReferenceLoaded = true;
+  }).catch(() => {
+    document.getElementById('columnReferenceBody').innerHTML = '<tr><td colspan="4">Failed to load column reference.</td></tr>';
+  });
+}
+
+function closeColumnReference() {
+  document.getElementById('columnModal').style.display = 'none';
+}
+
+function getFilters() {
+  return {
+    market: MARKET, page: currentPage, per_page: 50,
+    sort: currentSort, sort_dir: currentDir,
+    search: document.getElementById('fSearch').value,
+    min_price: document.getElementById('fMinPrice').value,
+    max_price: document.getElementById('fMaxPrice').value,
+    min_wa: document.getElementById('fMinWA').value,
+    max_wa: document.getElementById('fMaxWA').value,
+    min_change: document.getElementById('fMinChg').value,
+    max_change: document.getElementById('fMaxChg').value,
+    min_streak: document.getElementById('fMinStreak').value,
+    atr_status: document.getElementById('fATRStatus').value,
+    accel_status: document.getElementById('fAccelStatus').value,
+    min_volume: document.getElementById('fMinVol').value,
+    date_cutoff: document.getElementById('fDateCutoff').value,
+  };
+}
+
+function loadScreener() {
+  const params = new URLSearchParams(getFilters());
+  const tf = document.getElementById('fTimeframe').value;
+  document.getElementById('screenerTable').innerHTML = '<div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>';
+  Promise.all([
+    fetch('/api/basket-screener?' + params).then(r => r.json()),
+    tf !== '1D' ? fetch(`/api/basket-screener/timeframe-returns?market=${MARKET}&timeframe=${tf}`).then(r => r.json()) : Promise.resolve(null),
+  ]).then(([d, tfData]) => {
+    if (tfData && tfData.returns && d.data) {
+      d.data.forEach(row => {
+        row.week_return = tf === '1W' ? (tfData.returns[row.symbol] || 0) : null;
+        row.month_return = tf === '1M' ? (tfData.returns[row.symbol] || 0) : null;
+      });
+    }
+    if (!d.data || d.data.length === 0) {
+      document.getElementById('emptyState').style.display = 'block';
+    } else {
+      document.getElementById('emptyState').style.display = 'none';
+    }
+    renderTable(d.data, d.total, d.page, d.total_pages, d.historical, d.date);
+  }).catch(() => {
+    document.getElementById('screenerTable').innerHTML = '<div class="empty-state"><h3>Failed to load</h3><p>Check server connection.</p></div>';
+  });
+}
+
+function renderTable(data, total, page, totalPages, historical, histDate) {
+  let html = '<table><thead><tr>';
+  COLUMNS.forEach(col => {
+    const sorted = currentSort === col.key;
+    const arrow = sorted ? (currentDir === 'desc' ? ' v' : ' ^') : '';
+    html += `<th style="width:${col.width}px;${sorted?'color:var(--brand)':''}" onclick="sort('${col.key}')">${col.label}<span class="sort-icon">${col.sort ? arrow : ''}</span></th>`;
+  });
+  html += '</tr></thead><tbody>';
+  if (!data || data.length === 0) {
+    html += `<tr><td colspan="${COLUMNS.length}" style="text-align:center;padding:40px;color:var(--text-muted)">No baskets found.</td></tr>`;
+  }
+  (data || []).forEach(row => {
+    html += `<tr>`;
+    COLUMNS.forEach(col => {
+      let val = row[col.key];
+      let cls = '';
+      if (col.key === 'symbol') { val = `<a href="/${MARKET === 'INDIA' ? 'india/' : ''}basket-screener/string/${row.symbol}" target="_blank">${row.symbol}</a>`; }
+      else if (col.key === 'name') { val = val ? String(val).slice(0,28) + (String(val).length>28?'...':'') : '-'; }
+      else if (col.key === 'change_pct' || col.key === 'next_day_return' || col.key === 'next_5d_return' || col.key === 'week_return' || col.key === 'month_return') {
+        const pct = formatSignedPercent(val);
+        val = pct.html; cls = pct.cls;
+      }
+      else if (col.key === 'weighted_alpha') {
+        const n = Number(val);
+        val = Number.isFinite(n) ? n.toFixed(2) : '-';
+        cls = Number.isFinite(n) ? (n >= 0 ? 'text-up' : 'text-down') : '';
+      }
+      else if (col.key === 'volume') { val = val != null ? parseInt(val).toLocaleString() : '-'; }
+      else if (col.key === 'price') { val = val != null ? parseFloat(val).toFixed(2) : '-'; }
+      else if (col.key === 'atr_stop' || col.key === 'atrp') { val = val != null ? parseFloat(val).toFixed(2) : '-'; }
+      else if (col.key === 'atr_crossed_above') { val = val ? '<span class="cross-chip cross-up">Crossed Up</span>' : (row.atr_signal === 1 ? '<span class="badge badge-up">Above</span>' : '-'); }
+      else if (col.key === 'atr_crossed_below') { val = val ? '<span class="cross-chip cross-down">Crossed Down</span>' : (row.atr_signal === -1 ? '<span class="badge badge-down">Below</span>' : '-'); }
+      else if (col.key === 'atr_signal') { val = val === 1 ? '<span class="badge badge-up">Above ST</span>' : val === -1 ? '<span class="badge badge-down">Below ST</span>' : '-'; }
+      else if (col.key === 'streak') { val = val != null ? (val > 0 ? '+' + val : val) : '-'; cls = val > 0 ? 'text-up' : val < 0 ? 'text-down' : ''; }
+      else if (col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'prob_up_1d' || col.key === 'prob_up_5d') {
+        const v = parseFloat(val);
+        val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';
+      }
+      else if (col.key === 'ai_conclusion') {
+        val = val || '-';
+        const cls2 = val === 'BUY' ? 'badge-up' : val === 'SELL' ? 'badge-down' : 'badge-info';
+        val = `<span class="badge ${cls2}">${val}</span>`;
+      }
+      else if (col.key === 'accel_signal') { val = val === 1 ? '<span class="badge badge-up">UP</span>' : val === -1 ? '<span class="badge badge-down">DOWN</span>' : '-'; }
+      else if (col.key === 'accel_crossed_up') { val = val ? '<span class="cross-chip cross-up">UP</span>' : '-'; }
+      else if (col.key === 'accel_crossed_down') { val = val ? '<span class="cross-chip cross-down">DOWN</span>' : '-'; }
+      else if (col.key === 'last_updated') { val = val ? new Date(val).toLocaleDateString() : '-'; }
+      else { val = val != null ? val : '-'; }
+      html += `<td class="${col.num ? 'numeric' : ''} ${cls}">${val}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById('screenerTable').innerHTML = html;
+
+  let ph = '';
+  for (let i = 1; i <= totalPages; i++) {
+    if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
+      ph += `<button class="${i===page?'active':''}" onclick="goPage(${i})">${i}</button>`;
+    } else if (Math.abs(i - page) === 3) {
+      ph += '<span>...</span>';
+    }
+  }
+  document.getElementById('pagination').innerHTML = ph;
+
+  let countHtml = `<div class="screener-count">Showing ${(page-1)*50+1}-${Math.min(page*50, total)} of ${total.toLocaleString()} baskets`;
+  if (historical) countHtml += ` <span style="color:var(--brand);font-weight:600">as of ${histDate}</span>`;
+  countHtml += '</div>';
+  document.getElementById('pagination').innerHTML = countHtml + ph;
+}
+
+function sort(key) {
+  if (currentSort === key) { currentDir = currentDir === 'desc' ? 'asc' : 'desc'; }
+  else { currentSort = key; currentDir = 'desc'; }
+  loadScreener();
+}
+
+function goPage(p) { currentPage = p; loadScreener(); }
+
+function clearFilters() {
+  ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fDateCutoff'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  ['fATRStatus','fAccelStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  currentPage = 1;
+  loadScreener();
+}
+
+function exportCSV() { showToast('Exporting CSV...'); }
+
+function loadBreadth() {
+  fetch('/api/market-breadth?market=' + MARKET).then(r => r.json()).then(d => {
+    document.getElementById('breadthAdv').textContent = d.advancers || 0;
+    document.getElementById('breadthDec').textContent = d.decliners || 0;
+    document.getElementById('breadthTotal').textContent = d.total || 0;
+    document.getElementById('breadthPct').textContent = (d.pct_up || 0) + '%';
+  });
+}
+
+function loadTopLists() {
+  fetch('/api/top-lists?market=' + MARKET).then(r => r.json()).then(d => {
+    ['topGainers','topVolume','topWA'].forEach((id, idx) => {
+      const items = idx === 0 ? d.gainers : idx === 1 ? d.by_volume : d.by_weighted_alpha;
+      if (!items || items.length === 0) {
+        document.getElementById(id).innerHTML = `<h4>${idx===0?'Top Gainers':idx===1?'Top by Volume':'Top by Wtd Alpha'}</h4><p class="text-muted" style="font-size:12px;padding:8px">No data yet.</p>`;
+        return;
+      }
+      let html = `<h4>${idx===0?'Top Gainers':idx===1?'Top by Volume':'Top by Wtd Alpha'}</h4><table>`;
+      items.slice(0,5).forEach(r => {
+        const val = idx === 0 ? (r.change_pct||0).toFixed(2)+'%' : idx === 1 ? (r.volume||0).toLocaleString() : (r.weighted_alpha||0).toFixed(2);
+        const cls = idx === 0 ? (r.change_pct >= 0 ? 'text-up' : 'text-down') : '';
+        html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}basket-screener/string/${r.symbol}" target="_blank">${r.symbol}</a></td><td class="${cls} numeric">${val}</td></tr>`;
+      });
+      html += '</table>';
+      document.getElementById(id).innerHTML = html;
+    });
+  });
+}
+
+let _pollTimers = {};
+
+function startGenerate(mkt) {
+  if (!confirm('Generate 25,000 fresh strings + full historical data for ' + mkt + '? This will take a while.')) return;
+  document.getElementById('btnGenerate' + mkt).disabled = true;
+  document.getElementById('btnGenerate' + mkt).textContent = 'Generating...';
+  document.getElementById('buildProgress' + mkt).style.display = 'block';
+  fetch('/api/basket-screener/generate', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({market: mkt})
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); resetBtn(mkt); return; }
+    pollProgress(mkt);
+  }).catch(e => { alert('Failed: ' + e); resetBtn(mkt); });
+}
+
+function pollProgress(mkt) {
+  fetch('/api/basket-screener/progress?market=' + mkt).then(r => r.json()).then(d => {
+    const bar = document.getElementById('buildBar' + mkt);
+    const stage = document.getElementById('buildStage' + mkt);
+    const detail = document.getElementById('buildDetail' + mkt);
+    const eta = document.getElementById('buildEta' + mkt);
+    bar.style.width = d.pct + '%';
+    stage.textContent = d.stage === 'done' ? mkt + ' Done!' : d.stage === 'error' ? mkt + ' Error' : mkt + ' — ' + (d.stage.charAt(0).toUpperCase() + d.stage.slice(1));
+    detail.textContent = d.detail || '';
+    if (d.eta > 0 && d.stage !== 'done' && d.stage !== 'error') {
+      const hrs = Math.floor(d.eta / 3600), mins = Math.floor((d.eta % 3600) / 60), secs = Math.round(d.eta % 60);
+      const elH = Math.floor(d.elapsed / 3600), elM = Math.floor((d.elapsed % 3600) / 60), elS = Math.round(d.elapsed % 60);
+      eta.textContent = 'ETA: ' + (hrs > 0 ? hrs + 'h ' : '') + (mins > 0 ? mins + 'm ' : '') + secs + 's  |  ' + (elH > 0 ? elH + 'h ' : '') + (elM > 0 ? elM + 'm ' : '') + elS + 's elapsed';
+    } else if (d.elapsed > 0) {
+      const elH = Math.floor(d.elapsed / 3600), elM = Math.floor((d.elapsed % 3600) / 60), elS = Math.round(d.elapsed % 60);
+      eta.textContent = 'Took ' + (elH > 0 ? elH + 'h ' : '') + (elM > 0 ? elM + 'm ' : '') + elS + 's';
+    }
+    if (d.stage === 'done' || d.stage === 'error') {
+      resetBtn(mkt);
+      if (d.stage === 'done') loadScreener();
+      return;
+    }
+    _pollTimers[mkt] = setTimeout(() => pollProgress(mkt), 1500);
+  }).catch(() => { _pollTimers[mkt] = setTimeout(() => pollProgress(mkt), 3000); });
+}
+
+function resetBtn(mkt) {
+  const b = document.getElementById('btnGenerate' + mkt);
+  b.disabled = false;
+  b.textContent = 'Generate ' + mkt;
+}
+
+loadScreener();
+loadBreadth();
+loadTopLists();
+</script>
+{% endblock %}

@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}Portfolio Overall - {{ market }}{% endblock %}
+{% block content %}
+<style>
+  @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+  .hero-stat{background:var(--surface-solid);border:1px solid var(--border);border-radius:20px;padding:24px 32px;animation:fadeUp .4s ease}
+  .hero-big{font-size:42px;font-weight:800;letter-spacing:-2px}
+  .hero-label{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.5px}
+  .stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
+  .stat-pill{background:var(--surface-solid);border:1px solid var(--border);border-radius:14px;padding:16px 20px;animation:fadeUp .5s ease}
+  .stat-pill .label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px}
+  .stat-pill .value{font-size:22px;font-weight:700;margin-top:2px}
+  .port-card{background:var(--surface-solid);border:1px solid var(--border);border-radius:16px;padding:20px;transition:all .3s;animation:fadeUp .5s ease;cursor:pointer}
+  .port-card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+  .pnl-up{color:#10b981}.pnl-down{color:#ef4444}
+</style>
+
+<div class="page-header">
+  <div><h1 style="font-size:28px;font-weight:800;letter-spacing:-1px">All Portfolios</h1><div style="font-size:13px;color:var(--text-muted);margin-top:4px">Aggregate view across all portfolios and strings</div></div>
+  <div><a class="btn-ghost" href="/{{ 'india/' if market == 'INDIA' else '' }}portfolio">Back</a></div>
+</div>
+
+<div class="hero-stat mb-16" style="text-align:center">
+  <div class="hero-label">Total P&L</div>
+  <div id="heroPnl" class="hero-big" style="margin-top:8px">-</div>
+  <div id="heroPct" style="font-size:16px;font-weight:600;margin-top:4px"></div>
+</div>
+
+<div class="stat-row" id="statCards"></div>
+
+<div id="chartSection" class="card mb-16" style="overflow:hidden;border-radius:16px">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border)">
+    <span style="font-size:13px;font-weight:600">Portfolio Value Over Time</span>
+    <div style="flex:1"></div>
+    <span style="font-size:11px;color:var(--text-muted)" id="barCount"></span>
+  </div>
+  <div id="mainChartWrap" style="position:relative;height:400px">
+    <div id="mainChartBox" style="width:100%;height:100%"></div>
+  </div>
+</div>
+
+<div class="section-title" style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-muted);margin-bottom:12px">Portfolios</div>
+<div id="portGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-bottom:16px"></div>
+{% endblock %}
+{% block scripts %}
+<script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const{createChart,LineSeries}=LightweightCharts;
+let mainChart=null;
+function fmt(n,d){d=d||2;return(n==null||n==='')?'-':Number(n).toFixed(d)}
+function signedPct(n){n=Number(n);if(!Number.isFinite(n))return'-';return(n>=0?'+':'')+n.toFixed(2)+'%'}
+function cur(){return MARKET==='INDIA'?'\u20B9':'$'}
+
+function loadOverall(){
+  Promise.all([
+    fetch('/api/portfolios?market='+MARKET).then(r=>r.json()),
+    fetch('/api/portfolios/stats?market='+MARKET).then(r=>r.json()).catch(()=>null)
+  ]).then(([ports,stats])=>{
+    if(!ports||!ports.length){
+      document.getElementById('portGrid').innerHTML='<div style="grid-column:1/-1;text-align:center;padding:60px;color:var(--text-muted)">No portfolios yet. <a href="/${MARKET==='INDIA'?'india/':''}portfolio">Create one</a></div>';
+      return;
+    }
+    if(stats){
+      const totalPct=stats.total_invested>0?((stats.total_current/stats.total_invested-1)*100):0;
+      document.getElementById('heroPnl').className='hero-big '+(stats.total_pnl>=0?'pnl-up':'pnl-down');
+      document.getElementById('heroPnl').textContent=(stats.total_pnl>=0?'+':'')+cur()+Math.abs(stats.total_pnl).toFixed(2);
+      document.getElementById('heroPct').className=stats.total_pnl>=0?'pnl-up':'pnl-down';
+      document.getElementById('heroPct').textContent=signedPct(totalPct)+' return';
+      document.getElementById('statCards').innerHTML=[
+        ['Total Invested',cur()+stats.total_invested.toFixed(2),''],
+        ['Current Value',cur()+stats.total_current.toFixed(2),''],
+        ['P(Up) 1D',(stats.prob_1up||0).toFixed(1)+'%',''],
+        ['Realised P&L',cur()+(stats.total_realised||0).toFixed(2),(stats.total_realised||0)>=0?'pnl-up':'pnl-down']
+      ].map(c=>'<div class="stat-pill"><div class="label">'+c[0]+'</div><div class="value '+c[2]+'">'+c[1]+'</div></div>').join('');
+    }
+    renderPortfolios(ports);
+    loadChart(ports);
+  });
+}
+
+function renderPortfolios(ports){
+  const g=document.getElementById('portGrid');
+  let html='';
+  ports.forEach((p,i)=>{
+    const pnl=(p.total_pnl||0);
+    const pc=pnl>=0?'pnl-up':'pnl-down';
+    const strings=p.strings||[];
+    const strList=strings.slice(0,3).map(s=>'<div style="font-size:12px;color:var(--text-muted);margin-top:2px">'+(s.name||'String')+' <span class="'+((s.realised_pnl||0)+(s.unrealised_pnl||0)>=0?'pnl-up':'pnl-down')+'">'+signedPct(s.pnl_pct)+'</span></div>').join('');
+    html+=`<div class="port-card" style="animation-delay:${i*0.06}s" onclick="window.location.href='/${MARKET==='INDIA'?'india/':''}portfolio/${p.id}'">
+      <div style="font-size:16px;font-weight:700">${p.name}</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${strings.length} strings</div>
+      <div class="${pc}" style="font-size:22px;font-weight:700;margin-top:8px">${pnl>=0?'+':''}${cur()}${Math.abs(pnl).toFixed(2)}</div>
+      ${strList}
+    </div>`;
+  });
+  g.innerHTML=html;
+}
+
+function loadChart(ports){
+  fetch('/api/portfolios/ohlc?market='+MARKET+'&limit=365').then(r=>r.json()).then(ohlc=>{
+    if(!ohlc||!ohlc.length)return;
+    document.getElementById('barCount').textContent=ohlc.length+' bars';
+    renderChart(ohlc);
+  }).catch(()=>{});
+}
+
+function getTC(){const d=document.documentElement.getAttribute('data-theme')==='dark';return{bg:d?'#131722':'#ffffff',txt:d?'#d1d4dc':'#333',grid:d?'rgba(42,46,57,.6)':'rgba(0,0,0,.06)'}}
+
+function renderChart(ohlc){
+  if(!ohlc||!ohlc.length)return;
+  if(mainChart){mainChart.remove();mainChart=null}
+  const tc=getTC(),box=document.getElementById('mainChartBox');
+  mainChart=createChart(box,{width:box.clientWidth,height:400,autoSize:true,layout:{background:{type:'solid',color:tc.bg},textStyle:{color:tc.txt,fontFamily:'system-ui'}},grid:{vertLines:{color:tc.grid},horzLines:{color:tc.grid}},crosshair:{mode:0},rightPriceScale:{borderVisible:false,autoScale:true},timeScale:{timeVisible:false,secondsVisible:false,borderVisible:false}});
+  const ls=mainChart.addSeries(LineSeries,{color:'#2563eb',lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+  ls.setData(ohlc.map(d=>({time:d.time,value:d.value})));
+  setTimeout(()=>{try{mainChart.timeScale().setVisibleLogicalRange({from:Math.max(0,ohlc.length-90),to:ohlc.length-1})}catch(e){}},200);
+}
+
+document.querySelectorAll('.modal-overlay').forEach(m=>{m.addEventListener('click',function(e){if(e.target===this)this.classList.remove('show')})});
+loadOverall();
+</script>
+{% endblock %}

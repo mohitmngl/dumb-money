@@ -1,0 +1,8 @@
+﻿I'll start by finding the project and reading all files systematically. Let me begin with the project structure and key files.
+agy : Error: timeout waiting for response
+At line:2 char:1
++ agy -p $prompt --model "Claude Opus 4.6 (Thinking)" --dangerously-ski ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Error: timeout waiting for response:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
