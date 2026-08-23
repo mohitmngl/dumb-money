@@ -21,7 +21,6 @@ screener_bp = Blueprint("screener", __name__)
 stock_bp = Blueprint("stock", __name__)
 portfolio_bp = Blueprint("portfolio", __name__)
 string_bp = Blueprint("string", __name__)
-string_screener_bp = Blueprint("string_screener", __name__)
 ai_bp = Blueprint("ai", __name__)
 paper_bp = Blueprint("paper", __name__)
 api_bp = Blueprint("api", __name__)
@@ -162,18 +161,6 @@ def ai_discovered_detail(pid):
     return render_template("ai_discovered_detail.html", pid=pid, market=market)
 
 
-@app.route("/string-screener/")
-def string_screener_list():
-    return render_template("string_screener.html", market="US")
-
-
-@app.route("/india/string-screener/")
-def india_string_screener_list():
-    return render_template("string_screener.html", market="INDIA")
-
-
-@app.route("/string-screener/strategy/<int:sid>")
-@app.route("/india/string-screener/strategy/<int:sid>")
 def string_screener_detail(sid):
     market = "INDIA" if "/india/" in request.path else "US"
     return render_template("string_strategy_detail.html", sid=sid, market=market)
@@ -187,16 +174,6 @@ def paper_trading():
 @app.route("/india/paper-trading")
 def india_paper_trading():
     return render_template("paper_trading.html", market="INDIA")
-
-
-@app.route("/btst-dashboard")
-def btst_dashboard():
-    return render_template("btst_dashboard.html", market="US")
-
-
-@app.route("/india/btst-dashboard")
-def india_btst_dashboard():
-    return render_template("btst_dashboard.html", market="INDIA")
 
 
 @app.route("/vault")
@@ -4159,81 +4136,6 @@ def api_portfolio_string_validate():
         conn.close()
 
 
-@api_bp.route("/strings/parse")
-def api_parse_string():
-    raw = request.args.get("raw", "")
-    symbols = [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
-    return jsonify({"symbols": symbols})
-
-
-@api_bp.route("/strings/generate", methods=["POST"])
-def api_generate_string():
-    data = request.json
-    market = data.get("market", "US")
-    name = data.get("name", "New String")
-    symbols = data.get("symbols", [])
-    raw_string = ",".join(symbols)
-
-    conn = get_db(market)
-    try:
-        conn.execute(
-            "INSERT INTO strings (name, raw_string) VALUES (?, ?)", (name, raw_string)
-        )
-        sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        for sym in symbols:
-            conn.execute(
-                "INSERT INTO string_symbols (string_id, symbol) VALUES (?, ?)", (sid, sym)
-            )
-        conn.commit()
-        return jsonify({"id": sid, "name": name, "symbols": symbols})
-    finally:
-        conn.close()
-
-
-@api_bp.route("/strings/<int:sid>", methods=["DELETE"])
-def api_delete_string(sid):
-    market = request.args.get("market", "US")
-    conn = get_db(market)
-    try:
-        conn.execute("DELETE FROM strings WHERE id=?", (sid,))
-        conn.execute("DELETE FROM string_symbols WHERE string_id=?", (sid,))
-        conn.commit()
-        return jsonify({"deleted": True})
-    finally:
-        conn.close()
-
-
-@api_bp.route("/strings/<int:sid>/detail")
-def api_string_detail_info(sid):
-    market = request.args.get("market", "US")
-    conn = get_db(market)
-    try:
-        row = conn.execute("SELECT id, name FROM strings WHERE id=?", (sid,)).fetchone()
-        if not row:
-            return jsonify({"error": "not found"}), 404
-        symbols = [r[0] for r in conn.execute(
-            "SELECT symbol FROM string_symbols WHERE string_id=?", (sid,)
-        ).fetchall()]
-        stats_rows = []
-        if symbols:
-            placeholders = ",".join("?" * len(symbols))
-            stats_rows = conn.execute(
-                f"SELECT symbol, price, change_pct, weighted_alpha FROM stats WHERE symbol IN ({placeholders})",
-                symbols
-            ).fetchall()
-        price = sum(r["price"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
-        chg = sum(r["change_pct"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
-        wa = sum(r["weighted_alpha"] or 0 for r in stats_rows) / max(len(stats_rows), 1)
-        return jsonify({
-            "id": row["id"], "name": row["name"],
-            "price": round(price, 2), "change_pct": round(chg, 2),
-            "weighted_alpha": round(wa, 2), "num_stocks": len(symbols),
-        })
-    finally:
-        conn.close()
-
-
-@api_bp.route("/strings/<int:sid>/ohlc")
 def api_string_ohlc(sid):
     market = request.args.get("market", "US")
     conn = get_db(market)
@@ -4251,7 +4153,6 @@ def api_string_ohlc(sid):
         conn.close()
 
 
-@api_bp.route("/strings/<int:sid>/supertrend")
 def api_string_supertrend(sid):
     market = request.args.get("market", "US")
     conn = get_db(market)
@@ -4280,7 +4181,6 @@ def api_string_supertrend(sid):
         conn.close()
 
 
-@api_bp.route("/strings/<int:sid>/accel")
 def api_string_accel(sid):
     market = request.args.get("market", "US")
     conn = get_db(market)
@@ -4290,189 +4190,6 @@ def api_string_accel(sid):
         ).fetchall()]
         combined = _combined_ohlc_for_symbols(conn, symbols)
         return jsonify(_accel_payload(combined))
-    finally:
-        conn.close()
-
-
-@api_bp.route("/string-screener/strategies")
-def api_ss_strategies():
-    market = request.args.get("market", "US")
-    page = int(request.args.get("page", 1))
-    per_page = int(request.args.get("per_page", 50))
-    sort = request.args.get("sort", "sharpe_1d")
-    sort_dir = request.args.get("sort_dir", "desc")
-    search = request.args.get("search", "")
-    min_win = request.args.get("min_win", "")
-    min_prob = request.args.get("min_prob", "")
-    min_avg = request.args.get("min_avg", "")
-    min_entries = request.args.get("min_entries", "")
-    hide_random = request.args.get("hide_random", "") in ("1", "true", "yes")
-    from dumbmoney.string_screener import get_strategies
-    result = get_strategies(
-        market, page, per_page, sort, sort_dir, search,
-        min_win=min_win, min_prob=min_prob, min_avg=min_avg,
-        min_entries=min_entries, hide_random=hide_random,
-    )
-    return jsonify(result)
-
-
-@api_bp.route("/string-screener/strategy/<int:sid>/data")
-def api_ss_strategy_data(sid):
-    market = request.args.get("market", "US")
-    from dumbmoney.string_screener import get_strategy_detail
-    result = get_strategy_detail(sid, market)
-    return jsonify(result)
-
-
-@api_bp.route("/string-screener/strategy/<int:sid>/current")
-def api_ss_strategy_current(sid):
-    market = request.args.get("market", "US")
-    from dumbmoney.string_screener import get_current_basket
-    result = get_current_basket(sid, market)
-    return jsonify(result)
-
-
-@api_bp.route("/string-screener/backtest/run", methods=["POST"])
-def api_ss_backtest_run():
-    data = request.json if request.is_json else {}
-    market = (data or {}).get("market", "US")
-    from dumbmoney.string_screener import run_string_backtest
-    success = run_string_backtest(market)
-    return jsonify({"started": success})
-
-
-@api_bp.route("/string-screener/backtest/cancel", methods=["POST"])
-def api_ss_backtest_cancel():
-    from dumbmoney.string_screener import cancel_string_backtest
-    cancel_string_backtest()
-    return jsonify({"cancelled": True})
-
-
-@api_bp.route("/string-screener/backtest/status")
-def api_ss_backtest_status():
-    from dumbmoney.string_screener import get_ss_status
-    return jsonify(get_ss_status())
-
-
-@api_bp.route("/btst-dashboard")
-def api_btst_dashboard():
-    market = request.args.get("market", "US")
-    limit = min(int(request.args.get("limit", 25)), 100)
-    conn = get_db(market)
-    try:
-        stock_rows = conn.execute(
-            """
-            SELECT s.symbol, s.name, s.price, s.volume, s.change_pct, s.next_day_return,
-                   s.weighted_alpha, s.prob_up_1d, s.prob_up_5d, s.confluence,
-                   s.atr_signal, s.atr_crossed_above, s.atr_crossed_below, s.atr_streak,
-                   s.accel_signal, s.accel_crossed_up, s.accel_crossed_down, s.accel_streak,
-                   COALESCE(a.overall_score, 0) AS ai_overall_score,
-                   COALESCE(a.conclusion, 'HOLD') AS ai_conclusion,
-                   s.streak, s.exchange, s.asset_class
-            FROM stats s
-            LEFT JOIN ai_analysis a ON s.symbol = a.symbol
-            WHERE s.price > 0
-              AND COALESCE(s.volume, 0) >= 0
-              AND (s.asset_class IS NULL OR LOWER(COALESCE(s.asset_class,'')) = 'stock')
-            ORDER BY (
-                COALESCE(s.prob_up_1d, 0) * 0.30 +
-                COALESCE(s.confluence, 0) * 0.18 +
-                COALESCE(a.overall_score, 0) * 0.15 +
-                CAST(MIN(100, MAX(0, 50 + COALESCE(s.weighted_alpha, 0) / 2.0)) AS REAL) * 0.12 +
-                CAST(MIN(100, MAX(0, LOG(COALESCE(s.volume, 0) + 1) / LOG(10.0) * 100.0 / 7.0)) AS REAL) * 0.10 +
-                2.5 +
-                CASE COALESCE(s.atr_signal, 0) WHEN 1 THEN 8 WHEN -1 THEN -5 ELSE 0 END +
-                CASE COALESCE(s.accel_signal, 0) WHEN 1 THEN 7 WHEN -1 THEN -4 ELSE 0 END +
-                COALESCE(s.atr_crossed_above, 0) * 8 +
-                COALESCE(s.accel_crossed_up, 0) * 8 -
-                COALESCE(s.atr_crossed_below, 0) * 8 -
-                COALESCE(s.accel_crossed_down, 0) * 8
-            ) DESC
-            LIMIT ?
-            """,
-            (limit * 4,)
-        ).fetchall()
-
-        stock_picks = []
-        for row in stock_rows:
-            r = dict(row)
-            prob = float(r.get("prob_up_1d") or 0)
-            conf = float(r.get("confluence") or 0)
-            ai = float(r.get("ai_overall_score") or 0)
-            wa = float(r.get("weighted_alpha") or 0)
-            volume = max(float(r.get("volume") or 0), 0)
-            liquidity = min(np.log10(volume + 1) / 7 * 100, 100) if volume > 0 else 0
-            trend_bonus = 8 if r.get("atr_signal") == 1 else -5 if r.get("atr_signal") == -1 else 0
-            accel_bonus = 7 if r.get("accel_signal") == 1 else -4 if r.get("accel_signal") == -1 else 0
-            cross_bonus = 0
-            if r.get("atr_crossed_above"):
-                cross_bonus += 8
-            if r.get("accel_crossed_up"):
-                cross_bonus += 8
-            if r.get("atr_crossed_below"):
-                cross_bonus -= 8
-            if r.get("accel_crossed_down"):
-                cross_bonus -= 8
-            wa_score = max(0, min(100, 50 + wa / 2))
-            score = (
-                prob * 0.30 + conf * 0.18 + ai * 0.15 + wa_score * 0.12 +
-                liquidity * 0.10 + 50 * 0.05 + trend_bonus + accel_bonus + cross_bonus
-            )
-            r["btst_score"] = round(max(0, min(100, score)), 2)
-            r["why"] = []
-            if prob >= 55:
-                r["why"].append(f"P(Up) {prob:.1f}%")
-            if conf >= 60:
-                r["why"].append(f"Confluence {conf:.0f}")
-            if r.get("atr_crossed_above"):
-                r["why"].append("ST cross up")
-            elif r.get("atr_signal") == 1:
-                r["why"].append("ST up")
-            if r.get("accel_crossed_up"):
-                r["why"].append("Accel cross up")
-            elif r.get("accel_signal") == 1:
-                r["why"].append("Accel up")
-            if wa > 0:
-                r["why"].append(f"WA {wa:.1f}")
-            stock_picks.append(r)
-        stock_picks.sort(key=lambda x: x["btst_score"], reverse=True)
-
-        string_rows = conn.execute(
-            """
-            SELECT id, name, sharpe_1d, win_rate, avg_1d_return, prob_up_1d,
-                   prob_up_1pct, prob_up_2pct, prob_down_2pct, total_entries,
-                   current_count, current_symbols, sort_field, top_n, is_random
-            FROM ss_strategies
-            WHERE COALESCE(total_entries, 0) > 0 AND COALESCE(current_count, 0) > 0
-            ORDER BY prob_up_1d DESC, sharpe_1d DESC
-            LIMIT ?
-            """,
-            (limit * 4,),
-        ).fetchall()
-        string_picks = []
-        for row in string_rows:
-            r = dict(row)
-            prob = float(r.get("prob_up_1d") or 0)
-            sharpe = float(r.get("sharpe_1d") or 0)
-            avg = float(r.get("avg_1d_return") or 0)
-            wr = float(r.get("win_rate") or 0)
-            entries = float(r.get("total_entries") or 0)
-            sample_score = min(np.log10(entries + 1) / 3 * 100, 100)
-            score = prob * 0.35 + wr * 0.20 + max(0, min(100, 50 + avg * 10)) * 0.15 + max(0, min(100, 50 + sharpe * 25)) * 0.15 + sample_score * 0.15
-            r["btst_score"] = round(max(0, min(100, score)), 2)
-            r["symbols"] = [s for s in (r.get("current_symbols") or "").split(",") if s]
-            string_picks.append(r)
-        string_picks.sort(key=lambda x: x["btst_score"], reverse=True)
-
-        return jsonify({
-            "market": market,
-            "stocks": stock_picks[:limit],
-            "strings": string_picks[:limit],
-            "notes": {
-                "stocks": "Scores use current stats only: probability, confluence, AI, weighted alpha, SuperTrend, Accel, and liquidity.",
-                "strings": "String picks require generated ss_strategies from String Screener backtest; empty means run that backtest first."
-            }
-        })
     finally:
         conn.close()
 
@@ -5325,7 +5042,6 @@ app.register_blueprint(screener_bp)
 app.register_blueprint(stock_bp)
 app.register_blueprint(portfolio_bp)
 app.register_blueprint(string_bp)
-app.register_blueprint(string_screener_bp)
 app.register_blueprint(ai_bp)
 app.register_blueprint(paper_bp)
 app.register_blueprint(api_bp, url_prefix="/api")

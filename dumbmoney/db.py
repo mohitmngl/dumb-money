@@ -107,28 +107,6 @@ CREATE TABLE IF NOT EXISTS portfolio_string_symbols (
   UNIQUE(portfolio_string_id, symbol)
 );
 
-CREATE TABLE IF NOT EXISTS strings (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, portfolio_id INTEGER, name TEXT,
-  raw_string TEXT, created_at TEXT DEFAULT (datetime('now')));
-CREATE TABLE IF NOT EXISTS string_symbols (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, string_id INTEGER, symbol TEXT, weight REAL DEFAULT 1.0);
-
-CREATE TABLE IF NOT EXISTS ss_strategies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, strategy_type TEXT NOT NULL,
-  filter_json TEXT NOT NULL, sort_field TEXT NOT NULL, sort_dir TEXT DEFAULT 'desc', top_n INTEGER DEFAULT 10,
-  st_period INTEGER DEFAULT 14, st_multiplier REAL DEFAULT 1.0, total_entries INTEGER DEFAULT 0,
-  win_rate REAL, avg_1d_return REAL, median_1d_return REAL, std_1d_return REAL, max_1d_gain REAL, max_1d_loss REAL,
-  max_consecutive_wins INTEGER, max_consecutive_losses INTEGER, sharpe_1d REAL,
-  prob_up_1d REAL, prob_up_1pct REAL, prob_up_2pct REAL, prob_down_2pct REAL,
-  prob_up_after_st_cross REAL, prob_up_after_wa_high REAL,
-  current_date TEXT, current_count INTEGER DEFAULT 0, current_symbols TEXT, current_value REAL,
-  current_st_signal INTEGER, current_st_crossed INTEGER, current_avg_wa REAL, is_random INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now')));
-CREATE TABLE IF NOT EXISTS ss_entries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, strategy_id INTEGER NOT NULL REFERENCES ss_strategies(id) ON DELETE CASCADE,
-  date TEXT, symbols TEXT, basket_value REAL, next_day_return REAL, st_signal INTEGER, avg_wa REAL);
-CREATE TABLE IF NOT EXISTS ss_backtest_status (
-  id INTEGER PRIMARY KEY CHECK (id=1), status TEXT, phase TEXT, progress TEXT, message TEXT, updated_at REAL);
 
 CREATE TABLE IF NOT EXISTS ai_discovered_portfolios (
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, rules TEXT NOT NULL,
@@ -341,10 +319,7 @@ CREATE INDEX IF NOT EXISTS idx_hs_date ON historical_screener(date);
 CREATE INDEX IF NOT EXISTS idx_adp_score ON ai_discovered_portfolios(score DESC);
 CREATE INDEX IF NOT EXISTS idx_stats_accel ON stats(accel_signal);
 CREATE INDEX IF NOT EXISTS idx_stats_confluence ON stats(confluence);
-CREATE INDEX IF NOT EXISTS idx_ss_strat_name ON ss_strategies(name);
-CREATE INDEX IF NOT EXISTS idx_ss_entries_strat ON ss_entries(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_su_market ON string_universe(market);
-CREATE INDEX IF NOT EXISTS idx_sc_string ON string_constituents(string_id);
 CREATE INDEX IF NOT EXISTS idx_ssm_market ON string_screener_metrics(market);
 CREATE INDEX IF NOT EXISTS idx_nifty500_date ON nifty500_constituents(from_date, to_date);
 CREATE INDEX IF NOT EXISTS idx_nifty50_date ON nifty50_constituents(from_date, to_date);
@@ -601,13 +576,6 @@ def migrate_nulls(db_path):
                         "momentum_score": 0, "volume_score": 0, "events_score": 0,
                         "volume_profile_score": 0, "trendline_score": 0, "sentiment_score": 0,
                         "conclusion": "HOLD", "ai_matrix": ""},
-        "ss_strategies": {"total_entries": 0, "win_rate": 0, "avg_1d_return": 0, "median_1d_return": 0,
-                          "std_1d_return": 0, "max_1d_gain": 0, "max_1d_loss": 0,
-                          "max_consecutive_wins": 0, "max_consecutive_losses": 0, "sharpe_1d": 0,
-                          "prob_up_1d": 0, "prob_up_1pct": 0, "prob_up_2pct": 0, "prob_down_2pct": 0,
-                          "prob_up_after_st_cross": 0, "prob_up_after_wa_high": 0,
-                          "current_count": 0, "current_value": 0, "current_st_signal": 0,
-                          "current_st_crossed": 0, "current_avg_wa": 0, "is_random": 0},
         "portfolio_strings": {"realised_pnl": None},
     }
     for table, cols in defaults.items():

@@ -86,8 +86,6 @@
   </div>
   <div class="action-bar" id="actionBar" style="display:none">
     <span id="selectedCount">0</span> selected
-    <button class="btn btn-sm btn-primary" onclick="btstSelected()">Next-day return (BTST)</button>
-    <button class="btn btn-sm" onclick="saveAsString()">Save as String</button>
     <button class="btn btn-sm" onclick="addToPortfolio()">Add to Portfolio</button>
   </div>
 </div>
@@ -394,28 +392,6 @@ function toggleAll(cb) {
   document.getElementById('selectedCount').textContent = selectedSymbols.size;
 }
 
-function btstSelected() { showToast('BTST analysis: ' + [...selectedSymbols].join(', ')); }
-
-function saveAsString() {
-  const name = prompt('String name:');
-  if (!name) return;
-  fetch('/api/strings/generate', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({market: MARKET, name, symbols: [...selectedSymbols]})
-  }).then(r => r.json()).then(d => { showToast('String created: ' + d.id); });
-}
-
-function addToPortfolio() {
-  const pid = prompt('Portfolio ID:');
-  if (!pid) return;
-  [...selectedSymbols].forEach(sym => {
-    fetch('/api/portfolio/add', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({market: MARKET, portfolio_id: parseInt(pid), symbol: sym})
-    });
-  });
-  showToast('Added to portfolio');
-}
 
 function exportCSV() { showToast('Exporting CSV...'); }
 

@@ -42,10 +42,6 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
         <span>Portfolios</span>
       </a>
-      <a class="sidebar-item {% if '/string-screener' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}string-screener/">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
-        <span>String Screener</span>
-      </a>
       {% if market != 'INDIA' %}
       <a class="sidebar-item {% if '/long-short' in request.path %}active{% endif %}" href="/long-short-screener/">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>
@@ -65,10 +61,6 @@
       <a class="sidebar-item {% if '/vault' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}vault">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1"/></svg>
         <span>Vault</span>
-      </a>
-      <a class="sidebar-item {% if '/btst-dashboard' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}btst-dashboard">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3-3 3 2 5-7"/></svg>
-        <span>BTST Dashboard</span>
       </a>
       <a class="sidebar-item {% if '/paper-trading' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}paper-trading">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
