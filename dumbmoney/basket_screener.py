@@ -176,6 +176,21 @@ def _eligible_symbols(market):
 
 
 
+def _get_cache_path(market):
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    return os.path.join(_CACHE_DIR, f"close_pivot_{market}.npy"), os.path.join(_CACHE_DIR, f"close_meta_{market}.json")
+
+
+def _get_ohlc_cache_paths(market):
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    base = _CACHE_DIR
+    return {
+        'open': os.path.join(base, f"open_pivot_{market}.npy"),
+        'high': os.path.join(base, f"high_pivot_{market}.npy"),
+        'low': os.path.join(base, f"low_pivot_{market}.npy"),
+    }
+
+
 def build_close_pivot_cache(market):
     """Build .npy cache of OHLC pivots from bars. Returns (sym_list, dates, close_matrix)."""
     t0 = time.time()
