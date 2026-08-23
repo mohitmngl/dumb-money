@@ -421,7 +421,7 @@ def get_crypto_screener_columns():
         {"key": "atr_signal", "label": "ST Signal", "current": "crypto_stats.atr_signal", "historical": "crypto_historical_screener.atr_signal", "meaning": "ATR Trailing Stop direction: 1 up, -1 down, 0 neutral."},
         {"key": "atr_crossed_above", "label": "Cross Up", "current": "crypto_stats.atr_crossed_above", "historical": "crypto_historical_screener.atr_crossed_above", "meaning": "ATR crossed from bearish to bullish."},
         {"key": "atr_crossed_below", "label": "Cross Down", "current": "crypto_stats.atr_crossed_below", "historical": "crypto_historical_screener.atr_crossed_below", "meaning": "ATR crossed from bullish to bearish."},
-        {"key": "atr_stop", "label": "ST Stop 14x1", "current": "crypto_stats.atr_stop", "historical": "crypto_historical_screener.atr_stop", "meaning": "ATR Trailing Stop line."},
+        {"key": "atr_stop", "label": "ST Stop 14x2", "current": "crypto_stats.atr_stop", "historical": "crypto_historical_screener.atr_stop", "meaning": "ATR Trailing Stop line."},
         {"key": "atr_signal_w", "label": "ST W", "current": "crypto_stats.atr_signal_w", "historical": "crypto_historical_screener.atr_signal_w", "meaning": "Rolling weekly ATR direction."},
         {"key": "atr_crossed_above_w", "label": "Cross Up W", "current": "crypto_stats.atr_crossed_above_w", "historical": "crypto_historical_screener.atr_crossed_above_w", "meaning": "Weekly ATR crossed up."},
         {"key": "atr_crossed_below_w", "label": "Cross Down W", "current": "crypto_stats.atr_crossed_below_w", "historical": "crypto_historical_screener.atr_crossed_below_w", "meaning": "Weekly ATR crossed down."},

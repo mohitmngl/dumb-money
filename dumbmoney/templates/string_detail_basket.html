@@ -25,7 +25,7 @@
       <label style="font-size:11px;color:var(--text-muted)">Period</label>
       <input id="stPeriod" type="number" min="1" max="50" value="14" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
       <label style="font-size:11px;color:var(--text-muted)">Mult</label>
-      <input id="stMult" type="number" min="0.1" max="5" step="0.1" value="1.0" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+      <input id="stMult" type="number" min="0.1" max="5" step="0.1" value="2.0" style="width:44px;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
       <button id="stApply" class="btn btn-sm" style="font-size:11px">Apply</button>
       <div style="flex:1"></div>
       <span style="font-size:11px;color:var(--text-muted)" id="barCount"></span>
@@ -198,7 +198,7 @@ function loadStats(){
 function loadChart(){
   var params=new URLSearchParams({market:MARKET,timeframe:currentTF});
   var stP=document.getElementById('stPeriod').value||14;
-  var stM=document.getElementById('stMult').value||1.0;
+  var stM=document.getElementById('stMult').value||2.0;
   var box=document.getElementById('mainChartBox');
   box.innerHTML='<div class="loading" style="padding:40px"><div class="spinner"></div> Loading chart data...</div>';
   Promise.all([

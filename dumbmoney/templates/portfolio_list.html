@@ -355,7 +355,7 @@ function loadMainChart(){
   box.innerHTML='<div style="padding:40px;text-align:center;color:var(--text-muted)">Loading chart...</div>';
   Promise.all([
     fetch('/api/portfolios/ohlc?market='+MARKET+'&limit=500&timeframe='+currentTF).then(r=>r.json()),
-    fetch('/api/portfolios/supertrend?market='+MARKET+'&period=14&multiplier=1.0').then(r=>r.json()),
+    fetch('/api/portfolios/supertrend?market='+MARKET+'&period=14&multiplier=2.0').then(r=>r.json()),
   ]).then(([ohlc,stData])=>{
     box.innerHTML='';
     document.getElementById('barCount').textContent=(ohlc?ohlc.length:0)+' bars';
