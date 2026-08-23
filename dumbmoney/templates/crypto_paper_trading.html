@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% block title %}Crypto Trading{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Crypto Trading <span class="badge badge-info">CRYPTO</span></h1>
+  <div class="flex-row">
+    <label class="switch">
+      <input type="checkbox" id="liveToggle" onchange="toggleMode()">
+      <span id="modeLabel">Paper Mode</span>
+    </label>
+    <button class="btn btn-sm" onclick="syncPositions()">Sync Positions</button>
+  </div>
+</div>
+
+<div class="card-grid" style="grid-template-columns:1fr 1fr 1fr">
+  <div class="card">
+    <h3>Wallet Balance</h3>
+    <div id="walletContent" style="font-size:14px">
+      <div class="loading"><div class="spinner"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Open Positions</h3>
+    <div id="positionsContent" style="font-size:13px">
+      <div class="loading"><div class="spinner"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Recent Orders</h3>
+    <div id="ordersContent" style="font-size:13px;max-height:200px;overflow:auto">
+      <div class="loading"><div class="spinner"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="card mt-16">
+  <h3>Place Order</h3>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px">
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Symbol</label>
+      <select id="oSymbol" style="width:100%">
+        {% for sym in symbols %}
+        <option value="{{ sym }}">{{ sym }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Side</label>
+      <select id="oSide" style="width:100%">
+        <option value="buy">Buy / Long</option>
+        <option value="sell">Sell / Short</option>
+      </select>
+    </div>
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Quantity (contracts)</label>
+      <input type="number" id="oQty" value="1" min="0.001" step="0.001" style="width:100%">
+    </div>
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Order Type</label>
+      <select id="oType" style="width:100%">
+        <option value="market_order">Market</option>
+        <option value="limit_order">Limit</option>
+      </select>
+    </div>
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Price (limit only)</label>
+      <input type="number" id="oPrice" step="0.0001" placeholder="Market if empty" style="width:100%">
+    </div>
+    <div>
+      <label style="font-size:12px;color:var(--text-muted)">Leverage</label>
+      <input type="number" id="oLeverage" value="1" min="1" max="200" style="width:100%">
+    </div>
+  </div>
+  <div style="margin-top:12px">
+    <button class="btn btn-primary" onclick="placeOrder()">Place Order</button>
+    <span id="orderResult" class="text-muted" style="font-size:13px;margin-left:12px"></span>
+  </div>
+</div>
+
+<div class="card mt-16">
+  <h3>Quick Actions</h3>
+  <div class="flex-row" style="gap:8px">
+    <button class="btn btn-sm btn-danger" onclick="closeAllPositions()">Close All Positions</button>
+    <button class="btn btn-sm" onclick="loadAll()">Refresh All</button>
+  </div>
+</div>
+
+<script>
+let isLive = false;
+
+function toggleMode() {
+  isLive = document.getElementById('liveToggle').checked;
+  document.getElementById('modeLabel').textContent = isLive ? 'Live Trading' : 'Paper Mode';
+  document.getElementById('modeLabel').className = isLive ? 'text-up' : 'text-muted';
+  showToast(isLive ? 'Live trading enabled — orders go to Delta Exchange' : 'Paper mode — simulating trades locally');
+  loadPositions();
+  loadWallet();
+}
+
+function placeOrder() {
+  const symbol = document.getElementById('oSymbol').value;
+  const side = document.getElementById('oSide').value;
+  const qty = parseFloat(document.getElementById('oQty').value);
+  const type = document.getElementById('oType').value;
+  const price = document.getElementById('oPrice').value;
+  const leverage = parseInt(document.getElementById('oLeverage').value);
+
+  if (!isLive) {
+    // Paper mode — store locally
+    const order = {
+      id: Date.now(), symbol, side, qty, order_type: type,
+      price: price ? parseFloat(price) : null, leverage,
+      status: 'filled', filled_at: new Date().toISOString()
+    };
+    // Store in localStorage
+    const orders = JSON.parse(localStorage.getItem('crypto_orders') || '[]');
+    orders.unshift(order);
+    localStorage.setItem('crypto_orders', JSON.stringify(orders));
+    showToast(`Paper order: ${side} ${qty} ${symbol}`);
+    loadPositions();
+    loadOrders();
+    return;
+  }
+
+  const body = {symbol, side, qty, order_type: type};
+  if (type === 'limit_order' && price) body.price = parseFloat(price);
+  if (leverage > 1) body.leverage = leverage;
+
+  document.getElementById('orderResult').innerHTML = '<span class="text-muted">Sending...</span>';
+  fetch('/api/crypto/order', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(r => r.json()).then(d => {
+      if (d.error) {
+        document.getElementById('orderResult').innerHTML = `<span class="text-down">Error: ${d.error}</span>`;
+      } else {
+        document.getElementById('orderResult').innerHTML = `<span class="text-up">Order placed! ${JSON.stringify(d).substring(0,80)}</span>`;
+        loadPositions();
+        loadOrders();
+      }
+    }).catch(e => {
+      document.getElementById('orderResult').innerHTML = `<span class="text-down">Failed: ${e.message}</span>`;
+    });
+}
+
+function loadWallet() {
+  if (!isLive) {
+    document.getElementById('walletContent').innerHTML = '<p class="text-muted">Paper mode — no real wallet</p>';
+    return;
+  }
+  fetch('/api/crypto/balances').then(r => r.json()).then(data => {
+    if (!Array.isArray(data) || !data.length) {
+      document.getElementById('walletContent').innerHTML = '<p class="text-muted">No wallet data</p>';
+      return;
+    }
+    let html = '';
+    data.forEach(b => {
+      const bal = parseFloat(b.balance || 0);
+      const lock = parseFloat(b.locked || 0);
+      if (bal > 0.000001 || lock > 0.000001) {
+        html += `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+          <span>${b.asset || b.symbol || '?'}</span>
+          <span>Avail: <b>${bal.toFixed(6)}</b> | Locked: ${lock.toFixed(6)}</span>
+        </div>`;
+      }
+    });
+    document.getElementById('walletContent').innerHTML = html || '<p class="text-muted">No balances</p>';
+  }).catch(() => {
+    document.getElementById('walletContent').innerHTML = '<p class="text-muted">Failed to load wallet</p>';
+  });
+}
+
+function loadPositions() {
+  if (!isLive) {
+    // Show paper positions from localStorage
+    const positions = JSON.parse(localStorage.getItem('crypto_positions') || '[]');
+    if (!positions.length) {
+      document.getElementById('positionsContent').innerHTML = '<p class="text-muted">No paper positions</p>';
+      return;
+    }
+    let html = '<table style="width:100%"><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Action</th></tr></thead><tbody>';
+    positions.forEach((p, i) => {
+      html += `<tr>
+        <td>${p.symbol}</td>
+        <td class="${p.side==='buy'?'text-up':'text-down'}">${p.side.toUpperCase()}</td>
+        <td>${p.qty}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="closePaperPos(${i})">Close</button></td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('positionsContent').innerHTML = html;
+    return;
+  }
+
+  fetch('/api/crypto/positions').then(r => r.json()).then(data => {
+    if (!Array.isArray(data) || !data.length) {
+      document.getElementById('positionsContent').innerHTML = '<p class="text-muted">No open positions</p>';
+      return;
+    }
+    let html = '<table style="width:100%;font-size:13px"><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Unrealized PnL</th><th>Action</th></tr></thead><tbody>';
+    data.forEach(p => {
+      const size = parseFloat(p.size || 0);
+      const side = size > 0 ? 'long' : 'short';
+      const sideCls = size >= 0 ? 'text-up' : 'text-down';
+      html += `<tr>
+        <td>${p.symbol || '?'}</td>
+        <td class="${sideCls}">${side.toUpperCase()}</td>
+        <td>${Math.abs(size).toFixed(4)}</td>
+        <td>${parseFloat(p.entry_price||0).toFixed(4)}</td>
+        <td class="${(p.unrealized_pnl||0)>=0?'text-up':'text-down'}">${parseFloat(p.unrealized_pnl||0).toFixed(2)}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="closePosition(${p.product_id||0},'${p.symbol}')">Close</button></td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('positionsContent').innerHTML = html;
+  }).catch(() => {
+    document.getElementById('positionsContent').innerHTML = '<p class="text-muted">Failed to load positions</p>';
+  });
+}
+
+function closePosition(productId, symbol) {
+  if (!confirm(`Close ${symbol}?`)) return;
+  fetch('/api/crypto/order', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({symbol, side: 'sell', qty: 1, order_type: 'market_order'})
+  }).then(() => loadPositions()).catch(() => showToast('Failed to close'));
+}
+
+function closeAllPositions() {
+  if (!isLive) {
+    localStorage.setItem('crypto_positions', '[]');
+    loadPositions();
+    showToast('All paper positions closed');
+    return;
+  }
+  if (!confirm('Close ALL positions?')) return;
+  fetch('/api/crypto/close-all', {method:'POST'}).then(r => r.json()).then(d => {
+    showToast(`Closed ${d.closed || 0} positions`);
+    loadPositions();
+  }).catch(() => showToast('Failed'));
+}
+
+function loadOrders() {
+  if (!isLive) {
+    const orders = JSON.parse(localStorage.getItem('crypto_orders') || '[]');
+    if (!orders.length) {
+      document.getElementById('ordersContent').innerHTML = '<p class="text-muted">No paper orders</p>';
+      return;
+    }
+    let html = '<table style="width:100%"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th></tr></thead><tbody>';
+    orders.slice(0, 20).forEach(o => {
+      html += `<tr>
+        <td>${new Date(o.filled_at||Date.now()).toLocaleTimeString()}</td>
+        <td>${o.symbol}</td>
+        <td class="${o.side==='buy'?'text-up':'text-down'}">${o.side.toUpperCase()}</td>
+        <td>${o.qty}</td>
+        <td>${o.order_type}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('ordersContent').innerHTML = html;
+    return;
+  }
+  fetch('/api/crypto/order-history').then(r => r.json()).then(data => {
+    if (!Array.isArray(data) || !data.length) {
+      document.getElementById('ordersContent').innerHTML = '<p class="text-muted">No order history</p>';
+      return;
+    }
+    let html = '<table style="width:100%"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th></tr></thead><tbody>';
+    data.slice(0, 20).forEach(o => {
+      html += `<tr>
+        <td>${new Date(o.created_at||Date.now()).toLocaleTimeString()}</td>
+        <td>${o.symbol || '?'}</td>
+        <td class="${(o.side||'').toLowerCase()==='buy'?'text-up':'text-down'}">${(o.side||'?').toUpperCase()}</td>
+        <td>${parseFloat(o.size||0).toFixed(4)}</td>
+        <td>${o.order_type || '?'}</td>
+        <td>${o.state || '?'}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    document.getElementById('ordersContent').innerHTML = html;
+  }).catch(() => {
+    document.getElementById('ordersContent').innerHTML = '<p class="text-muted">Failed to load orders</p>';
+  });
+}
+
+function syncPositions() { loadPositions(); loadWallet(); loadOrders(); }
+function loadAll() { loadWallet(); loadPositions(); loadOrders(); }
+
+// Init
+loadWallet();
+loadPositions();
+loadOrders();
+</script>
+{% endblock %}

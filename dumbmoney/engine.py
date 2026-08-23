@@ -12,10 +12,17 @@ from dumbmoney.indicators import (
     supertrend, atr_trailing_stop, weighted_alpha, accel, prob_up, prob_up_after_st_cross_up,
     next_day_return, streak_vectorized, atrp, ai_score_latest, compute_confluence, rsi_wilder,
     compute_signal_prob_matrix, _compute_ai_matrix_score, compute_confluence_vectorized,
-    bars_at_side, compute_rolling_atr_trailing_stop, compute_rolling_atr_batch
+    bars_at_side, compute_rolling_atr_trailing_stop, compute_rolling_atr_batch, r_squared
 )
 
 logger = logging.getLogger(__name__)
+
+# ATR trailing stop multiplier used across ALL markets, timeframes, charts,
+# portfolios and metrics. Changed 1.0 -> 2.0 per owner decision (2026-08-23).
+ATR_MULTIPLIER = 2.0
+
+# Rolling window (bars) for the R² straight-trend column.
+R_SQUARED_WINDOW = 90
 
 
 def _compute_symbol_stats_worker(args):
@@ -65,7 +72,7 @@ def _compute_symbol_stats_worker(args):
         wa = weighted_alpha(grp)
         wa_val = wa.iloc[-1] if len(wa) > 0 else 0
 
-        st_result = atr_trailing_stop(grp, period=14, multiplier=1.0)
+        st_result = atr_trailing_stop(grp, period=14, multiplier=ATR_MULTIPLIER)
         st_trend = _safe_int(st_result["trend"].iloc[-1]) if len(st_result) > 0 else 0
         st_signal = st_trend
         st_stop = _safe_float(st_result["stop"].iloc[-1]) if len(st_result) > 0 else 0
@@ -169,7 +176,7 @@ def _compute_symbol_stats_worker(args):
 
 
 
-HISTORICAL_SCREENER_VERSION = "asof-v2"
+HISTORICAL_SCREENER_VERSION = "asof-v3"
 
 HISTORICAL_SCREENER_COLUMNS = [
     "symbol", "date", "price", "change_pct", "volume",
@@ -179,7 +186,7 @@ HISTORICAL_SCREENER_COLUMNS = [
     "ai_volume_score", "ai_events_score", "ai_volume_profile_score",
     "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
     "next_day_return", "next_5d_return", "prob_up_1d", "prob_up_5d", "prob_up_st_cross",
-    "prob_up_1w", "prob_up_1m",
+    "prob_up_1w", "prob_up_1m", "r_squared",
     "accel_a", "accel_base", "accel_signal", "accel_crossed_up",
     "accel_crossed_down", "confluence",
     "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
@@ -207,6 +214,7 @@ def _compute_stats_batch(batch_args):
         bars_at_side as _bars_at_side, next_day_return as _next_day_return,
         compute_confluence as _compute_confluence, atr_trailing_stop as _atr_trailing_stop,
         compute_rolling_atr_trailing_stop as _compute_rolling_atr_trailing_stop,
+        r_squared as _r_squared,
     )
 
     def _si(v):
@@ -256,7 +264,7 @@ def _compute_stats_batch(batch_args):
                     "volume": int(row["volume"]), "change_pct": 0.0,
                     "weighted_alpha": 0.0, "atr_signal": 0, "atr_stop": 0.0,
                     "atr_value": 0.0, "atr_streak": 0, "atr_crossed_above": 0,
-                    "atr_crossed_below": 0, "atr_multiplier": 0.0, "streak": 0,
+                    "atr_crossed_below": 0, "atr_multiplier": ATR_MULTIPLIER, "streak": 0,
                     "next_day_return": 0.0, "prob_up_1d": 0.0, "prob_up_5d": 0.0,
                     "prob_up_st_cross": 0.0, "prob_up_1w": 50.0, "prob_up_1m": 50.0,
                     "pre_price": 0.0, "pre_change_pct": 0.0, "post_price": 0.0,
@@ -273,6 +281,7 @@ def _compute_stats_batch(batch_args):
                     "st_bars_below_m": 0, "st_bars_above_m": 0,
                     "last_updated": now,
                     "oldest_data": grp["date"].iloc[0].strftime("%Y-%m-%d") if hasattr(grp["date"].iloc[0], "strftime") else str(grp["date"].iloc[0])[:10],
+                    "r_squared": 0.0,
                     "ai_overall_score": 0, "ai_bias": "neutral",
                     "ai_tech_score": 0, "ai_momentum_score": 0,
                     "ai_volume_score": 0, "ai_events_score": 0,
@@ -293,7 +302,7 @@ def _compute_stats_batch(batch_args):
             wa = _weighted_alpha(grp)
             wa_val = wa.iloc[-1] if len(wa) > 0 else 0
 
-            st_result = _atr_trailing_stop(grp, period=14, multiplier=1.0)
+            st_result = _atr_trailing_stop(grp, period=14, multiplier=ATR_MULTIPLIER)
             st_trend = _si(st_result["trend"].iloc[-1]) if len(st_result) > 0 else 0
             st_signal = st_trend
             st_stop = _sf(st_result["stop"].iloc[-1]) if len(st_result) > 0 else 0
@@ -313,7 +322,7 @@ def _compute_stats_batch(batch_args):
                     closes_arr = grp["close"].astype(float).values
                     r = _compute_rolling_atr_trailing_stop(
                         dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                        len(dates_arr) - 1, 5, period=14, multiplier=1.0)
+                        len(dates_arr) - 1, 5, period=14, multiplier=ATR_MULTIPLIER)
                     st_w_signal = r['trend']; st_w_stop = r['stop']
                     st_w_cross_up = r['crossed_above']; st_w_cross_down = r['crossed_below']
                     st_w_streak = r['streak']; st_w_bars_below = r['bars_below']
@@ -332,7 +341,7 @@ def _compute_stats_batch(batch_args):
                     closes_arr = grp["close"].astype(float).values
                     r = _compute_rolling_atr_trailing_stop(
                         dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                        len(dates_arr) - 1, 22, period=14, multiplier=1.0)
+                        len(dates_arr) - 1, 22, period=14, multiplier=ATR_MULTIPLIER)
                     st_m_signal = r['trend']; st_m_stop = r['stop']
                     st_m_cross_up = r['crossed_above']; st_m_cross_down = r['crossed_below']
                     st_m_streak = r['streak']; st_m_bars_below = r['bars_below']
@@ -375,6 +384,26 @@ def _compute_stats_batch(batch_args):
             ndr = _next_day_return(c)
             ndr_val = _sf(ndr.iloc[-2]) if len(ndr) >= 2 else 0
             streak_val = _si(_streak_vectorized(c)[-1]) if len(c) > 1 else 0
+            r2_val = _sf(_r_squared(c, R_SQUARED_WINDOW).iloc[-1]) if len(c) > 1 else 0.0
+
+            # Real vectorized AI scores (same model as historical/crypto rows)
+            try:
+                ai = _historical_ai_columns(grp)
+                ai_overall = _sf(ai["ai_overall_score"].iloc[-1]) if len(ai) else 0.0
+                ai_bias = str(ai["ai_bias"].iloc[-1]) if len(ai) else "neutral"
+                ai_tech = _sf(ai["ai_tech_score"].iloc[-1]) if len(ai) else 0.0
+                ai_mom = _sf(ai["ai_momentum_score"].iloc[-1]) if len(ai) else 0.0
+                ai_vol = _sf(ai["ai_volume_score"].iloc[-1]) if len(ai) else 0.0
+                ai_evt = _sf(ai["ai_events_score"].iloc[-1]) if len(ai) else 0.0
+                ai_vp = _sf(ai["ai_volume_profile_score"].iloc[-1]) if len(ai) else 0.0
+                ai_tl = _sf(ai["ai_trendline_score"].iloc[-1]) if len(ai) else 0.0
+                ai_sent = _sf(ai["ai_sentiment_score"].iloc[-1]) if len(ai) else 0.0
+                ai_conc = str(ai["ai_conclusion"].iloc[-1]) if len(ai) else "HOLD"
+                ai_mat = ai["ai_matrix"].iloc[-1] if len(ai) else 0.0
+            except Exception:
+                (ai_overall, ai_bias, ai_tech, ai_mom, ai_vol, ai_evt,
+                 ai_vp, ai_tl, ai_sent, ai_conc, ai_mat) = (
+                    0.0, "neutral", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "HOLD", 0.0)
 
             row = {
                 "symbol": sym, "price": float(last_close), "volume": _si(v.iloc[-1]),
@@ -382,7 +411,7 @@ def _compute_stats_batch(batch_args):
                 "atr_signal": st_signal, "atr_stop": round(st_stop, 4),
                 "atr_value": round(st_atr, 4), "atr_streak": st_streak,
                 "atr_crossed_above": st_cross_up, "atr_crossed_below": st_cross_down,
-                "atr_multiplier": 1.0, "streak": streak_val,
+                "atr_multiplier": ATR_MULTIPLIER, "streak": streak_val,
                 "next_day_return": round(ndr_val, 4),
                 "prob_up_1d": round(prob_1d, 2), "prob_up_5d": round(prob_5d, 2),
                 "prob_up_st_cross": round(prob_st_cross, 2),
@@ -403,11 +432,13 @@ def _compute_stats_batch(batch_args):
                 "accel_bars_below": accel_bars_below_val, "accel_bars_above": accel_bars_above_val,
                 "last_updated": now,
                 "oldest_data": grp["date"].iloc[0].strftime("%Y-%m-%d") if hasattr(grp["date"].iloc[0], "strftime") else str(grp["date"].iloc[0])[:10],
-                "ai_overall_score": 0, "ai_bias": "neutral",
-                "ai_tech_score": 0, "ai_momentum_score": 0, "ai_volume_score": 0,
-                "ai_events_score": 0, "ai_volume_profile_score": 0,
-                "ai_trendline_score": 0, "ai_sentiment_score": 0,
-                "ai_conclusion": "HOLD", "ai_matrix": 0.0,
+                "r_squared": round(r2_val, 4),
+                "ai_overall_score": ai_overall, "ai_bias": ai_bias,
+                "ai_tech_score": ai_tech, "ai_momentum_score": ai_mom,
+                "ai_volume_score": ai_vol, "ai_events_score": ai_evt,
+                "ai_volume_profile_score": ai_vp, "ai_trendline_score": ai_tl,
+                "ai_sentiment_score": ai_sent, "ai_conclusion": ai_conc,
+                "ai_matrix": ai_mat,
             }
             row["confluence"] = _compute_confluence(row)
             results.append(row)
@@ -494,15 +525,10 @@ def vectorized_stats_pass(market="US", only_symbols=None, progress_callback=None
                     r.get("change_pct", 0), r.get("atrp", 0), r.get("weighted_alpha", 0),
                     r.get("atr_signal", 0), r.get("atr_stop", 0), r.get("atr_value", 0),
                     r.get("atr_streak", 0), r.get("atr_crossed_above", 0), r.get("atr_crossed_below", 0),
-                    r.get("atr_multiplier", 1.0), r.get("streak", 0),
-                    r.get("next_day_return", 0), r.get("prob_up_1d", 50), r.get("prob_up_5d", 50), r.get("prob_up_st_cross", 50),
-                    0, 0, 0, 0,
-                    None, None, None, None, None,
-                    0, 0,
-                    None, None, None, 0,
-                    None, None,
+                    r.get("atr_multiplier", ATR_MULTIPLIER), r.get("streak", 0),
+                    r.get("next_day_return", 0), r.get("prob_up_1d", 50), r.get("prob_up_5d", 50),
+                    r.get("prob_up_st_cross", 50), r.get("prob_up_1w", 50), r.get("prob_up_1m", 50),
                     now, r.get("oldest_data", ""),
-                    None, None, None,
                     r.get("accel_a", 0), r.get("accel_base", 0), r.get("accel_signal", 0),
                     r.get("accel_crossed_up", 0), r.get("accel_crossed_down", 0), r.get("accel_streak", 0),
                     r.get("confluence", 0),
@@ -512,29 +538,48 @@ def vectorized_stats_pass(market="US", only_symbols=None, progress_callback=None
                     r.get("atr_streak_w", 0), r.get("st_bars_below_w", 0), r.get("st_bars_above_w", 0),
                     r.get("atr_signal_m", 0), r.get("atr_stop_m", 0), r.get("atr_crossed_above_m", 0), r.get("atr_crossed_below_m", 0),
                     r.get("atr_streak_m", 0), r.get("st_bars_below_m", 0), r.get("st_bars_above_m", 0),
-                    r.get("prob_up_1w", 50), r.get("prob_up_1m", 50),
+                    r.get("r_squared", 0),
                 ))
+            # Upsert ONLY the indicator columns. A bare INSERT OR REPLACE used to
+            # delete each row and re-insert it, wiping profit_*, pre/post prices,
+            # asset metadata and pattern columns that other steps own.
             conn.executemany(
-                """INSERT OR REPLACE INTO stats (
+                """INSERT INTO stats (
                     symbol, name, price, volume, change_pct, atrp, weighted_alpha,
                     atr_signal, atr_stop, atr_value, atr_streak, atr_crossed_above, atr_crossed_below,
                     atr_multiplier, streak,
-                    next_day_return, prob_up_1d, prob_up_5d, prob_up_st_cross,
-                    pre_price, pre_change_pct, post_price, post_change_pct,
-                    profit_status, profit_last_qtr_pct, profit_millions,
-                    profit_expectations, profit_post_result_dir,
-                    fractionable, marginable,
-                    asset_class, exchange, status, tradable,
-                    pattern_name, pattern_prob,
+                    next_day_return, prob_up_1d, prob_up_5d, prob_up_st_cross, prob_up_1w, prob_up_1m,
                     last_updated, oldest_data,
-                    downloaded_1day, downloaded_1hour, downloaded_1min,
                     accel_a, accel_base, accel_signal, accel_crossed_up, accel_crossed_down, accel_streak,
                     confluence,
                     st_bars_below, st_bars_above, accel_bars_below, accel_bars_above,
                     atr_signal_w, atr_stop_w, atr_crossed_above_w, atr_crossed_below_w, atr_streak_w, st_bars_below_w, st_bars_above_w,
                     atr_signal_m, atr_stop_m, atr_crossed_above_m, atr_crossed_below_m, atr_streak_m, st_bars_below_m, st_bars_above_m,
-                    prob_up_1w, prob_up_1m
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    r_squared
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    price=excluded.price, volume=excluded.volume, change_pct=excluded.change_pct,
+                    atrp=excluded.atrp, weighted_alpha=excluded.weighted_alpha,
+                    atr_signal=excluded.atr_signal, atr_stop=excluded.atr_stop, atr_value=excluded.atr_value,
+                    atr_streak=excluded.atr_streak, atr_crossed_above=excluded.atr_crossed_above,
+                    atr_crossed_below=excluded.atr_crossed_below, atr_multiplier=excluded.atr_multiplier,
+                    streak=excluded.streak, next_day_return=excluded.next_day_return,
+                    prob_up_1d=excluded.prob_up_1d, prob_up_5d=excluded.prob_up_5d,
+                    prob_up_st_cross=excluded.prob_up_st_cross, prob_up_1w=excluded.prob_up_1w,
+                    prob_up_1m=excluded.prob_up_1m,
+                    last_updated=excluded.last_updated, oldest_data=excluded.oldest_data,
+                    accel_a=excluded.accel_a, accel_base=excluded.accel_base, accel_signal=excluded.accel_signal,
+                    accel_crossed_up=excluded.accel_crossed_up, accel_crossed_down=excluded.accel_crossed_down,
+                    accel_streak=excluded.accel_streak, confluence=excluded.confluence,
+                    st_bars_below=excluded.st_bars_below, st_bars_above=excluded.st_bars_above,
+                    accel_bars_below=excluded.accel_bars_below, accel_bars_above=excluded.accel_bars_above,
+                    atr_signal_w=excluded.atr_signal_w, atr_stop_w=excluded.atr_stop_w,
+                    atr_crossed_above_w=excluded.atr_crossed_above_w, atr_crossed_below_w=excluded.atr_crossed_below_w,
+                    atr_streak_w=excluded.atr_streak_w, st_bars_below_w=excluded.st_bars_below_w, st_bars_above_w=excluded.st_bars_above_w,
+                    atr_signal_m=excluded.atr_signal_m, atr_stop_m=excluded.atr_stop_m,
+                    atr_crossed_above_m=excluded.atr_crossed_above_m, atr_crossed_below_m=excluded.atr_crossed_below_m,
+                    atr_streak_m=excluded.atr_streak_m, st_bars_below_m=excluded.st_bars_below_m, st_bars_above_m=excluded.st_bars_above_m,
+                    r_squared=excluded.r_squared""",
                 records
             )
             conn.commit()
@@ -790,7 +835,7 @@ def _compute_historical_symbol_frame(grp):
     h = grp["high"].astype(float)
     l = grp["low"].astype(float)
     v = grp["volume"].replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
-    st = atr_trailing_stop(grp, period=14, multiplier=1.0)
+    st = atr_trailing_stop(grp, period=14, multiplier=ATR_MULTIPLIER)
     ac = accel(grp)
     ai = _historical_ai_columns(grp)
 
@@ -809,7 +854,7 @@ def _compute_historical_symbol_frame(grp):
         "atr_crossed_above": st["crossed_above"].fillna(0).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int),
         "atr_crossed_below": st["crossed_below"].fillna(0).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int),
         "atr_streak": st["streak"].fillna(0).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int),
-        "atr_multiplier": 1.0,
+        "atr_multiplier": ATR_MULTIPLIER,
     })
     out = pd.concat([out, ai], axis=1)
     # prob_up_st_cross must come before accel columns to match HISTORICAL_SCREENER_COLUMNS order
@@ -823,6 +868,7 @@ def _compute_historical_symbol_frame(grp):
         st["crossed_above"].fillna(0).values,
         out["next_day_return"].values,
     )
+    out["r_squared"] = r_squared(c, R_SQUARED_WINDOW)
     out["accel_a"] = ac["accel_a"].fillna(0)
     out["accel_base"] = ac["accel_base"].fillna(0)
     out["accel_signal"] = ac["accel_signal"].fillna(0).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
@@ -849,7 +895,7 @@ def _compute_historical_symbol_frame(grp):
 
             w_trends, w_stops, w_atrs, w_streaks, w_cross_above, w_cross_below, w_bars_bl, w_bars_ab = \
                 compute_rolling_atr_batch(dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                                          sessions, period=14, multiplier=1.0)
+                                          sessions, period=14, multiplier=ATR_MULTIPLIER)
 
             out[f"atr_signal{suffix}"] = w_trends
             out[f"atr_stop{suffix}"] = w_stops
@@ -983,7 +1029,7 @@ def _compute_symbol_batch(args):
                 if last_hist:
                     try:
                         dt = datetime.strptime(last_hist, "%Y-%m-%d")
-                        cutoff = (dt - timedelta(days=300)).strftime("%Y-%m-%d")
+                        cutoff = (dt - timedelta(days=500)).strftime("%Y-%m-%d")
                     except Exception:
                         cutoff = "1970-01-01"
                 else:
@@ -1014,7 +1060,7 @@ def _compute_symbol_batch(args):
                     if new_bars.empty:
                         continue
                     num_new = len(new_bars)
-                    grp_sliced = grp.tail(num_new + 252).copy()
+                    grp_sliced = grp.tail(num_new + 320).copy()
                     hist = _compute_historical_symbol_frame(grp_sliced)
                     # Look back 5 days to recompute next_day_return for recent rows
                     # (new bars may change the next_day_return of the previous day)
@@ -1195,7 +1241,7 @@ def update_historical_screener(market="US", progress_callback=None, only_symbols
                             try:
                                 dt = datetime.strptime(last_hist, "%Y-%m-%d")
                                 from datetime import timedelta
-                                cutoff = (dt - timedelta(days=300)).strftime("%Y-%m-%d")
+                                cutoff = (dt - timedelta(days=500)).strftime("%Y-%m-%d")
                             except Exception:
                                 cutoff = "1970-01-01"
                         else:
@@ -1228,7 +1274,7 @@ def update_historical_screener(market="US", progress_callback=None, only_symbols
                             if new_bars.empty:
                                 continue
                             num_new = len(new_bars)
-                            grp_sliced = grp.tail(num_new + 252).copy()
+                            grp_sliced = grp.tail(num_new + 320).copy()
                             hist = _compute_historical_symbol_frame(grp_sliced)
                             # Look back 5 days to recompute next_day_return for recent rows
                             from datetime import timedelta as _td2, datetime as _dt2
@@ -1421,7 +1467,7 @@ CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
     "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
 ]
 
-CRYPTO_STATS_VERSION = "crypto-v1"
+CRYPTO_STATS_VERSION = "crypto-v2"  # v2: ATR multiplier 1.0 -> 2.0 (matches equities)
 
 
 def _compute_crypto_stats_batch(batch_args):
@@ -1501,7 +1547,7 @@ def _compute_crypto_stats_batch(batch_args):
             wa = _weighted_alpha(grp)
             wa_val = wa.iloc[-1] if len(wa) > 0 else 0
 
-            st_result = _atr_trailing_stop(grp, period=14, multiplier=1.0)
+            st_result = _atr_trailing_stop(grp, period=14, multiplier=ATR_MULTIPLIER)
             st_signal = _si(st_result["trend"].iloc[-1]) if len(st_result) > 0 else 0
             st_stop = _sf(st_result["stop"].iloc[-1]) if len(st_result) > 0 else 0
             st_atr = _sf(st_result["atr_value"].iloc[-1]) if len(st_result) > 0 else 0
@@ -1520,7 +1566,7 @@ def _compute_crypto_stats_batch(batch_args):
                     closes_arr = grp["close"].astype(float).values
                     r = _compute_rolling_atr_trailing_stop(
                         dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                        len(dates_arr) - 1, 5, period=14, multiplier=1.0)
+                        len(dates_arr) - 1, 5, period=14, multiplier=ATR_MULTIPLIER)
                     st_w_signal = r['trend']; st_w_stop = r['stop']
                     st_w_cross_up = r['crossed_above']; st_w_cross_down = r['crossed_below']
                     st_w_streak = r['streak']
@@ -1538,7 +1584,7 @@ def _compute_crypto_stats_batch(batch_args):
                     closes_arr = grp["close"].astype(float).values
                     r = _compute_rolling_atr_trailing_stop(
                         dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                        len(dates_arr) - 1, 22, period=14, multiplier=1.0)
+                        len(dates_arr) - 1, 22, period=14, multiplier=ATR_MULTIPLIER)
                     st_m_signal = r['trend']; st_m_stop = r['stop']
                     st_m_cross_up = r['crossed_above']; st_m_cross_down = r['crossed_below']
                     st_m_streak = r['streak']
@@ -1920,7 +1966,7 @@ def _compute_crypto_symbol_batch(args):
                 if last_hist:
                     try:
                         dt = datetime.strptime(last_hist, "%Y-%m-%d")
-                        cutoff = (dt - timedelta(days=300)).strftime("%Y-%m-%d")
+                        cutoff = (dt - timedelta(days=500)).strftime("%Y-%m-%d")
                     except Exception:
                         cutoff = "1970-01-01"
                 else:
@@ -1952,7 +1998,7 @@ def _compute_crypto_symbol_batch(args):
                     if new_bars.empty:
                         continue
                     num_new = len(new_bars)
-                    grp_sliced = grp.tail(num_new + 252).copy()
+                    grp_sliced = grp.tail(num_new + 320).copy()
                     hist = _compute_historical_crypto_frame(grp_sliced)
                     try:
                         _ld = datetime.strptime(str(last_hist_date)[:10], "%Y-%m-%d")
@@ -1982,7 +2028,7 @@ def _compute_historical_crypto_frame(grp):
     h = grp["high"].astype(float)
     l = grp["low"].astype(float)
     v = grp["volume"].replace([_np.inf, -_np.inf], _np.nan).fillna(0)
-    st = atr_trailing_stop(grp, period=14, multiplier=1.0)
+    st = atr_trailing_stop(grp, period=14, multiplier=ATR_MULTIPLIER)
     ac = accel(grp)
     ai = _historical_ai_columns(grp)
 
@@ -2036,7 +2082,7 @@ def _compute_historical_crypto_frame(grp):
 
             w_trends, w_stops, w_atrs, w_streaks, w_cross_above, w_cross_below, w_bars_bl, w_bars_ab = \
                 compute_rolling_atr_batch(dates_arr, opens_arr, highs_arr, lows_arr, closes_arr,
-                                          sessions, period=14, multiplier=1.0)
+                                          sessions, period=14, multiplier=ATR_MULTIPLIER)
 
             out[f"atr_signal{suffix}"] = w_trends
             out[f"atr_stop{suffix}"] = w_stops

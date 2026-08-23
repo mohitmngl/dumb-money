@@ -1,13 +1,12 @@
 {% extends "base.html" %}
-{% block title %}String Basket Screener - {{ market }}{% endblock %}
+{% block title %}Long+Short Strings - {{ market }}{% endblock %}
 {% block content %}
 <div class="page-header">
-  <h1>String Basket Screener <span class="badge badge-info">{{ market }}</span></h1>
+  <h1>Long+Short Strings <span class="badge badge-info">{{ market }}</span></h1>
   <div class="flex-row">
     <button class="btn btn-sm btn-primary" id="btnGenerateUS" onclick="startGenerate('US')">Generate US</button>
     <button class="btn btn-sm btn-primary" id="btnGenerateINDIA" onclick="startGenerate('INDIA')">Generate India</button>
-    <a href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/leaderboard" class="btn btn-sm" style="text-decoration:none">Leaderboard</a>
-    <button class="btn btn-sm" onclick="openColumnReference()">Columns</button>
+        <button class="btn btn-sm" onclick="openColumnReference()">Columns</button>
     <button class="btn btn-sm" onclick="exportCSV()">Export CSV</button>
   </div>
 </div>
@@ -102,7 +101,7 @@
 <div class="modal-overlay" id="columnModal" style="display:none">
   <div class="modal" style="max-width:920px;max-height:82vh;overflow:auto">
     <div class="flex-between mb-16">
-      <h3 style="margin:0">Basket Screener Columns</h3>
+      <h3 style="margin:0">Long+Short String Columns</h3>
       <button class="btn btn-sm" onclick="closeColumnReference()">Close</button>
     </div>
     <div class="screener-table">
@@ -138,6 +137,7 @@ const COLUMNS = [
   {key:'weighted_alpha', label:'Wtd Alpha', width:90, sort:true, num:true},
   {key:'volume', label:'Volume', width:85, sort:true, num:true},
   {key:'streak', label:'Streak', width:70, sort:true, num:true},
+  {key:'r_squared', label:'R²', width:70, sort:true, num:true},
   {key:'confluence', label:'Confluence', width:95, sort:true, num:true, heat:true},
   {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
   {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
@@ -215,8 +215,7 @@ function loadScreener() {
   const tf = document.getElementById('fTimeframe').value;
   document.getElementById('screenerTable').innerHTML = '<div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>';
   Promise.all([
-    fetch('/api/basket-screener?' + params).then(r => r.json()),
-    tf !== '1D' ? fetch(`/api/basket-screener/timeframe-returns?market=${MARKET}&timeframe=${tf}`).then(r => r.json()) : Promise.resolve(null),
+    fetch('/api/long-short-screener?' + params).then(r => r.json()),
   ]).then(([d, tfData]) => {
     if (tfData && tfData.returns && d.data) {
       d.data.forEach(row => {
@@ -251,7 +250,7 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
     COLUMNS.forEach(col => {
       let val = row[col.key];
       let cls = '';
-      if (col.key === 'symbol') { val = `<a href="/${MARKET === 'INDIA' ? 'india/' : ''}basket-screener/string/${row.symbol}" target="_blank">${row.symbol}</a>`; }
+      if (col.key === 'symbol') { val = `<a href="/${MARKET === 'INDIA' ? 'india/' : ''}long-short-screener/string/${row.symbol}" target="_blank">${row.symbol}</a>`; }
       else if (col.key === 'name') { val = val ? String(val).slice(0,28) + (String(val).length>28?'...':'') : '-'; }
       else if (col.key === 'change_pct' || col.key === 'next_day_return' || col.key === 'next_5d_return' || col.key === 'week_return' || col.key === 'month_return') {
         const pct = formatSignedPercent(val);
@@ -344,7 +343,7 @@ function loadTopLists() {
       items.slice(0,5).forEach(r => {
         const val = idx === 0 ? (r.change_pct||0).toFixed(2)+'%' : idx === 1 ? (r.volume||0).toLocaleString() : (r.weighted_alpha||0).toFixed(2);
         const cls = idx === 0 ? (r.change_pct >= 0 ? 'text-up' : 'text-down') : '';
-        html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}basket-screener/string/${r.symbol}" target="_blank">${r.symbol}</a></td><td class="${cls} numeric">${val}</td></tr>`;
+        html += `<tr><td><a href="/${MARKET==='INDIA'?'india/':''}long-short-screener/string/${r.symbol}" target="_blank">${r.symbol}</a></td><td class="${cls} numeric">${val}</td></tr>`;
       });
       html += '</table>';
       document.getElementById(id).innerHTML = html;
@@ -359,7 +358,7 @@ function startGenerate(mkt) {
   document.getElementById('btnGenerate' + mkt).disabled = true;
   document.getElementById('btnGenerate' + mkt).textContent = 'Generating...';
   document.getElementById('buildProgress' + mkt).style.display = 'block';
-  fetch('/api/basket-screener/generate', {
+  fetch('/api/long-short-screener/generate', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({market: mkt})
   }).then(r => r.json()).then(d => {
@@ -369,7 +368,7 @@ function startGenerate(mkt) {
 }
 
 function pollProgress(mkt) {
-  fetch('/api/basket-screener/progress?market=' + mkt).then(r => r.json()).then(d => {
+  fetch('/api/long-short-screener/progress?market=' + mkt).then(r => r.json()).then(d => {
     const bar = document.getElementById('buildBar' + mkt);
     const stage = document.getElementById('buildStage' + mkt);
     const detail = document.getElementById('buildDetail' + mkt);

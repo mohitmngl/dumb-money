@@ -178,6 +178,12 @@ def _normal_refresh_warmup_start(days=450, market=None):
     return (_market_date(market) - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _latest_expected_bar(market=None):
+    """Most recent trading date that should have a finalized daily bar
+    (walks back over weekends and, for US, federal holidays)."""
+    return _last_weekday_cutoff(market, days_back=0)
+
+
 def _market_is_open_now(market=None):
     """Check if market is currently in trading hours."""
     from datetime import datetime, time as dt_time
@@ -309,8 +315,18 @@ def _refresh_worker(market):
             stats_symbols = updated_symbols
             label = f"{len(updated_symbols)} updated"
         else:
-            stats_symbols = None  # None = full market recompute (keeps stats fresh)
-            label = "all (full recompute)"
+            # No bars changed. Stats are already current from the run that
+            # downloaded them — a no-change refresh must be a no-op (AGENTS.md /
+            # SPEED.md contract). Full recompute only if stats never populated.
+            try:
+                from dumbmoney.db import get_db as _gdb
+                _c = _gdb(market)
+                stats_rows = _c.execute("SELECT COUNT(*) FROM stats").fetchone()[0]
+                _c.close()
+            except Exception:
+                stats_rows = 0
+            stats_symbols = [] if stats_rows > 0 else None
+            label = "no changes (no-op)" if stats_rows > 0 else "all (stats empty — full recompute)"
 
         # If most stats are stale (>1 day old), force full recompute
         if stats_symbols and market == "INDIA":
@@ -456,6 +472,68 @@ def _refresh_worker(market):
             pass
 
 
+def _record_new_ipos(conn, new_symbols):
+    """Persist first-seen date for symbols that have no bars yet (new IPOs/listings).
+    They are downloaded with a warm-up window now and re-checked on every refresh
+    until their first bars appear."""
+    if not new_symbols:
+        return
+    today = _market_date().strftime("%Y-%m-%d")
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS ipos (
+                 symbol TEXT PRIMARY KEY, first_seen TEXT, first_bar TEXT)"""
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO ipos (symbol, first_seen) VALUES (?, ?)",
+            [(s, today) for s in new_symbols],
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to record IPOs: {e}")
+
+
+def _mark_ipos_first_bar(conn, updated_symbols):
+    """Stamp the first bar date for IPOs once their bars arrive."""
+    if not updated_symbols:
+        return
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ipos'"
+        ).fetchone()
+        if not row:
+            return
+        pending = conn.execute(
+            "SELECT symbol FROM ipos WHERE first_bar IS NULL"
+        ).fetchall()
+        pending_set = {r[0] for r in pending} & set(updated_symbols)
+        for sym in pending_set:
+            first = conn.execute(
+                "SELECT MIN(date) FROM bars WHERE symbol=? AND timeframe='1Day'", (sym,)
+            ).fetchone()[0]
+            if first:
+                conn.execute(
+                    "UPDATE ipos SET first_bar=? WHERE symbol=? AND first_bar IS NULL",
+                    (first, sym),
+                )
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to stamp IPO first bars: {e}")
+
+
+def _next_download_start(last_bar, market_open):
+    """Start date for the next incremental download of one symbol.
+
+    Always re-fetch inclusively from the last stored bar so that:
+    - a mid-market refresh's partial bar is replaced by the finalized bar later,
+    - a next-day refresh picks up yesterday's final close plus today,
+    - multiple same-day refreshes keep updating the current day's bar.
+    """
+    if not last_bar:
+        return None
+    return last_bar  # inclusive: re-download the last bar to correct partial data
+
+
 def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
     from dumbmoney.db import get_db
     from dumbmoney.data_us import download_bars
@@ -483,21 +561,30 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
              SELECT sym FROM s WHERE sym IS NOT NULL"""
         ).fetchall()]
 
-    date_map = {}
+    # Per-asset indexed latest-bar lookup only (MIN() is backfill-only; skipping it
+    # halves the planning scan on the huge bars table).
+    oldest_select = ("(SELECT MIN(b.date) FROM bars b "
+                     "WHERE b.symbol=a.symbol AND b.timeframe='1Day')"
+                     if allow_backfill else "NULL")
     if explicit_symbols:
         placeholders = ",".join("?" * len(symbols))
         date_rows = conn.execute(
-            f"""SELECT symbol, MAX(date), MIN(date) FROM bars
-                WHERE timeframe='1Day' AND symbol IN ({placeholders})
-                GROUP BY symbol""",
+            f"""SELECT symbol, MAX(d), NULL FROM (
+                    SELECT symbol, date AS d FROM bars
+                    WHERE timeframe='1Day' AND symbol IN ({placeholders})
+                ) GROUP BY symbol""",
             symbols,
-        )
+        ).fetchall()
+        date_map = {r[0]: (r[1], None) for r in date_rows}
+        if allow_backfill:
+            od_rows = conn.execute(
+                f"SELECT symbol, MIN(date) FROM bars WHERE timeframe='1Day' AND symbol IN ({placeholders}) GROUP BY symbol",
+                symbols,
+            ).fetchall()
+            for r in od_rows:
+                if r[0] in date_map:
+                    date_map[r[0]] = (date_map[r[0]][0], r[1])
     else:
-        # oldest-date lookup is only needed for backfill planning; skipping the MIN()
-        # correlated subquery halves the planning scan on the huge bars table.
-        oldest_select = ("(SELECT MIN(b.date) FROM bars b "
-                         "WHERE b.symbol=a.symbol AND b.timeframe='1Day')"
-                         if allow_backfill else "NULL")
         date_rows = conn.execute(
             f"""SELECT a.symbol,
                       (SELECT MAX(b.date) FROM bars b
@@ -505,126 +592,126 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
                       {oldest_select}
                FROM assets a
                WHERE a.status='active' AND a.tradable=1 AND COALESCE(a.exchange, '') <> 'OTC'"""
-        )
-    for row in date_rows:
-        date_map[row[0]] = (row[1], row[2])
-    conn.close()
-
-    last_dates = {s: v[0] for s, v in date_map.items()}
-    oldest_dates = {s: v[1] for s, v in date_map.items()}
+        ).fetchall()
+        date_map = {r[0]: (r[1], r[2]) for r in date_rows}
 
     if not symbols:
         _update_status(step_pct=100, symbols_total=0, symbols_done=0)
         # Must be [] (deliberate no-op), never None (None means full-market recompute).
         return []
 
-    from datetime import date, timedelta
-    cutoff = _last_weekday_cutoff(market)
     today_str = _market_date(market).strftime("%Y-%m-%d")
     market_open = _market_is_open_now(market)
+    cutoff = _last_weekday_cutoff(market)
+    warmup_start = _normal_refresh_warmup_start(450, market)
     BACKFILL_CUTOFF = "2016-01-01"
 
-    symbols_to_download = []
-    up_to_date = 0
+    # Group symbols by their own next-needed start date so a stale symbol never
+    # drags the whole batch, and every symbol resumes exactly from its last bar.
+    start_groups = {}
     new_stocks = []
+    up_to_date = 0
     backfill_stocks = []
     for sym in symbols:
-        ld = last_dates.get(sym)
-        od = oldest_dates.get(sym)
+        ld, od = date_map.get(sym, (None, None))
         if ld is None:
-            # Never downloaded — always include (backfill from warmup window)
-            symbols_to_download.append(sym)
+            # Never downloaded: seed from the warm-up window, not 1970.
+            start_groups.setdefault(warmup_start, []).append(sym)
             new_stocks.append(sym)
-        elif ld >= cutoff:
-            if market_open:
-                # Market open: ALWAYS re-download (supports multiple refreshes per day)
-                symbols_to_download.append(sym)
-            elif ld < today_str:
-                # Market closed: download if bar is stale
-                symbols_to_download.append(sym)
-            else:
-                up_to_date += 1
-        else:
-            symbols_to_download.append(sym)
-
-        if allow_backfill and od and od > BACKFILL_CUTOFF and ld:
+            continue
+        # Skip only when the stored latest bar is already the newest expected bar:
+        # market open -> today, market closed -> latest weekday.
+        expected_latest = today_str if market_open else _latest_expected_bar(market)
+        if ld >= expected_latest and not market_open:
+            up_to_date += 1
+            if allow_backfill and od and od > BACKFILL_CUTOFF:
+                backfill_stocks.append(sym)
+            continue
+        start = _next_download_start(ld, market_open)
+        start_groups.setdefault(start, []).append(sym)
+        if allow_backfill and od and od > BACKFILL_CUTOFF:
             backfill_stocks.append(sym)
 
-    backfill_set = set(backfill_stocks) - set(symbols_to_download)
-    symbols_to_download.extend(sorted(backfill_set))
+    if backfill_stocks:
+        bf_set = set(backfill_stocks) - {s for g in start_groups.values() for s in g}
+        if bf_set:
+            start_groups.setdefault(BACKFILL_CUTOFF, []).extend(sorted(bf_set))
 
-    total = len(symbols_to_download)
+    _record_new_ipos(conn, new_stocks)
+
+    total = sum(len(g) for g in start_groups.values())
     if total == 0:
         _update_status(symbols_total=len(symbols), symbols_done=len(symbols), step_pct=100,
                        phase=f"All {up_to_date} symbols up to date")
+        conn.close()
         return []
 
     new_count = len(new_stocks)
-    backfill_count = len(backfill_set)
     phase_msg = f"Downloading {total} symbols ({up_to_date} up to date"
     if new_count:
         phase_msg += f", {new_count} new IPOs"
-    if backfill_count:
-        phase_msg += f", {backfill_count} backfilling"
-    phase_msg += ")"
+    bf_count = total - sum(1 for g in start_groups.values() for s in g if s not in new_stocks)
+    phase_msg += f", {len(start_groups)} date groups)"
     _update_status(symbols_total=total, symbols_done=0, phase=phase_msg, new_stocks_count=new_count)
 
     updated = []
-    is_incremental = not backfill_set and total > 0
-
-    if symbols_to_download:
+    group_items = sorted(start_groups.items())
+    done_so_far = 0
+    for start, group_syms in group_items:
+        if _check_cancel(market):
+            break
         try:
             def _us_download_progress(done_batches, total_batches):
-                pct = round(done_batches / total_batches * 90, 1) if total_batches else 90
-                s = _update_status(step_pct=pct, phase=f"Downloading bars: batch {done_batches}/{total_batches}")
+                pct = round((done_so_far + done_batches / max(total_batches, 1)) / total * 90, 1)
+                s = _update_status(step_pct=pct, phase=f"Bars from {start}: batch {done_batches}/{total_batches}")
                 s["overall_pct"] = _compute_overall_pct(s)
                 _persist_status(s)
-            _update_status(phase=f"Downloading bars for {total} symbols...")
-            download_bars(symbols_to_download, start_date=cutoff, timeframe="1Day", incremental=False, progress_callback=_us_download_progress)
-            _update_status(step_pct=90, phase=f"Downloaded bars for {total} symbols")
-            updated = symbols_to_download
+            download_bars(group_syms, start_date=start, timeframe="1Day", incremental=False,
+                          progress_callback=_us_download_progress, cancel_check=lambda: _check_cancel(market))
+            updated.extend(group_syms)
         except Exception as e:
-            logger.warning(f"Download error: {e}")
-            _update_status(phase=f"Download error: {e}")
+            logger.warning(f"Download error (start={start}, {len(group_syms)} symbols): {e}")
+        done_so_far += len(group_syms)
+        _update_status(symbols_done=min(done_so_far, total))
 
-    # Snapshot bar correction: Alpaca IEX bars endpoint can return stale mid-day
-    # snapshots for the current day even after market close. Snapshots finalize
-    # faster. Run on ALL symbols (not just downloaded) to catch skipped ones too.
-    try:
-        from dumbmoney.data_us import get_snapshots
-        snaps = get_snapshots(symbols)
-        snap_updates = []
-        for sym, snap in snaps.items():
-            daily = snap.get("dailyBar")
-            if not daily:
-                continue
-            snap_date = daily.get("t", "")[:10]
-            snap_vol = int(daily.get("v", 0))
-            if snap_vol <= 0:
-                continue
-            snap_updates.append((sym, snap_vol, daily["o"], daily["h"], daily["l"], daily["c"], snap_date))
-        if snap_updates:
-            from dumbmoney.db import get_db as _get_db
-            _conn2 = _get_db(market)
-            corrected = 0
-            for sym, snap_vol, so, sh, sl, sc, snap_date in snap_updates:
-                cur = _conn2.execute(
-                    "SELECT volume FROM bars WHERE symbol=? AND timeframe='1Day' AND date=?",
-                    (sym, snap_date)
-                ).fetchone()
-                if cur and cur[0] >= snap_vol:
+    # Snapshot correction: only for symbols we just downloaded (finalizes the
+    # current day's IEX bar faster than the bars endpoint).
+    if updated:
+        try:
+            from dumbmoney.data_us import get_snapshots
+            snaps = get_snapshots(updated)
+            snap_updates = []
+            for sym, snap in snaps.items():
+                daily = snap.get("dailyBar")
+                if not daily:
                     continue
-                _conn2.execute(
-                    "INSERT OR REPLACE INTO bars (symbol, timeframe, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
-                    (sym, "1Day", snap_date, so, sh, sl, sc, snap_vol)
-                )
-                corrected += 1
-            _conn2.commit()
-            _conn2.close()
-            if corrected:
-                logger.info(f"Snapshot-corrected {corrected} bars")
-    except Exception as e:
-        logger.warning(f"Snapshot bar correction failed: {e}")
+                snap_date = daily.get("t", "")[:10]
+                snap_vol = int(daily.get("v", 0))
+                if snap_vol <= 0:
+                    continue
+                snap_updates.append((sym, snap_vol, daily["o"], daily["h"], daily["l"], daily["c"], snap_date))
+            if snap_updates:
+                corrected = 0
+                for sym, snap_vol, so, sh, sl, sc, snap_date in snap_updates:
+                    cur = conn.execute(
+                        "SELECT volume FROM bars WHERE symbol=? AND timeframe='1Day' AND date=?",
+                        (sym, snap_date)
+                    ).fetchone()
+                    if cur and cur[0] >= snap_vol:
+                        continue
+                    conn.execute(
+                        "INSERT OR REPLACE INTO bars (symbol, timeframe, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
+                        (sym, "1Day", snap_date, so, sh, sl, sc, snap_vol)
+                    )
+                    corrected += 1
+                conn.commit()
+                if corrected:
+                    logger.info(f"Snapshot-corrected {corrected} bars")
+        except Exception as e:
+            logger.warning(f"Snapshot bar correction failed: {e}")
+
+    _mark_ipos_first_bar(conn, updated)
+    conn.close()
 
     s = _update_status(symbols_done=total, step_pct=100, phase=f"Downloaded {len(updated)} symbols")
     s["overall_pct"] = _compute_overall_pct(s)
@@ -646,8 +733,8 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
             return []
     else:
         # Keep this filter aligned with the per-asset date lookup below: a symbol in
-        # `symbols` but missing from `last_dates` is treated as brand-new and gets a
-        # 450-day warm-up download on every refresh.
+        # `symbols` but missing from `date_map` is treated as brand-new and gets a
+        # full-history seed download on every refresh.
         symbols = [r[0] for r in conn.execute(
             "SELECT symbol FROM assets WHERE status='active'").fetchall()]
     if not symbols:
@@ -669,8 +756,7 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
                 GROUP BY symbol""",
             symbols,
         ).fetchall()
-        last_dates = {row[0]: row[1] for row in date_rows}
-        oldest_dates = {row[0]: row[2] for row in date_rows}
+        date_map = {row[0]: (row[1], row[2]) for row in date_rows}
     else:
         # oldest-date lookup is only needed for backfill planning; skipping the MIN()
         # correlated subquery halves the planning scan on the huge bars table.
@@ -685,90 +771,82 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
                FROM assets a
                WHERE a.status='active'"""
         ).fetchall()
-        last_dates = {row[0]: row[1] for row in date_rows}
-        oldest_dates = {row[0]: row[2] for row in date_rows}
-    conn.close()
+        date_map = {row[0]: (row[1], row[2]) for row in date_rows}
 
     if not symbols:
         _update_status(step_pct=100, symbols_total=0, symbols_done=0)
+        conn.close()
         return []
 
-    from datetime import date, timedelta
-    cutoff = _last_weekday_cutoff(market)
     today_str = _market_date(market).strftime("%Y-%m-%d")
     market_open = _market_is_open_now(market)
     BACKFILL_CUTOFF = "2016-01-01"
+    NEW_SEED_START = "1970-01-01"  # Yahoo path maps this to range=10y
 
-    new_backfill_syms = []
-    incremental_syms = []
-    up_to_date = 0
+    # Group by each symbol's own next-needed start date: new symbols get a full
+    # seed, current symbols resume inclusively from their own last bar. A new
+    # listing must never force the whole batch into a 10-year re-download.
+    start_groups = {}
     new_stocks = []
+    up_to_date = 0
     backfill_stocks = []
-
     for sym in symbols:
-        ld = last_dates.get(sym)
-        od = oldest_dates.get(sym)
+        ld, od = date_map.get(sym, (None, None))
         if ld is None:
-            # Never downloaded — always backfill
+            # Never downloaded — full seed (Yahoo range=10y)
+            start_groups.setdefault(NEW_SEED_START, []).append(sym)
             new_stocks.append(sym)
-            new_backfill_syms.append(sym)
-        elif ld >= cutoff:
-            if market_open:
-                # Market open: ALWAYS re-download (supports multiple refreshes per day)
-                incremental_syms.append(sym)
-            elif ld < today_str:
-                # Market closed: download if bar is stale
-                incremental_syms.append(sym)
-            else:
-                up_to_date += 1
             continue
-        elif allow_backfill and od and od > BACKFILL_CUTOFF:
+        expected_latest = today_str if market_open else _latest_expected_bar(market)
+        if ld >= expected_latest and not market_open:
+            up_to_date += 1
+            if allow_backfill and od and od > BACKFILL_CUTOFF:
+                backfill_stocks.append(sym)
+            continue
+        start_groups.setdefault(ld, []).append(sym)
+        if allow_backfill and od and od > BACKFILL_CUTOFF:
             backfill_stocks.append(sym)
-            new_backfill_syms.append(sym)
-        else:
-            incremental_syms.append(sym)
 
-    total = len(new_backfill_syms) + len(incremental_syms)
+    if backfill_stocks:
+        bf_set = set(backfill_stocks) - {s for g in start_groups.values() for s in g}
+        if bf_set:
+            start_groups.setdefault(BACKFILL_CUTOFF, []).extend(sorted(bf_set))
+
+    _record_new_ipos(conn, new_stocks)
+
+    total = sum(len(g) for g in start_groups.values())
     if total == 0:
         _update_status(symbols_total=len(symbols), symbols_done=len(symbols), step_pct=100,
                        phase=f"All {up_to_date} symbols up to date")
+        conn.close()
         return []
 
     new_count = len(new_stocks)
-    backfill_count = len(backfill_stocks)
-    incr_count = len(incremental_syms)
     phase_msg = f"Downloading {total} symbols ({up_to_date} up to date"
     if new_count:
         phase_msg += f", {new_count} new"
-    if backfill_count:
-        phase_msg += f", {backfill_count} backfill"
-    if incr_count:
-        phase_msg += f", {incr_count} incremental"
-    phase_msg += ")"
+    phase_msg += f", {len(start_groups)} date groups)"
     _update_status(symbols_total=total, symbols_done=0, phase=phase_msg, new_stocks_count=new_count)
 
     updated = []
-    all_syms = new_backfill_syms + incremental_syms
-    is_incremental = not new_backfill_syms and total > 0
-
-    if all_syms:
+    group_items = sorted(start_groups.items())
+    done_so_far = 0
+    for start, group_syms in group_items:
+        if _check_cancel(market):
+            break
         try:
             def _india_progress(done, total_syms):
-                if _check_cancel():
-                    return
-                pct = round(done / total_syms * 100, 1) if total_syms else 100
-                s = _update_status(step_pct=pct, symbols_done=done, symbols_total=total_syms)
+                pct = round((done_so_far + done) / total * 100, 1)
+                s = _update_status(step_pct=pct, symbols_done=min(done_so_far + done, total))
                 s["overall_pct"] = _compute_overall_pct(s)
                 _persist_status(s)
-            if is_incremental:
-                download_bars_india(all_syms, start_date=cutoff,
-                                    cancel_check=_check_cancel, progress_callback=_india_progress)
-            else:
-                download_bars_india(all_syms, start_date="1970-01-01",
-                                    cancel_check=_check_cancel, progress_callback=_india_progress)
-            updated = all_syms
+            download_bars_india(group_syms, start_date=start,
+                                cancel_check=lambda: _check_cancel(market),
+                                progress_callback=_india_progress)
+            updated.extend(group_syms)
         except Exception as e:
-            logger.warning(f"India download error: {e}")
+            logger.warning(f"India download error (start={start}, {len(group_syms)} symbols): {e}")
+        done_so_far += len(group_syms)
 
     # Fill gaps from NSE bhavcopy (catches Yahoo misses on recent trading days)
     # Yfinance is primary; bhavcopy fills EQ+BE gaps where Yahoo returned nothing.
@@ -780,7 +858,7 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
             _persist_status(s)
         dates_filled, bars_added, bhav_symbols = fill_gaps_from_bhavcopy(
             series=['EQ', 'BE'], coverage_threshold=0.95,
-            cancel_check=_check_cancel, progress_callback=_bhav_progress)
+            cancel_check=lambda: _check_cancel(market), progress_callback=_bhav_progress)
         if bars_added > 0:
             logger.info(f"Bhavcopy filled {bars_added} bars across {dates_filled} dates")
             s = _update_status(phase=f"Bhavcopy filled {bars_added} bars")
@@ -788,19 +866,23 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
             _persist_status(s)
             # Add bhavcopy symbols to updated list so stats get computed
             if bhav_symbols:
-                updated = list(set(updated or []) | bhav_symbols)
+                updated = list(set(updated) | set(bhav_symbols))
 
         # Backfill new symbols that have very few bars (e.g. 1-day bhavcopy only)
-        backfilled = backfill_new_bhavcopy_symbols(
-            max_bars_threshold=50, cancel_check=_check_cancel, progress_callback=_bhav_progress)
-        if backfilled > 0:
-            s = _update_status(phase=f"Backfilled {backfilled} new symbols via yfinance")
+        backfilled_syms = backfill_new_bhavcopy_symbols(
+            max_bars_threshold=50, cancel_check=lambda: _check_cancel(market),
+            progress_callback=_bhav_progress, return_symbols=True)
+        if backfilled_syms:
+            s = _update_status(phase=f"Backfilled {len(backfilled_syms)} new symbols via NSE")
             s["overall_pct"] = _compute_overall_pct(s)
             _persist_status(s)
-            # Add backfilled symbols to stats computation
-            updated = list(set(updated or []))
+            # Add backfilled symbols so stats/history pick them up this same run
+            updated = list(set(updated) | set(backfilled_syms))
     except Exception as e:
         logger.warning(f"Bhavcopy gap-fill error: {e}")
+
+    _mark_ipos_first_bar(conn, updated)
+    conn.close()
 
     s = _update_status(symbols_done=total, step_pct=100, phase=f"Downloaded {len(updated)} symbols")
     s["overall_pct"] = _compute_overall_pct(s)

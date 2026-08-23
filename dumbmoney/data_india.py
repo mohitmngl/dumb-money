@@ -373,7 +373,7 @@ def fill_gaps_from_bhavcopy(series=None, start_date=None, end_date=None,
 
 
 def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
-                                   cancel_check=None):
+                                   cancel_check=None, return_symbols=False):
     """Backfill historical bars for symbols that have very few bars.
 
     After bhavcopy gap-fill, some symbols may only have 1 day of data.
@@ -384,8 +384,10 @@ def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
         max_bars_threshold: symbols with fewer bars than this get backfilled
         progress_callback: fn(message)
         cancel_check: fn() -> bool
+        return_symbols: if True, return the list of backfilled symbols
+                        (so stats/history can recompute them this same run)
     Returns:
-        number of symbols backfilled
+        number of symbols backfilled, or the symbol list when return_symbols=True
     """
     from dumbmoney.db import get_db
     from datetime import date, timedelta
@@ -402,7 +404,7 @@ def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
     conn.close()
 
     if not rows:
-        return 0
+        return [] if return_symbols else 0
 
     syms_to_backfill = [r[0] for r in rows]
     logger.info(f"Backfilling {len(syms_to_backfill)} symbols with <{max_bars_threshold} bars via NSE")
@@ -414,10 +416,11 @@ def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
         from jugaad_data.nse import stock_df as jugaad_stock_df
     except ImportError:
         logger.warning("jugaad-data not installed, falling back to yfinance")
-        return _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_check)
+        return _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_check,
+                                           return_symbols=return_symbols)
 
     conn = get_db("INDIA")
-    filled = 0
+    filled_syms = []
     today = date.today()
     start = date(2015, 1, 1)
 
@@ -467,7 +470,7 @@ def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
                         bars
                     )
                     conn.commit()
-                    filled += 1
+                    filled_syms.append(sym)
 
             if (i + 1) % 20 == 0:
                 logger.info(f"Backfill: {i+1}/{len(syms_to_backfill)} done")
@@ -480,15 +483,16 @@ def backfill_new_bhavcopy_symbols(max_bars_threshold=50, progress_callback=None,
 
     conn.close()
     if progress_callback:
-        progress_callback(f"Backfilled {filled} symbols via NSE")
-    logger.info(f"Backfill complete: {filled} symbols via NSE")
-    return filled
+        progress_callback(f"Backfilled {len(filled_syms)} symbols via NSE")
+    logger.info(f"Backfill complete: {len(filled_syms)} symbols via NSE")
+    return filled_syms if return_symbols else len(filled_syms)
 
 
-def _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_check):
+def _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_check,
+                                return_symbols=False):
     """Fallback yfinance backfill if jugaad-data is not available."""
     _init_yf_sessions()
-    filled = 0
+    filled_syms = []
     from queue import Queue
     write_queue = Queue()
 
@@ -524,7 +528,7 @@ def _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_chec
     writer.start()
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_download_one, s, "2016-01-01"): s for s in syms_to_backfill}
+        futures = {executor.submit(_download_one, s, "1970-01-01"): s for s in syms_to_backfill}
         for f in as_completed(futures):
             if cancel_check and cancel_check():
                 break
@@ -532,15 +536,15 @@ def _backfill_yfinance_fallback(syms_to_backfill, progress_callback, cancel_chec
             if bars:
                 for bar in bars:
                     write_queue.put(bar)
-                filled += 1
-            if filled % 20 == 0 and filled > 0:
-                logger.info(f"Backfill: {filled}/{len(syms_to_backfill)} done")
+                filled_syms.append(sym)
+            if len(filled_syms) % 20 == 0 and filled_syms:
+                logger.info(f"Backfill: {len(filled_syms)}/{len(syms_to_backfill)} done")
 
     write_queue.put(None)
     writer.join(timeout=30)
     if progress_callback:
-        progress_callback(f"Backfilled {filled} symbols via yfinance")
-    return filled
+        progress_callback(f"Backfilled {len(filled_syms)} symbols via yfinance")
+    return filled_syms if return_symbols else len(filled_syms)
 
 
 def get_live_prices_india(symbols):

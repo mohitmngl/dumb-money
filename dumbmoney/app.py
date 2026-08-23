@@ -42,10 +42,11 @@ SCREENER_COLUMN_REFERENCE = [
     {"key": "prob_up_5d", "label": "P(Up) 5D", "current": "stats.prob_up_5d", "historical": "historical_screener.prob_up_5d", "meaning": "Trailing probability that the next five-day close move was positive using data available as of the row date."},
     {"key": "prob_up_1w", "label": "P(Up) 1W", "current": "stats.prob_up_1w", "historical": "historical_screener.prob_up_1w", "meaning": "Trailing probability that the next week (5 trading days) close move was positive using data available as of the row date."},
     {"key": "prob_up_1m", "label": "P(Up) 1M", "current": "stats.prob_up_1m", "historical": "historical_screener.prob_up_1m", "meaning": "Trailing probability that the next month (22 trading days) close move was positive using data available as of the row date."},
-    {"key": "prob_up_st_cross", "label": "P(Up) ST Cross", "current": "stats.prob_up_st_cross", "historical": "historical_screener.prob_up_st_cross", "meaning": "Expanding-window probability that the next day closes higher after a 14d/1x SuperTrend bullish cross, using data available as of the row date."},
+    {"key": "prob_up_st_cross", "label": "P(Up) ST Cross", "current": "stats.prob_up_st_cross", "historical": "historical_screener.prob_up_st_cross", "meaning": "Expanding-window probability that the next day closes higher after a 14d/2x ATR Trailing Stop bullish cross, using data available as of the row date."},
     {"key": "weighted_alpha", "label": "Wtd Alpha", "current": "stats.weighted_alpha", "historical": "historical_screener.weighted_alpha", "meaning": "Weighted price performance computed only from bars available as of the row date."},
     {"key": "volume", "label": "Volume", "current": "stats.volume", "historical": "historical_screener.volume", "meaning": "Daily bar volume for the row date; never signed."},
     {"key": "streak", "label": "Streak", "current": "stats.streak", "historical": "historical_screener.streak", "meaning": "Consecutive up or down close streak as of the row date."},
+    {"key": "r_squared", "label": "R²", "current": "stats.r_squared", "historical": "historical_screener.r_squared", "meaning": "Signed R² of a linear fit on log(close) over the last 90 bars: +1 = perfectly straight uptrend, -1 = perfectly straight downtrend. Sort descending for the straightest uptrending charts."},
     {"key": "confluence", "label": "Confluence", "current": "stats.confluence", "historical": "historical_screener.confluence", "meaning": "Combined technical score computed from row-date indicator values."},
     {"key": "ai_overall_score", "label": "AI Score", "current": "ai_analysis.overall_score", "historical": "historical_screener.ai_overall_score", "meaning": "Local vectorized score, not external generated text."},
     {"key": "ai_volume_profile_score", "label": "VP Score", "current": "ai_analysis.volume_profile_score", "historical": "historical_screener.ai_volume_profile_score", "meaning": "Local volume-profile score computed from available bars."},
@@ -56,7 +57,7 @@ SCREENER_COLUMN_REFERENCE = [
     {"key": "atr_signal", "label": "ATR Signal", "current": "stats.atr_signal", "historical": "historical_screener.atr_signal", "meaning": "ATR Trailing Stop direction: 1 above (bullish), -1 below (bearish), 0 neutral."},
     {"key": "atr_crossed_above", "label": "Cross Up", "current": "stats.atr_crossed_above", "historical": "historical_screener.atr_crossed_above", "meaning": "ATR Trailing Stop crossed from bearish to bullish on the row date."},
     {"key": "atr_crossed_below", "label": "Cross Down", "current": "stats.atr_crossed_below", "historical": "historical_screener.atr_crossed_below", "meaning": "ATR Trailing Stop crossed from bullish to bearish on the row date."},
-    {"key": "atr_stop", "label": "ATR Stop 14x1", "current": "stats.atr_stop", "historical": "historical_screener.atr_stop", "meaning": "ATR Trailing Stop line using the app's current 14 period, 1.0 multiplier setup."},
+    {"key": "atr_stop", "label": "ATR Stop 14x2", "current": "stats.atr_stop", "historical": "historical_screener.atr_stop", "meaning": "ATR Trailing Stop line using the app's current 14 period, 2.0 multiplier setup."},
     {"key": "atr_signal_w", "label": "ATR Signal W", "current": "stats.atr_signal_w", "historical": "historical_screener.atr_signal_w", "meaning": "Rolling weekly ATR Trailing Stop direction: 1 above, -1 below, 0 neutral."},
     {"key": "atr_crossed_above_w", "label": "Cross Up W", "current": "stats.atr_crossed_above_w", "historical": "historical_screener.atr_crossed_above_w", "meaning": "Rolling weekly ATR Trailing Stop crossed from bearish to bullish."},
     {"key": "atr_crossed_below_w", "label": "Cross Down W", "current": "stats.atr_crossed_below_w", "historical": "historical_screener.atr_crossed_below_w", "meaning": "Rolling weekly ATR Trailing Stop crossed from bullish to bearish."},
@@ -79,12 +80,6 @@ SCREENER_COLUMN_REFERENCE = [
     {"key": "profit_status", "label": "Profit", "current": "stats.profit_status", "historical": "stats.profit_status", "meaning": "Current earnings/profit status until a historical fundamentals table exists."},
     {"key": "last_updated", "label": "Updated", "current": "stats.last_updated", "historical": "historical_screener.date", "meaning": "Current mode stats update timestamp; date mode selected as-of date."},
 ]
-
-
-def _get_market():
-    if request.path.startswith("/india/"):
-        return "INDIA"
-    return request.path.split("/")[1] if len(request.path.split("/")) > 1 and request.path.split("/")[1] in ("US", "INDIA") else "US"
 
 
 @app.context_processor
@@ -359,32 +354,63 @@ def api_crypto_candles():
 
 @crypto_bp.route("/api/crypto/download", methods=["POST"])
 def api_crypto_download():
-    """Trigger candle backfill for all or specified symbols."""
-    from dumbmoney.data_crypto import backfill_all
+    """Trigger candle backfill for one resolution (threaded; poll
+    /api/crypto/download/status)."""
+    from dumbmoney.data_crypto import get_all_symbols, download_candles
     body = request.get_json() or {}
     resolution = body.get("resolution", "1d")
-    days_back = body.get("days_back", 730)
-    symbols = body.get("symbols")
+    days_back = int(body.get("days_back", 730))
+    symbols = body.get("symbols") or get_all_symbols()
+    total = len(symbols)
 
-    def progress(pct, msg):
-        logger.info(f"[CRYPTO] download progress: {pct:.0f}% — {msg}")
+    def _persist(done):
+        try:
+            from dumbmoney.db import get_db as _gdb
+            import json as _json
+            c = _gdb("CRYPTO")
+            c.execute("INSERT OR REPLACE INTO crypto_settings (key, value) VALUES ('download_progress', ?)",
+                      (_json.dumps({"resolution": resolution, "done": done, "total": total}),))
+            c.commit()
+            c.close()
+        except Exception:
+            pass
 
-    done, total = backfill_all(resolution=resolution, days_back=days_back, symbols=symbols, progress_callback=progress)
-    return jsonify({"done": done, "total": total, "resolution": resolution})
+    def _run():
+        done = 0
+        for sym in symbols:
+            if _crypto_download_cancel.is_set():
+                break
+            try:
+                download_candles(sym, resolution, days_back)
+            except Exception as e:
+                logger.warning(f"[CRYPTO] download {sym} {resolution}: {e}")
+            done += 1
+            if done % 5 == 0 or done == total:
+                _persist(done)
+        _persist(total)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True, "total": total, "resolution": resolution})
 
 
 @crypto_bp.route("/api/crypto/backfill-all", methods=["POST"])
 def api_crypto_backfill_all():
-    """Download all supported timeframes for all symbols."""
+    """Download all supported timeframes for all symbols (threaded)."""
     from dumbmoney.data_crypto import backfill_all_timeframes
 
-    def progress(pct, msg):
-        logger.info(f"[CRYPTO] backfill progress: {pct:.0f}% — {msg}")
+    def _run():
+        def progress(pct, msg):
+            logger.info(f"[CRYPTO] backfill progress: {pct:.0f}% — {msg}")
+        try:
+            backfill_all_timeframes(progress_callback=progress)
+        except Exception as e:
+            logger.error(f"[CRYPTO] backfill-all failed: {e}", exc_info=True)
 
-    done, total = backfill_all_timeframes(progress_callback=progress)
-    return jsonify({"done": done, "total": total})
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True})
 
 
+_crypto_download_cancel = threading.Event()
 _crypto_refresh_thread = None
 _crypto_refresh_cancel = threading.Event()
 
@@ -559,6 +585,12 @@ def api_crypto_refresh():
 
             compute_crypto_stats_batch(only_symbols=symbols, progress_callback=_compute_progress)
             update_crypto_historical_screener(only_symbols=symbols, progress_callback=_compute_progress)
+            # Merge live OI/funding/mark/bid-ask into crypto_stats
+            try:
+                from dumbmoney.data_crypto import update_live_columns
+                update_live_columns()
+            except Exception as e:
+                logger.warning(f"[CRYPTO] live columns update failed: {e}")
 
             _persist({
                 "status": "complete", "market": "CRYPTO",
@@ -671,25 +703,51 @@ def api_crypto_balances():
 
 @crypto_bp.route("/api/crypto/order", methods=["POST"])
 def api_crypto_order():
-    from dumbmoney.data_crypto import place_order
+    """Place a Delta order. Accepts either product_id or symbol (resolved to its
+    numeric product_id) and limit_price/stop_price (or legacy 'price' for limits)."""
+    from dumbmoney.data_crypto import place_order, get_all_products
     body = request.get_json()
-    symbol = body.get("symbol", "")
     side = body.get("side", "buy")
     qty = float(body.get("qty", 0))
     order_type = body.get("order_type", "market_order")
-    price = body.get("price")
+    limit_price = body.get("limit_price") or (body.get("price") if order_type == "limit_order" else None)
+    stop_price = body.get("stop_price")
     leverage = body.get("leverage")
-    result = place_order(symbol, side, qty, order_type=order_type, price=price, leverage=leverage)
-    return jsonify(result)
+
+    product_id = body.get("product_id")
+    if not product_id:
+        symbol = str(body.get("symbol", "")).upper()
+        products = {p.get("symbol", "").upper(): p for p in (get_all_products() or [])}
+        prod = products.get(symbol)
+        if not prod:
+            return jsonify({"error": f"Unknown symbol {symbol}"}), 400
+        product_id = prod.get("id") or prod.get("product_id")
+    try:
+        result = place_order(int(product_id), qty, side, order_type=order_type,
+                             limit_price=limit_price, stop_price=stop_price, leverage=leverage)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @crypto_bp.route("/api/crypto/cancel-order", methods=["POST"])
 def api_crypto_cancel_order():
-    from dumbmoney.data_crypto import cancel_order
+    from dumbmoney.data_crypto import cancel_order, get_all_products
     body = request.get_json()
     order_id = body.get("order_id")
-    ok = cancel_order(order_id)
-    return jsonify({"ok": ok})
+    product_id = body.get("product_id")
+    if not product_id:
+        symbol = str(body.get("symbol", "")).upper()
+        products = {p.get("symbol", "").upper(): p for p in (get_all_products() or [])}
+        prod = products.get(symbol)
+        if not prod:
+            return jsonify({"error": f"Unknown symbol {symbol}"}), 400
+        product_id = prod.get("id") or prod.get("product_id")
+    try:
+        cancel_order(order_id, int(product_id))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 
@@ -722,24 +780,23 @@ def api_crypto_account():
         return jsonify({"error": str(e)}), 500
 @crypto_bp.route("/api/crypto/close-all", methods=["POST"])
 def api_crypto_close_all():
-    """Close all positions for a given symbol or all symbols."""
-    if not DELTA_API_KEY:
+    """Close all open positions (authenticated)."""
+    from dumbmoney.config import DELTA_API_KEY as _KEY
+    if not _KEY:
         return jsonify({"error": "No API key configured"}), 400
-    from dumbmoney.data_crypto import _get, _post
+    from dumbmoney.data_crypto import get_positions, place_order
     try:
-        positions = _get("/v2/positions")
+        positions = get_positions() or []
         closed = 0
         for pos in positions:
-            if float(pos.get("size", 0)) != 0:
-                sym = pos.get("symbol", "")
-                size = float(pos.get("size", 0))
-                side = "buy" if size < 0 else "sell"
-                _post("/v2/orders", body={
-                    "product_id": pos.get("product_id"),
-                    "size": abs(size),
-                    "order_type": "market_order",
-                    "side": side,
-                })
+            size = float(pos.get("size", 0) or 0)
+            if size != 0:
+                place_order(
+                    int(pos.get("product_id")),
+                    abs(size),
+                    "buy" if size < 0 else "sell",
+                    order_type="market_order",
+                )
                 closed += 1
         return jsonify({"closed": closed})
     except Exception as e:
@@ -760,7 +817,7 @@ def api_crypto_portfolios():
         for r in rows:
             d = dict(r)
             strings = conn.execute(
-                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY sort_order, created_at", (r["id"],)
+                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY created_at", (r["id"],)
             ).fetchall()
             str_list = []
             total_pnl = 0
@@ -1146,7 +1203,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     direction = "DESC" if sort_dir == "desc" else "ASC"
     h_col_map = {"symbol": "h.symbol", "name": "a.name", "price": "h.price",
                  "change_pct": "h.change_pct", "weighted_alpha": "h.weighted_alpha",
-                 "volume": "h.volume", "streak": "h.streak",
+                 "volume": "h.volume", "streak": "h.streak", "r_squared": "h.r_squared",
                  "atr_signal": "h.atr_signal", "atr_stop": "h.atr_stop",
                  "atr_value": "h.atr_value", "atr_streak": "h.atr_streak",
                  "atrp": "h.atrp", "atr_crossed_above": "h.atr_crossed_above",
@@ -1181,7 +1238,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     offset = (page - 1) * per_page
     rows = conn.execute(
         f"SELECT h.symbol, h.price, h.volume, NULL as open, NULL as high, NULL as low, "
-        f"h.change_pct, h.weighted_alpha, h.atrp, h.streak, h.atr_value, h.atr_stop, h.atr_signal, "
+        f"h.change_pct, h.weighted_alpha, h.atrp, h.streak, h.r_squared, h.atr_value, h.atr_stop, h.atr_signal, "
         f"h.atr_crossed_above, h.atr_crossed_below, h.atr_streak, h.atr_multiplier, "
         f"h.prob_up_1d, h.prob_up_5d, h.prob_up_st_cross, h.next_day_return, h.next_5d_return, h.confluence, "
         f"h.prob_up_1w, h.prob_up_1m, "
@@ -1370,7 +1427,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
         total = conn.execute(f"SELECT COUNT(*) FROM stats s WHERE {where_str}", params).fetchone()[0]
 
     allowed_sorts = {
-        "symbol", "name", "price", "change_pct", "weighted_alpha", "volume", "streak",
+        "symbol", "name", "price", "change_pct", "weighted_alpha", "volume", "streak", "r_squared",
         "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
         "atr_crossed_above", "atr_crossed_below",
         "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
@@ -1407,7 +1464,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
     rows = conn.execute(
         f"SELECT s.symbol, s.name, s.price, s.volume, s.change_pct, "
         f"s.atrp, s.weighted_alpha, s.atr_signal, s.atr_stop, s.atr_value, s.atr_streak, "
-        f"s.atr_crossed_above, s.atr_crossed_below, s.atr_multiplier, s.streak, "
+        f"s.atr_crossed_above, s.atr_crossed_below, s.atr_multiplier, s.streak, s.r_squared, "
         f"s.next_day_return, s.prob_up_1d, s.prob_up_5d, s.prob_up_st_cross, s.prob_up_1w, s.prob_up_1m, "
         f"s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct, "
         f"s.profit_status, s.fractionable, s.marginable, s.asset_class, s.exchange, "
@@ -1645,9 +1702,9 @@ def api_stock_supertrend(symbol):
     timeframe = request.args.get("timeframe", "1Day")
     try:
         period = int(request.args.get("period", 14))
-        multiplier = float(request.args.get("multiplier", 1.0))
+        multiplier = float(request.args.get("multiplier", 2.0))
     except (ValueError, TypeError):
-        period, multiplier = 14, 1.0
+        period, multiplier = 14, 2.0
     conn = get_db(market)
     try:
         rows = conn.execute(
@@ -1954,6 +2011,32 @@ def api_market_stats():
     import time as _time
     from datetime import datetime, timedelta
     IST = timedelta(hours=5, minutes=30)
+    if market == "CRYPTO":
+        conn = get_db("CRYPTO")
+        try:
+            total_assets = conn.execute("SELECT COUNT(*) FROM crypto_products WHERE state='live'").fetchone()[0]
+            oldest = conn.execute("SELECT MIN(date) FROM crypto_bars WHERE timeframe='1d'").fetchone()[0] or ""
+            latest = conn.execute("SELECT MAX(date) FROM crypto_bars WHERE timeframe='1d'").fetchone()[0] or ""
+            with_stats = conn.execute("SELECT COUNT(*) FROM crypto_stats WHERE price > 0").fetchone()[0]
+            with_bars = conn.execute("SELECT COUNT(DISTINCT symbol) FROM crypto_bars WHERE timeframe='1d'").fetchone()[0]
+            new_today = conn.execute("SELECT COUNT(DISTINCT symbol) FROM crypto_bars WHERE timeframe='1d' AND date=?", (latest,)).fetchone()[0] if latest else 0
+            last_refresh = {}
+            row = conn.execute("SELECT value FROM crypto_settings WHERE key='refresh_status'").fetchone()
+            if row and row[0]:
+                s = json.loads(row[0])
+                ts = s.get("started_at", 0)
+                finished = ""
+                if ts:
+                    finished = datetime.utcfromtimestamp(ts + 0).strftime("%Y-%m-%d %I:%M %p UTC")
+                last_refresh = {"status": s.get("status", "idle"), "finished_at": finished,
+                                "new_stocks": 0, "phase": s.get("phase", "")}
+            return jsonify({
+                "market": "CRYPTO", "total_assets": total_assets, "with_bars": with_bars,
+                "with_stats": with_stats, "oldest_date": oldest, "latest_date": latest,
+                "new_today": new_today, "last_refresh": last_refresh,
+            })
+        finally:
+            conn.close()
     conn = get_db(market)
     try:
         total_assets = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
@@ -2097,33 +2180,93 @@ def api_recompute_streaks():
     return jsonify({"updated": n})
 
 
+_historical_rebuild_threads = {}
+
 @api_bp.route("/historical/rebuild", methods=["POST"])
 def api_historical_rebuild():
+    """Full rebuild of historical_screener + signal_prob_matrix.
+
+    Runs in a background thread (it can take a long time on the big DBs);
+    poll /api/historical/rebuild/status?market=X for progress. Only one
+    rebuild per market at a time.
+    """
     data = request.json if request.is_json else {}
     market = (data or {}).get("market", "US") or request.args.get("market", "US")
     force = bool((data or {}).get("force", True))
-    from dumbmoney.engine import update_historical_screener, update_signal_prob_matrix
-    update_historical_screener(market, force_rebuild=force)
-    update_signal_prob_matrix(market)
-    return jsonify({"rebuilt": True, "market": market})
+    market = "INDIA" if str(market).upper() == "INDIA" else "US"
+
+    t = _historical_rebuild_threads.get(market)
+    if t is not None and t.is_alive():
+        return jsonify({"started": False, "error": "Rebuild already running", "market": market}), 409
+
+    from dumbmoney.db import get_db
+    conn = get_db(market)
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('historical_rebuild_status', ?)",
+        ('{"status":"running","market":"' + market + '","progress":0,"message":"Starting full rebuild..."}',)
+    )
+    conn.commit()
+    conn.close()
+
+    def _worker():
+        import json as _json
+        from dumbmoney.engine import update_historical_screener, update_signal_prob_matrix
+        def _prog(pct, msg):
+            try:
+                c = get_db(market)
+                c.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('historical_rebuild_status', ?)",
+                    (_json.dumps({"status": "running", "market": market, "progress": pct, "message": str(msg)}),)
+                )
+                c.commit()
+                c.close()
+            except Exception:
+                pass
+        try:
+            update_historical_screener(market, progress_callback=_prog, force_rebuild=force)
+            _prog(97, "Computing signal probability matrix...")
+            update_signal_prob_matrix(market, progress_callback=_prog)
+            c = get_db(market)
+            c.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('historical_rebuild_status', ?)",
+                ('{"status":"complete","market":"' + market + '","progress":100,"message":"Done"}',)
+            )
+            c.commit()
+            c.close()
+        except Exception as e:
+            try:
+                c = get_db(market)
+                c.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('historical_rebuild_status', ?)",
+                    ('{"status":"error","market":"' + market + '","progress":0,"message":"' + str(e).replace('"', "'") + '"}',)
+                )
+                c.commit()
+                c.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    _historical_rebuild_threads[market] = thread
+    thread.start()
+    return jsonify({"started": True, "market": market})
 
 
-@api_bp.route("/reset-data", methods=["POST"])
-def api_reset_data():
-    data = request.json if request.is_json else {}
-    market = (data or {}).get("market", "US")
-    from dumbmoney.config import DB_PATHS
-    db_path = DB_PATHS[market]
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    ensure_schema(db_path)
-    migrate_nulls(db_path)
-    return jsonify({"reset": True})
-
-
-@api_bp.route("/kill-python", methods=["POST"])
-def api_kill_python():
-    return jsonify({"status": "ok"})
+@api_bp.route("/historical/rebuild/status")
+def api_historical_rebuild_status():
+    import json as _json
+    market = request.args.get("market", "US")
+    market = "INDIA" if str(market).upper() == "INDIA" else "US"
+    t = _historical_rebuild_threads.get(market)
+    running = t is not None and t.is_alive()
+    from dumbmoney.db import get_db
+    conn = get_db(market)
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key='historical_rebuild_status'").fetchone()
+        status = _json.loads(row[0]) if row and row[0] else {"status": "idle", "market": market, "progress": 0, "message": ""}
+    finally:
+        conn.close()
+    status["thread_alive"] = running
+    return jsonify(status)
 
 
 @api_bp.route("/health")
@@ -2159,7 +2302,7 @@ def api_portfolios():
         for r in rows:
             d = dict(r)
             strings = conn.execute(
-                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY sort_order, created_at", (r["id"],)
+                "SELECT * FROM portfolio_strings WHERE portfolio_id=? ORDER BY created_at", (r["id"],)
             ).fetchall()
             str_list = []
             total_pnl = 0
@@ -2169,7 +2312,22 @@ def api_portfolios():
                 syms = conn.execute(
                     "SELECT symbol, qty FROM portfolio_string_symbols WHERE portfolio_string_id=?", (sd["id"],)
                 ).fetchall()
-                entry_value = ep
+                # True entry cost: sum(qty x close on/before entry date); fall back
+                # to the stored scalar when bars are missing.
+                entry_value = 0.0
+                entry_resolved = False
+                for sy in syms:
+                    if sd.get("entry_date"):
+                        ebar = conn.execute(
+                            "SELECT close FROM bars WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1",
+                            (sy["symbol"], sd["entry_date"])
+                        ).fetchone()
+                        if ebar and ebar["close"]:
+                            entry_value += float(ebar["close"]) * (sy["qty"] or 0)
+                            entry_resolved = True
+                if not entry_resolved or entry_value <= 0:
+                    entry_value = ep
+                sd["entry_value_stored"] = ep
                 current_value = 0
                 prob_num = 0
                 prob_den = 0
@@ -2351,7 +2509,7 @@ def api_portfolios_ohlc():
 def api_portfolios_supertrend():
     market = request.args.get("market", "US")
     period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 1.0))
+    multiplier = float(request.args.get("multiplier", 2.0))
     limit = int(request.args.get("limit", 500))
 
     ohlc = _portfolios_ohlc_all(market, limit=500, timeframe="1D")
@@ -2726,7 +2884,7 @@ def _portfolio_ohlc(pid, market, limit=500, timeframe="1D"):
 def api_portfolio_supertrend(pid):
     market = request.args.get("market", "US")
     period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 1.0))
+    multiplier = float(request.args.get("multiplier", 2.0))
     limit = int(request.args.get("limit", 500))
     timeframe = request.args.get("timeframe", "1D")
 
@@ -3085,20 +3243,41 @@ def api_portfolio_string_add():
         ep = float(entry_price) if entry_price else 0
         num_syms = len(symbols)
 
-        if ep > 0 and num_syms > 0:
+        def _entry_close(sym):
+            bar = conn.execute(
+                "SELECT close FROM bars WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1",
+                (sym, entry_date)
+            ).fetchone()
+            return float(bar["close"]) if bar and bar["close"] else 0.0
+
+        has_explicit_qty = any(float(s.get("qty", 0) or 0) > 0 for s in symbols)
+        if has_explicit_qty:
+            # Respect the quantities typed in the string expression
+            # (AAPL*10+MSFT*15 means 10 and 15 shares). Never normalize them
+            # away — that used to make every string with the same entry amount
+            # show identical values/holdings.
+            corrected = []
+            actual_cost = 0.0
+            for s in symbols:
+                sym = s.get("symbol", "").upper()
+                qty = float(s.get("qty", 0) or 0)
+                corrected.append((sym, qty, s.get("weight", 1.0), s.get("fractional_allowed", False)))
+                entry_px = _entry_close(sym)
+                if entry_px > 0:
+                    actual_cost += qty * entry_px
+                else:
+                    px = s.get("price", 0) or 0
+                    actual_cost += qty * float(px)
+            if actual_cost > 0:
+                ep = actual_cost
+        elif ep > 0 and num_syms > 0:
+            # No quantities given: split the entry amount equally per symbol
             per_stock = ep / num_syms
             corrected = []
             for s in symbols:
                 sym = s.get("symbol", "").upper()
-                bar = conn.execute(
-                    "SELECT close FROM bars WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1",
-                    (sym, entry_date)
-                ).fetchone()
-                entry_px = float(bar["close"]) if bar and bar["close"] else 0
-                if entry_px > 0:
-                    corrected_qty = per_stock / entry_px
-                else:
-                    corrected_qty = float(s.get("qty", 0))
+                entry_px = _entry_close(sym)
+                corrected_qty = (per_stock / entry_px) if entry_px > 0 else 0.0
                 corrected.append((sym, corrected_qty, s.get("weight", 1.0), s.get("fractional_allowed", False)))
         else:
             total_cost = 0
@@ -3590,7 +3769,7 @@ def _string_ohlc(psid, market, limit=500, timeframe="1D"):
 def api_portfolio_string_supertrend(psid):
     market = request.args.get("market", "US")
     period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 1.0))
+    multiplier = float(request.args.get("multiplier", 2.0))
     limit = int(request.args.get("limit", 500))
 
     ohlc = _string_ohlc(psid, market, limit=500, timeframe="1D")
@@ -4390,23 +4569,6 @@ def api_paper_trades():
     return jsonify(get_paper_trades(strategy_id, market))
 
 
-@api_bp.route("/basket-screener")
-def api_basket_screener():
-    market = request.args.get("market", "US")
-    page = int(request.args.get("page", 1))
-    per_page = int(request.args.get("per_page", 50))
-    sort = request.args.get("sort", "weighted_alpha")
-    sort_dir = request.args.get("sort_dir") or request.args.get("order", "desc")
-    search = request.args.get("search", "")
-    exchange = request.args.get("exchange", "")
-    asset_type = request.args.get("asset_type", "")
-    date_cutoff = request.args.get("date_cutoff", "")
-    from dumbmoney.basket_screener import get_string_screener
-    result = get_string_screener(market, page, per_page, sort, sort_dir, search, exchange,
-                                 asset_type, date_cutoff, request.args, string_id_like="S%")
-    return jsonify(result)
-
-
 @api_bp.route("/basket-screener/columns")
 def api_basket_screener_columns():
     from dumbmoney.basket_screener import STRING_COLUMN_REFERENCE
@@ -4500,7 +4662,7 @@ def api_basket_ohlc(string_id):
 def api_basket_supertrend(string_id):
     market = request.args.get("market", "US")
     period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 1.0))
+    multiplier = float(request.args.get("multiplier", 2.0))
     timeframe = request.args.get("timeframe", "1D")
     cons, conn = _basket_constituents(string_id, market)
     try:
@@ -4766,189 +4928,6 @@ def _update_progress(market, pct, stage, detail="", elapsed=0, total_dates=0, do
     }
 
 
-@api_bp.route("/basket-screener/progress")
-def api_basket_progress():
-    market = request.args.get("market", "US")
-    return jsonify(_BUILD_PROGRESS.get(market, {"pct": 0, "stage": "idle", "detail": ""}))
-
-
-@api_bp.route("/basket-screener/generate", methods=["POST"])
-def api_basket_generate():
-    data = request.json or {}
-    market = data.get("market", "US")
-    with _BUILD_LOCK:
-        if _BUILD_PROGRESS.get(market, {}).get("stage") in ("universe", "cache", "metrics", "historical"):
-            return jsonify({"error": "Already running"}), 409
-
-    def _run():
-        import time as _time
-        t0 = _time.time()
-        try:
-            _update_progress(market, 0, "universe", "Generating string universe...")
-            from dumbmoney.basket_screener import generate_string_universe, compute_current_metrics, update_historical_string_screener, build_close_pivot_cache
-            n = generate_string_universe(market, n=25000, force=True)
-            _update_progress(market, 3, "cache", f"Universe ready: {n} strings. Building close pivot cache...", elapsed=_time.time()-t0)
-            build_close_pivot_cache(market)
-            _update_progress(market, 8, "metrics", "Cache built. Computing metrics...", elapsed=_time.time()-t0)
-            compute_current_metrics(market)
-            _update_progress(market, 12, "historical", "Metrics done. Building historical data...", elapsed=_time.time()-t0)
-
-            def _hist_progress(pct, detail):
-                elapsed = _time.time() - t0
-                done_d, total_d = 0, 0
-                if "dates" in detail:
-                    try:
-                        part = detail.split(":")[-1].strip().split(" ")[0]
-                        done_d, total_d = [int(x) for x in part.split("/")]
-                    except Exception:
-                        pass
-                _update_progress(market, 10 + pct * 0.9, "historical", detail,
-                                 elapsed=elapsed, total_dates=total_d, done_dates=done_d)
-
-            update_historical_string_screener(market, force_rebuild=True, progress_callback=_hist_progress)
-            _update_progress(market, 100, "done", f"Complete! {n} strings, historical built.", elapsed=_time.time()-t0)
-        except Exception as e:
-            _update_progress(market, 0, "error", str(e), elapsed=_time.time()-t0)
-
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"started": True, "market": market})
-
-
-@api_bp.route("/basket-screener/cache", methods=["POST"])
-def api_basket_cache():
-    data = request.json or {}
-    market = data.get("market", "US")
-    from dumbmoney.basket_screener import build_close_pivot_cache
-    syms, dates, matrix = build_close_pivot_cache(market)
-    return jsonify({"symbols": len(syms), "dates": len(dates), "shape": list(matrix.shape), "market": market})
-
-
-@api_bp.route("/basket-screener/build", methods=["POST"])
-def api_basket_build():
-    data = request.json or {}
-    market = data.get("market", "US")
-    n = int(data.get("n", 25000))
-    force = bool(data.get("force", False))
-    from dumbmoney.basket_screener import generate_string_universe, compute_current_metrics
-    generated = generate_string_universe(market, n=n, force=force)
-    compute_current_metrics(market)
-    return jsonify({"generated": generated, "market": market})
-
-
-@api_bp.route("/basket-screener/recompute", methods=["POST"])
-def api_basket_recompute():
-    data = request.json or {}
-    market = data.get("market", "US")
-    from dumbmoney.basket_screener import compute_current_metrics
-    n = compute_current_metrics(market)
-    return jsonify({"updated": n, "market": market})
-
-
-@api_bp.route("/basket-screener/historical", methods=["POST"])
-def api_basket_historical():
-    data = request.json or {}
-    market = data.get("market", "US")
-    force = bool(data.get("force", True))
-    date_limit = data.get("date_limit")
-    string_id_like = data.get("string_id_like")
-    from dumbmoney.basket_screener import update_historical_string_screener
-    rows = update_historical_string_screener(market, force_rebuild=force, date_limit=date_limit,
-                                              string_id_like=string_id_like)
-    return jsonify({"rows": rows, "market": market})
-
-
-@api_bp.route("/basket-screener/timeframe-returns")
-def api_basket_timeframe_returns():
-    """Compute 1W and 1M returns for basket strings from cached OHLC data."""
-    market = request.args.get("market", "US")
-    timeframe = request.args.get("timeframe", "1W")
-
-    conn = get_db(market)
-    try:
-        from dumbmoney.basket_screener import _load_composition, _load_close_pivot, _gather_einsum
-        sids, sym_list, indices, weights = _load_composition(market)
-        if not sids:
-            return jsonify({"returns": {}, "timeframe": timeframe})
-
-        _, dates, close = _load_close_pivot(market, sym_list)
-        if close.shape[1] == 0:
-            return jsonify({"returns": {}, "timeframe": timeframe})
-
-        V = _gather_einsum(close, indices, weights)
-        n_strings, n_dates = V.shape
-
-        if timeframe == "1W":
-            lookback = min(5, n_dates)
-        elif timeframe == "1M":
-            lookback = min(22, n_dates)
-        else:
-            lookback = min(1, n_dates)
-
-        returns = {}
-        for i, sid in enumerate(sids):
-            if n_dates >= lookback + 1:
-                cur = float(V[i, -1])
-                prev = float(V[i, -1 - lookback])
-                if prev > 0:
-                    returns[sid] = round((cur / prev - 1) * 100, 4)
-                else:
-                    returns[sid] = 0.0
-            else:
-                returns[sid] = 0.0
-
-        return jsonify({"returns": returns, "timeframe": timeframe, "strings": len(sids)})
-    finally:
-        conn.close()
-
-
-@api_bp.route("/basket-screener/leaderboard")
-def api_basket_leaderboard():
-    market = request.args.get("market", "US")
-    sort_by = request.args.get("sort", "total_return")
-    top_n = min(int(request.args.get("top", 50)), 200)
-
-    conn = get_db(market)
-    try:
-        sort_map = {
-            "total_return": "weighted_alpha", "win_rate": "prob_up_1d", "sharpe": "confluence",
-            "avg_return": "change_pct", "best_day": "ai_matrix",
-        }
-        sql_sort = sort_map.get(sort_by, "weighted_alpha")
-
-        rows = conn.execute(f"""
-            SELECT m.string_id, m.name, m.price, m.change_pct, m.weighted_alpha,
-                   m.prob_up_1d, m.prob_up_5d, m.streak, m.confluence,
-                   m.ai_matrix, m.atr_signal, m.accel_signal, m.volume
-            FROM string_screener_metrics m
-            WHERE m.market = ? AND m.price > 0
-            ORDER BY m.{sql_sort} DESC
-            LIMIT ?
-        """, (market, top_n)).fetchall()
-
-        total = conn.execute(
-            "SELECT COUNT(*) FROM string_screener_metrics WHERE market=? AND price > 0", (market,)
-        ).fetchone()[0]
-
-        data = []
-        for r in rows:
-            prob = float(r[5]) if r[5] else 50
-            chg = float(r[3]) if r[3] else 0
-            wa = float(r[4]) if r[4] else 0
-            conf = float(r[8]) if r[8] else 50
-            ai = float(r[9]) if r[9] else 50
-            data.append({
-                "string_id": r[0], "expression": (r[1] or r[0])[:60], "n_dates": 0,
-                "win_rate": round(prob, 2), "avg_return": round(chg, 4),
-                "total_return": round(wa, 2), "sharpe": round(conf, 2),
-                "max_drawdown": 0, "best_day": round(chg, 2),
-                "worst_day": 0, "avg_ai": round(ai, 1),
-            })
-
-        return jsonify({"data": data, "total": total, "sort": sort_by, "market": market})
-    finally:
-        conn.close()
-
-
 @api_bp.route("/basket-screener/rebalance")
 def api_basket_rebalance():
     market = request.args.get("market", "US")
@@ -5052,18 +5031,6 @@ def api_basket_rebalance():
 
 
 # Page routes for the basket string screener (parallel to stock screener).
-app.add_url_rule("/basket-screener/", "basket_screener_list",
-                 lambda: render_template("basket_screener.html", market="US"))
-app.add_url_rule("/india/basket-screener/", "india_basket_screener_list",
-                 lambda: render_template("basket_screener.html", market="INDIA"))
-app.add_url_rule("/basket-screener/string/<string_id>", "basket_string_detail",
-                 lambda string_id: render_template("string_detail_basket.html", string_id=string_id, market="US"))
-app.add_url_rule("/india/basket-screener/string/<string_id>", "india_basket_string_detail",
-                 lambda string_id: render_template("string_detail_basket.html", string_id=string_id, market="INDIA"))
-app.add_url_rule("/basket-screener/leaderboard", "basket_leaderboard",
-                 lambda: render_template("basket_leaderboard.html", market="US"))
-app.add_url_rule("/india/basket-screener/leaderboard", "india_basket_leaderboard",
-                 lambda: render_template("basket_leaderboard.html", market="INDIA"))
 
 app.add_url_rule("/long-short-screener/", "long_short_screener_list",
                  lambda: render_template("basket_screener.html", market="US", long_short=True))
@@ -5090,13 +5057,47 @@ def api_long_short_screener():
 
 @api_bp.route("/long-short-screener/generate", methods=["POST"])
 def api_long_short_generate():
+    """Full LS pipeline in a background thread: generate strings -> pivot cache ->
+    current metrics -> historical rows. Poll /api/long-short-screener/progress."""
     data = request.json or {}
     market = data.get("market", "US")
-    n = int(data.get("n", 100))
-    from dumbmoney.basket_screener import generate_long_short_strings, compute_current_metrics
-    count = generate_long_short_strings(market, n=n)
-    compute_current_metrics(market)
-    return jsonify({"generated": count, "market": market})
+    n = int(data.get("n", 25000))
+    with _BUILD_LOCK:
+        if _BUILD_PROGRESS.get(market, {}).get("stage") in ("universe", "cache", "metrics", "historical"):
+            return jsonify({"error": "Already running"}), 409
+
+    def _run():
+        import time as _time
+        t0 = _time.time()
+        try:
+            _update_progress(market, 0, "universe", "Generating long+short strings...")
+            from dumbmoney.basket_screener import (
+                generate_long_short_strings, compute_current_metrics,
+                update_historical_string_screener, build_close_pivot_cache)
+            count = generate_long_short_strings(market, n=n)
+            _update_progress(market, 3, "cache", f"Generated {count} strings. Building close pivot cache...", elapsed=_time.time()-t0)
+            build_close_pivot_cache(market)
+            _update_progress(market, 8, "metrics", "Cache built. Computing current metrics...", elapsed=_time.time()-t0)
+            compute_current_metrics(market)
+            _update_progress(market, 12, "historical", "Metrics done. Building LS history (gross-exposure values)...", elapsed=_time.time()-t0)
+
+            def _hist_progress(pct, detail):
+                _update_progress(market, 10 + pct * 0.9, "historical", detail, elapsed=_time.time()-t0)
+
+            update_historical_string_screener(market, force_rebuild=True,
+                                              progress_callback=_hist_progress, string_id_like="LS%")
+            _update_progress(market, 100, "done", f"Complete! {count} LS strings built.", elapsed=_time.time()-t0)
+        except Exception as e:
+            _update_progress(market, 0, "error", str(e), elapsed=_time.time()-t0)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True, "market": market})
+
+
+@api_bp.route("/long-short-screener/progress")
+def api_long_short_progress():
+    market = request.args.get("market", "US")
+    return jsonify(_BUILD_PROGRESS.get(market, {"pct": 0, "stage": "idle", "detail": ""}))
 
 
 # ── Leverage ETF Screener ─────────────────────────────────────────────────────
@@ -5170,7 +5171,7 @@ def api_lev_ohlc(string_id):
 def api_lev_supertrend(string_id):
     market = request.args.get("market", "US")
     period = int(request.args.get("period", 14))
-    multiplier = float(request.args.get("multiplier", 1.0))
+    multiplier = float(request.args.get("multiplier", 2.0))
     limit = int(request.args.get("limit", 500))
     from dumbmoney.basket_screener import (
         _load_composition, _load_close_pivot, _load_ohlc_pivots,

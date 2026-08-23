@@ -13,7 +13,7 @@ except ImportError:
     prange = range
 
 
-def supertrend(df, period=14, multiplier=1.0):
+def supertrend(df, period=14, multiplier=2.0):
     """Exact port of TradingView's ta.supertrend() Pine Script.
     Uses hl2 source, Wilder's ATR, two-band ratcheting with close[1] tests,
     and the prevSuperTrend == prevUpperBand direction convention.
@@ -129,7 +129,7 @@ def _supertrend_numba(h, l, c, period, multiplier):
     return st_arr, direction, signal, crossed_above, crossed_below, atr, streak_arr
 
 
-def atr_trailing_stop(df, period=14, multiplier=1.0):
+def atr_trailing_stop(df, period=14, multiplier=2.0):
     """ATR Trailing Stop formula (from TradingView docs).
     
     Uses recursive trailing stop based on ATR, not HL2 bands.
@@ -284,7 +284,7 @@ def build_anchored_blocks(dates, opens, highs, lows, closes, eval_idx, sessions)
 
 
 def compute_rolling_atr_trailing_stop(dates, opens, highs, lows, closes,
-                                       eval_idx, sessions, period=14, multiplier=1.0):
+                                       eval_idx, sessions, period=14, multiplier=2.0):
     """Compute ATR Trailing Stop on anchored rolling synthetic candles.
 
     For a given evaluation date, builds anchored non-overlapping blocks of
@@ -344,7 +344,7 @@ def compute_rolling_atr_trailing_stop(dates, opens, highs, lows, closes,
 
 
 def compute_rolling_atr_batch(dates, opens, highs, lows, closes, sessions,
-                               period=14, multiplier=1.0):
+                               period=14, multiplier=2.0):
     """Compute rolling ATR Trailing Stop for ALL dates in one symbol.
 
     Precomputes block aggregations with sliding window, then runs ATR
@@ -432,6 +432,47 @@ def compute_rolling_atr_batch(dates, opens, highs, lows, closes, sessions,
         bars_ab[eval_idx] = int(bas[-1]) if trends[eval_idx] == -1 else 0
 
     return trends, stops, atrs, streaks, cross_above, cross_below, bars_bl, bars_ab
+
+
+def r_squared(close, window=90):
+    """Rolling R² of a linear regression of log(close) vs bar index.
+
+    1.0 = price tracks a perfectly straight line on a log chart (classic
+    'straight uptrend'). Value is signed by slope direction: +R² for
+    uptrends, -R² for downtrends, so sorting descending surfaces the
+    straightest UPtrending charts first.
+    O(n) via rolling sums; no per-window regression loops.
+    """
+    c = np.asarray(close, dtype=float)
+    n = len(c)
+    if n < 3:
+        return pd.Series(np.zeros(n), index=close.index if hasattr(close, "index") else None)
+
+    y = np.log(np.maximum(c, 1e-12))
+    t = np.arange(n, dtype=float)
+
+    s1 = pd.Series(y).rolling(window, min_periods=window).sum().values
+    syy = pd.Series(y * y).rolling(window, min_periods=window).sum().values
+    sxy_abs = pd.Series(t * y).rolling(window, min_periods=window).sum().values
+
+    k0 = t - (window - 1)                     # first index inside each window
+    k0[k0 < 0] = 0
+    sxy = sxy_abs - k0 * s1                   # Σ(i·y) with i = 0..w-1 per window
+
+    sx = window * (window - 1) / 2.0
+    sxx = window * (window - 1) * (2 * window - 1) / 6.0
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        num = window * sxy - sx * s1
+        den = (window * sxx - sx * sx) * (window * syy - s1 * s1)
+        r2 = (num * num) / den
+        slope = num / (window * sxx - sx * sx)
+        r2 = np.where(den > 0, r2, 0.0)
+
+    signed = np.where(slope < 0, -r2, r2)
+    signed = np.nan_to_num(signed, nan=0.0, posinf=0.0, neginf=0.0)
+    out = pd.Series(signed, index=close.index if hasattr(close, "index") else None)
+    return out.fillna(0.0)
 
 
 def weighted_alpha(df, lookback=252):
@@ -993,7 +1034,7 @@ def ai_score_latest(bars_df, precomputed=None):
         wa_val = precomputed["wa_val"]
         prob_1d_val = precomputed["prob_1d_val"]
     else:
-        st = supertrend(bars_df, period=14, multiplier=1.0)
+        st = supertrend(bars_df, period=14, multiplier=2.0)
         ac = accel(bars_df)
         st_signal = int(st["trend"].iloc[-1])
         ac_signal = int(ac["accel_signal"].iloc[-1])

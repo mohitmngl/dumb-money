@@ -211,10 +211,11 @@ def sync_assets(force=False, cache_max_age_days=7):
     return len(filtered)
 
 
-def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, max_workers=8, incremental=False, progress_callback=None):
+def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, max_workers=8, incremental=False, progress_callback=None, cancel_check=None):
     """Download daily bars for US symbols using Alpaca multi-symbol endpoint.
     Optimized: large batches, parallel downloads, bulk DB writes.
-    incremental=True: skip pagination (1 page per batch, ~3 bars/symbol)."""
+    incremental=True: skip pagination (1 page per batch, ~3 bars/symbol).
+    cancel_check: fn() -> bool — aborts pending batches/pages when it returns True."""
     from dumbmoney.db import get_db
     from concurrent.futures import ThreadPoolExecutor, as_completed
     if not symbols:
@@ -248,6 +249,8 @@ def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, m
 
         if not incremental:
             while data.get("next_page_token"):
+                if cancel_check and cancel_check():
+                    return all_bars
                 params["page_token"] = data["next_page_token"]
                 data = _api_get(f"{ALPACA_DATA_URL}/v2/stocks/bars", params=params)
                 if not data or "bars" not in data:
@@ -269,7 +272,10 @@ def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, m
         futures = {executor.submit(_fetch_batch, b): b for b in batches}
         conn = get_db("US")
         try:
+            cancelled = False
             for future in as_completed(futures):
+                if cancelled:
+                    break
                 try:
                     bars = future.result()
                     if bars:
@@ -285,6 +291,8 @@ def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, m
                 done_batches += 1
                 if progress_callback and done_batches % 2 == 0:
                     progress_callback(done_batches, total_batches)
+                if cancel_check and cancel_check():
+                    cancelled = True
         finally:
             conn.close()
 

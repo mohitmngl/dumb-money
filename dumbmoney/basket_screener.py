@@ -174,185 +174,6 @@ def _eligible_symbols(market):
         conn.close()
 
 
-def generate_string_universe(market="US", n=STRING_COUNT, force=False):
-    """Pre-generate fixed random baskets. Each string has exactly 10 stocks.
-    US: $1000 allocation, fractional for fractionable stocks.
-    India: Rs 100000 allocation, all whole-number weights."""
-    ALLOCATION = 1000.0 if market == "US" else 100000.0
-    TARGET_STOCKS = 10
-    conn = get_db(market)
-    try:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM string_universe WHERE market=?", (market,)).fetchone()[0]
-        if existing >= n and not force:
-            logger.info(f"[{market}] string_universe already has {existing} strings; skipping")
-            return existing
-        if force:
-            conn.execute("DELETE FROM string_constituents WHERE string_id IN "
-                         "(SELECT string_id FROM string_universe WHERE market=?)", (market,))
-            conn.execute("DELETE FROM string_universe WHERE market=?", (market,))
-            conn.commit()
-
-        syms = _eligible_symbols(market)
-        if len(syms) < TARGET_STOCKS:
-            logger.warning(f"[{market}] too few eligible symbols ({len(syms)})")
-            return 0
-
-        price_rows = conn.execute(
-            f"SELECT symbol, price FROM stats WHERE symbol IN ({','.join('?' * len(syms))})",
-            syms).fetchall()
-        price_map = {r[0]: float(r[1]) for r in price_rows if r[1] and float(r[1]) > 0}
-
-        frac_rows = conn.execute(
-            f"SELECT symbol, fractionable FROM assets WHERE symbol IN ({','.join('?' * len(syms))})",
-            syms).fetchall()
-        frac_map = {r[0]: bool(r[1]) for r in frac_rows}
-
-        priced_syms = [s for s in syms if s in price_map]
-        if len(priced_syms) < TARGET_STOCKS:
-            logger.warning(f"[{market}] too few symbols with prices ({len(priced_syms)})")
-            return 0
-
-        rng = np.random.default_rng(20240707 if market == "US" else 20240708)
-        sym_arr = np.array(priced_syms, dtype=object)
-
-        start = conn.execute(
-            "SELECT COALESCE(MAX(CAST(SUBSTR(string_id,2) AS INTEGER)),0) "
-            "FROM string_universe WHERE string_id LIKE 'S%'").fetchone()[0]
-        count = 0
-        batch_univ = []
-        batch_cons = []
-        per_stock = ALLOCATION / TARGET_STOCKS
-
-        circuit_checked = set()
-        circuit_excluded = set()
-        _import_time = __import__('time')
-
-        for i in range(start + 1, start + 1 + n):
-            idx = rng.choice(len(sym_arr), size=TARGET_STOCKS, replace=False)
-            picked = sym_arr[idx]
-
-            if market == "INDIA":
-                filtered_picked = []
-                for j in range(TARGET_STOCKS):
-                    sym = str(picked[j])
-                    price = price_map.get(sym, 0)
-                    if sym not in circuit_checked and price > 0:
-                        circuit_checked.add(sym)
-                        _import_time.sleep(0.02)
-                        if _is_at_circuit(sym, price):
-                            circuit_excluded.add(sym)
-                    if sym not in circuit_excluded:
-                        filtered_picked.append(picked[j])
-                if len(filtered_picked) < TARGET_STOCKS:
-                    continue
-                picked = np.array(filtered_picked[:TARGET_STOCKS])
-
-            weights = np.zeros(TARGET_STOCKS)
-            nonfrac_count = 0
-            for j in range(TARGET_STOCKS):
-                sym = str(picked[j])
-                price = price_map[sym]
-                is_frac = frac_map.get(sym, False) if market == "US" else False
-                raw_w = per_stock / price
-                if market == "INDIA" or not is_frac:
-                    weights[j] = max(1.0, round(raw_w))
-                    nonfrac_count += 1
-                else:
-                    weights[j] = round(raw_w, 4)
-
-            if market == "US" and nonfrac_count >= 3:
-                for j in range(TARGET_STOCKS):
-                    if frac_map.get(str(picked[j]), False):
-                        weights[j] = round(weights[j])
-
-            weights = np.maximum(weights, 0.001)
-            sid = f"S{i:06d}"
-            expr = " + ".join(f"{picked[j]}*{weights[j]:g}" for j in range(TARGET_STOCKS))
-            batch_univ.append((sid, market, TARGET_STOCKS, expr, datetime.utcnow().isoformat(), 1))
-            for j in range(TARGET_STOCKS):
-                batch_cons.append((sid, str(picked[j]), float(weights[j])))
-            count += 1
-            if len(batch_univ) >= 2000:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO string_universe "
-                    "(string_id, market, num_stocks, expression, created_at, active) "
-                    "VALUES (?,?,?,?,?,?)", batch_univ)
-                conn.executemany(
-                    "INSERT OR REPLACE INTO string_constituents (string_id, symbol, weight) "
-                    "VALUES (?,?,?)", batch_cons)
-                conn.commit()
-                batch_univ.clear(); batch_cons.clear()
-        if batch_univ:
-            conn.executemany(
-                "INSERT OR REPLACE INTO string_universe "
-                "(string_id, market, num_stocks, expression, created_at, active) "
-                "VALUES (?,?,?,?,?,?)", batch_univ)
-            conn.executemany(
-                "INSERT OR REPLACE INTO string_constituents (string_id, symbol, weight) "
-                "VALUES (?,?,?)", batch_cons)
-            conn.commit()
-        logger.info(f"[{market}] generated {count} strings (10 stocks, ${ALLOCATION:.0f} allocation)")
-        return count
-    finally:
-        conn.close()
-
-
-def _load_composition(market, string_ids=None):
-    """Return (string_ids, sym_list, indices, weights).
-    indices: (n_strings, 10) int array — column indices into close_pivot
-    weights: (n_strings, 10) float array — corresponding weights"""
-    conn = get_db(market)
-    try:
-        if string_ids is None:
-            rows = conn.execute(
-                "SELECT sc.string_id, sc.symbol, sc.weight FROM string_constituents sc "
-                "JOIN string_universe u ON u.string_id=sc.string_id "
-                "WHERE u.market=?", (market,)).fetchall()
-        else:
-            placeholders = ",".join("?" * len(string_ids))
-            rows = conn.execute(
-                f"SELECT string_id, symbol, weight FROM string_constituents "
-                f"WHERE string_id IN ({placeholders})", string_ids).fetchall()
-        if not rows:
-            return [], [], None, None
-        sids = []
-        seen = set()
-        for r in rows:
-            if r[0] not in seen:
-                seen.add(r[0]); sids.append(r[0])
-        sym_list = sorted({r[1] for r in rows})
-        sym_idx = {s: i for i, s in enumerate(sym_list)}
-        sid_to_row = {s: i for i, s in enumerate(sids)}
-        n = len(sids)
-        indices = np.zeros((n, MAX_CONSTITUENTS), dtype=np.int32)
-        weights = np.zeros((n, MAX_CONSTITUENTS), dtype=np.float32)
-        counts = np.zeros(n, dtype=np.int32)
-        for r in rows:
-            ri = sid_to_row[r[0]]
-            ci = counts[ri]
-            if ci < MAX_CONSTITUENTS:
-                indices[ri, ci] = sym_idx[r[1]]
-                weights[ri, ci] = float(r[2])
-                counts[ri] += 1
-        return sids, sym_list, indices, weights
-    finally:
-        conn.close()
-
-
-def _get_cache_path(market):
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    return os.path.join(_CACHE_DIR, f"close_pivot_{market}.npy"), os.path.join(_CACHE_DIR, f"close_meta_{market}.json")
-
-
-def _get_ohlc_cache_paths(market):
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    base = _CACHE_DIR
-    return {
-        'open': os.path.join(base, f"open_pivot_{market}.npy"),
-        'high': os.path.join(base, f"high_pivot_{market}.npy"),
-        'low': os.path.join(base, f"low_pivot_{market}.npy"),
-    }
 
 
 def build_close_pivot_cache(market):
@@ -499,10 +320,27 @@ def _load_close_pivot(market, sym_list=None, date_limit=None):
         conn.close()
 
 
+def _gross_adjust(V, close_pivot, indices, weights):
+    """Convert net basket values to GROSS-exposure accounting.
+
+    The raw einsum value is net (shorts subtract), which hides the real
+    exposure of a long+short string: a $600 long / $400 short string shows
+    as ~$200. Correct accounting holds short proceeds as cash, so the
+    string value at the baseline date equals its GROSS exposure
+    (sum |weight x price|) and P&L accrues with correct signs afterwards:
+        V(t) = gross(t0) + sum_i w_i * (p_i(t) - p_i(t0))
+    Pure-long baskets are unchanged (cash adjustment = 0)."""
+    abs_w = np.abs(weights)
+    gross0 = np.einsum('bi,bi->b', abs_w, close_pivot[indices, 0])
+    gross0 = np.nan_to_num(gross0, nan=0.0)
+    cash = gross0 - V[:, 0]
+    return V + cash[:, None]
+
+
 def _gather_einsum(close_pivot, indices, weights):
     """Gather + einsum: compute basket values without sparse matmul.
     close_pivot: (n_sym, n_dates), indices: (n_strings, 10), weights: (n_strings, 10)
-    Returns V: (n_strings, n_dates)
+    Returns V: (n_strings, n_dates) in GROSS-exposure terms (see _gross_adjust).
     Chunked to keep peak RAM low."""
     n_strings = indices.shape[0]
     n_dates = close_pivot.shape[1]
@@ -512,7 +350,8 @@ def _gather_einsum(close_pivot, indices, weights):
         idx_chunk = indices[i:i+chunk_size]
         w_chunk = weights[i:i+chunk_size]
         result[i:i+chunk_size] = np.einsum('bi,bid->bd', w_chunk, close_pivot[idx_chunk])
-    return np.nan_to_num(result, nan=0.0)
+    result = np.nan_to_num(result, nan=0.0)
+    return _gross_adjust(result, close_pivot, indices, weights)
 
 
 def _series_metrics(V):
@@ -538,6 +377,52 @@ def _series_metrics(V):
         streak_arr[:, t] = st
         prev = st; prev_sgn = s
     return {"V": Vn, "ret": ret, "streak_series": streak_arr}
+
+
+def _r_squared_matrix(V, window=90):
+    """Row-wise rolling signed R2 of a linear fit on log(value), for the whole
+    (n_strings x n_dates) matrix at once via cumulative sums. +1 = perfectly
+    straight uptrending value line, -1 = straight down. O(n_strings * n_dates)."""
+    n_strings, n_dates = V.shape
+    out = np.zeros_like(V, dtype=np.float32)
+    if n_dates < 3:
+        return out
+    w = min(window, n_dates)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        y = np.log(np.maximum(V.astype(np.float64), 1e-9))
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    t = np.arange(n_dates, dtype=np.float64)[None, :]
+
+    cs1 = np.cumsum(y, axis=1)
+    csyy = np.cumsum(y * y, axis=1)
+    csty = np.cumsum(t * y, axis=1)
+
+    def _roll(cs):
+        tot = np.zeros_like(cs)
+        tot[:, w-1:] = cs[:, w-1:] - np.concatenate([np.zeros((cs.shape[0], 1)), cs[:, :-w]], axis=1)[:, w-1:]
+        tot[:, :w-1] = cs[:, :w-1]
+        return tot
+
+    s1 = _roll(cs1)
+    syy = _roll(csyy)
+    sty_abs = _roll(csty)
+
+    end_idx = np.arange(n_dates, dtype=np.float64)[None, :]
+    k0 = end_idx - (w - 1)
+    sxy = sty_abs - k0 * s1
+
+    sx = w * (w - 1) / 2.0
+    sxx = w * (w - 1) * (2 * w - 1) / 6.0
+
+    num = w * sxy - sx * s1
+    den = (w * sxx - sx * sx) * (w * syy - s1 * s1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = np.where(den > 0, (num * num) / den, 0.0)
+        slope = np.where((w * sxx - sx * sx) != 0, num / (w * sxx - sx * sx), 0.0)
+    signed = np.where(slope < 0, -r2, r2)
+    signed[:, :w-1] = 0.0  # first partial windows: undefined
+    signed = np.nan_to_num(signed, nan=0.0, posinf=0.0, neginf=0.0)
+    return signed.astype(np.float32)
 
 
 def _load_ohlc_pivots(market, sym_list=None, date_limit=None):
@@ -566,7 +451,9 @@ def _load_ohlc_pivots(market, sym_list=None, date_limit=None):
 
 
 def _compute_basket_ohlc(close_pivot, high_pivot, low_pivot, open_pivot, indices, weights):
-    """Compute basket OHLC via chunked gather+einsum. Returns dict of (n_strings, n_dates) arrays."""
+    """Compute basket OHLC via chunked gather+einsum. Returns dict of (n_strings, n_dates) arrays.
+    Shifted by the same gross-cash adjustment as the close series so stop levels
+    stay comparable to the displayed (gross) string value."""
     n_strings = indices.shape[0]
     n_dates = close_pivot.shape[1]
     basket_close = np.zeros((n_strings, n_dates), dtype=np.float32)
@@ -581,15 +468,20 @@ def _compute_basket_ohlc(close_pivot, high_pivot, low_pivot, open_pivot, indices
         basket_high[i:i+chunk_size] = np.einsum('bi,bid->bd', w_chunk, high_pivot[idx_chunk])
         basket_low[i:i+chunk_size] = np.einsum('bi,bid->bd', w_chunk, low_pivot[idx_chunk])
         basket_open[i:i+chunk_size] = np.einsum('bi,bid->bd', w_chunk, open_pivot[idx_chunk])
+    basket_close = np.nan_to_num(basket_close, nan=0.0)
+    # Same cash shift as _gather_einsum (based on close baseline) applied to all four
+    abs_w = np.abs(weights)
+    gross0 = np.nan_to_num(np.einsum('bi,bi->b', abs_w, close_pivot[indices, 0]), nan=0.0)
+    cash = (gross0 - basket_close[:, 0])[:, None]
     return {
-        'open': np.nan_to_num(basket_open, nan=0.0),
-        'high': np.nan_to_num(basket_high, nan=0.0),
-        'low': np.nan_to_num(basket_low, nan=0.0),
-        'close': np.nan_to_num(basket_close, nan=0.0),
+        'open': np.nan_to_num(basket_open, nan=0.0) + cash,
+        'high': np.nan_to_num(basket_high, nan=0.0) + cash,
+        'low': np.nan_to_num(basket_low, nan=0.0) + cash,
+        'close': basket_close + cash,
     }
 
 
-def _supertrend_vec(h, l, c, period=14, multiplier=1.0):
+def _supertrend_vec(h, l, c, period=14, multiplier=2.0):
     """ATR Trailing Stop for vectorized bulk use.
     Recursive trailing stop based on ATR, not HL2 bands.
     Returns dict of arrays. Convention: direction=1 → uptrend (stop below),
@@ -878,7 +770,7 @@ if HAVE_NUMBA:
         return (a.astype(np.float64), base.astype(np.float64), sig, crossed_up, crossed_down, accel_streak)
 
 
-def _compute_basket_indicators(basket_ohlc, period=14, multiplier=1.0):
+def _compute_basket_indicators(basket_ohlc, period=14, multiplier=2.0):
     """Compute SuperTrend and Accel for all baskets. Returns dict of (n_strings, n_dates) arrays.
     Uses numba prange parallelism when available (100x+ speedup).
     Processes in chunks to avoid memory spikes on large string sets."""
@@ -1042,11 +934,13 @@ def compute_current_metrics(market="US"):
     confluence = wm.get("confluence", np.zeros(n, np.float32))
     atr_mult = np.ones(n, np.float32)
 
+    r2_current = _r_squared_matrix(Vn, 90)[:, -1].astype(np.float32)
+
     ohlc = _load_ohlc_pivots(market, sym_list, date_limit=80)
     if ohlc is not None:
         high_p, low_p, open_p = ohlc
         basket_ohlc = _compute_basket_ohlc(close, high_p, low_p, open_p, indices, weights)
-        basket_ind = _compute_basket_indicators(basket_ohlc, period=14, multiplier=1.0)
+        basket_ind = _compute_basket_indicators(basket_ohlc, period=14, multiplier=2.0)
         atr_signal = basket_ind["atr_signal"][:, -1].astype(np.int32)
         atr_stop = basket_ind["atr_stop"][:, -1].astype(np.float32)
         atr_value = basket_ind["atr_value"][:, -1].astype(np.float32)
@@ -1127,6 +1021,7 @@ def compute_current_metrics(market="US"):
                 _safe_float(ai_sent[i]), str(ai_concl[i]), _safe_float(ai_matrix[i]), now,
                 _safe_int(st_bars_below[i]), _safe_int(st_bars_above[i]),
                 _safe_int(accel_bars_below[i]), _safe_int(accel_bars_above[i]),
+                _safe_float(r2_current[i]),
             ))
         cols = ["string_id", "market", "name", "exchange", "asset_class", "price", "change_pct",
                 "volume", "weighted_alpha", "atrp", "streak", "atr_signal", "atr_stop", "atr_value",
@@ -1138,7 +1033,8 @@ def compute_current_metrics(market="US"):
                 "ai_overall_score", "ai_bias", "ai_tech_score", "ai_momentum_score", "ai_volume_score",
                 "ai_events_score", "ai_volume_profile_score", "ai_trendline_score", "ai_sentiment_score",
                 "ai_conclusion", "ai_matrix", "updated_at",
-                "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above"]
+                "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
+                "r_squared"]
         placeholders = ",".join(["?"] * len(cols))
         conn.execute(f"DELETE FROM string_screener_metrics WHERE market=?", (market,))
         for j in range(0, len(rows), 5000):
@@ -1247,9 +1143,10 @@ def generate_long_short_strings(market="US", n=25000):
 
             weights = np.where(weights == 0, 0.001, weights)
             sid = f"LS{i:06d}"
-            long_part = " + ".join(f"{picked[j]}*{weights[j]:g}" for j in range(LONG_N))
-            short_part = " + ".join(f"{picked[j]}*{weights[j]:g}" for j in range(LONG_N, TARGET_STOCKS))
-            expr = f"LONG({long_part}) SHORT({short_part})"
+            # Expression format: ticker*qty + ticker*qty - ticker*qty ... (minus = short)
+            long_part = " + ".join(f"{picked[j]}*{abs(weights[j]):g}" for j in range(LONG_N))
+            short_part = " - ".join(f"{picked[j]}*{abs(weights[j]):g}" for j in range(LONG_N, TARGET_STOCKS))
+            expr = f"{long_part} - {short_part}"
             batch_univ.append((sid, market, TARGET_STOCKS, expr, datetime.utcnow().isoformat(), 1))
             for j in range(TARGET_STOCKS):
                 batch_cons.append((sid, str(picked[j]), float(weights[j])))
@@ -1360,6 +1257,7 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
                 ai_trendline_score REAL, ai_sentiment_score REAL, ai_conclusion TEXT, ai_matrix REAL,
                 st_bars_below INTEGER DEFAULT 0, st_bars_above INTEGER DEFAULT 0,
                 accel_bars_below INTEGER DEFAULT 0, accel_bars_above INTEGER DEFAULT 0,
+                r_squared REAL DEFAULT 0,
                 PRIMARY KEY (string_id, date))""")
             conn.commit()
             logger.info(f"[{market}] historical_string_screener table recreated (indexes deferred)")
@@ -1373,7 +1271,8 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
                 "ai_overall_score", "ai_bias", "ai_tech_score", "ai_momentum_score", "ai_volume_score",
                 "ai_events_score", "ai_volume_profile_score", "ai_trendline_score", "ai_sentiment_score",
                 "ai_conclusion", "ai_matrix",
-                "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above"]
+                "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
+                "r_squared"]
         placeholders_str = ",".join(["?"] * len(cols))
         insert_sql = f"INSERT OR REPLACE INTO historical_string_screener ({','.join(cols)}) VALUES ({placeholders_str})"
 
@@ -1465,6 +1364,7 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
             Vn = series["V"]
             ret = series["ret"]
             streak_full = series["streak_series"]
+            r2_full = _r_squared_matrix(Vn, 90)
 
             next_day_full = np.zeros((sc_n, n_dates), dtype=np.float32)
             next_day_full[:, :-1] = ret[:, 1:]
@@ -1479,7 +1379,7 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
             # Compute indicators for this chunk (not all 50K strings — avoids OOM)
             if ohlc is not None:
                 chunk_basket_ohlc = _compute_basket_ohlc(close_pivot, high_pivot, low_pivot, open_pivot, sc_indices_full, sc_weights)
-                chunk_basket_ind = _compute_basket_indicators(chunk_basket_ohlc, period=14, multiplier=1.0)
+                chunk_basket_ind = _compute_basket_indicators(chunk_basket_ohlc, period=14, multiplier=2.0)
                 atr_sig_full = chunk_basket_ind["atr_signal"].astype(np.int32)
                 atr_cu_full = chunk_basket_ind["atr_crossed_above"].astype(np.int32)
                 atr_cd_full = chunk_basket_ind["atr_crossed_below"].astype(np.int32)
@@ -1599,6 +1499,7 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
                     ac_strk_rows = np.nan_to_num(np.round(_fl(bi_ac_strk)), nan=0).astype(int).tolist()
                     conf_rows = _fl(wm_conf).tolist()
                     ai_m_rows = _fl(ai_m_full).tolist()
+                    r2_rows = _fl(r2_full).tolist()
                     ones_rows = [1.0] * sc_n
                     none_rows = [None] * sc_n
                     ai_bias_rows = [str(ai_bias_full[-1])] * sc_n
@@ -1642,6 +1543,7 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
                     ac_strk_rows = np.nan_to_num(np.round(_flat(bi_ac_strk, d0, d1)), nan=0).astype(int).tolist()
                     conf_rows = _flat(wm_conf, d0, d1).tolist()
                     ai_m_rows = _flat(ai_m_full, d0, d1).tolist()
+                    r2_rows = _flat(r2_full, d0, d1).tolist()
                     ones_rows = [1.0] * n_rows
                     none_rows = [None] * n_rows
                     ai_bias_block = ai_bias_full[:, d0:d1]
@@ -1689,8 +1591,8 @@ def update_historical_string_screener(market="US", only_strings=None, force_rebu
                     ac_bb_rows = np.where(acsig_chunk == 1, ac_bas_chunk, 0).tolist()
                     ac_ba_rows = np.where(acsig_chunk == -1, ac_bas_chunk, 0).tolist()
                 # Append bars_at_side values to each tuple
-                all_batch = [row + (st_bb, st_ba, ac_bb, ac_ba) for row, st_bb, st_ba, ac_bb, ac_ba in
-                             zip(all_batch, st_bb_rows, st_ba_rows, ac_bb_rows, ac_ba_rows)]
+                all_batch = [row + (st_bb, st_ba, ac_bb, ac_ba, r2v) for row, st_bb, st_ba, ac_bb, ac_ba, r2v in
+                             zip(all_batch, st_bb_rows, st_ba_rows, ac_bb_rows, ac_ba_rows, r2_rows)]
 
                 for bi in range(0, len(all_batch), 250000):
                     conn.executemany(insert_sql, all_batch[bi:bi+250000])
@@ -1899,7 +1801,7 @@ def get_string_screener(market="US", page=1, per_page=50, sort="weighted_alpha",
             direction = "DESC" if sort_dir == "desc" else "ASC"
             rows = conn.execute(
                 f"SELECT h.string_id as symbol, h.name, 'BASKET' as exchange, 'basket' as asset_class, h.price, h.change_pct, "
-                f"h.volume, h.weighted_alpha, h.atrp, h.streak, h.atr_signal, h.atr_stop, h.atr_value, "
+                f"h.volume, h.weighted_alpha, h.atrp, h.streak, h.r_squared, h.atr_signal, h.atr_stop, h.atr_value, "
                 f"h.atr_streak, h.atr_crossed_above, h.atr_crossed_below, h.atr_multiplier, "
                 f"h.next_day_return, h.next_5d_return, h.prob_up_1d, h.prob_up_5d, h.prob_up_st_cross, h.pre_price, h.pre_change_pct, "
                 f"h.post_price, h.post_change_pct, h.accel_a, h.accel_base, h.accel_signal, "
@@ -1935,7 +1837,7 @@ def get_string_screener(market="US", page=1, per_page=50, sort="weighted_alpha",
             direction = "DESC" if sort_dir == "desc" else "ASC"
             rows = conn.execute(
                 f"SELECT m.string_id as symbol, m.name, m.exchange, m.asset_class, m.price, m.change_pct, "
-                f"m.volume, m.weighted_alpha, m.atrp, m.streak, m.atr_signal, m.atr_stop, m.atr_value, "
+                f"m.volume, m.weighted_alpha, m.atrp, m.streak, m.r_squared, m.atr_signal, m.atr_stop, m.atr_value, "
                 f"m.atr_streak, m.atr_crossed_above, m.atr_crossed_below, m.atr_multiplier, "
                 f"m.next_day_return, m.next_5d_return, m.prob_up_1d, m.prob_up_5d, m.prob_up_st_cross, m.pre_price, m.pre_change_pct, "
                 f"m.post_price, m.post_change_pct, m.accel_a, m.accel_base, m.accel_signal, "
@@ -1994,6 +1896,7 @@ def _apply_signal_filters(where, params, args, pfx):
 
 def _map_sort(sort, pfx):
     allowed = {"symbol", "name", "price", "change_pct", "weighted_alpha", "volume", "streak",
+               "r_squared",
                "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
                "atr_crossed_above", "atr_crossed_below", "prob_up_1d", "prob_up_5d", "prob_up_st_cross",
                "next_day_return", "next_5d_return", "confluence", "accel_a", "accel_base",

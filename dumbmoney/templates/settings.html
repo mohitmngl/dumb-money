@@ -11,13 +11,6 @@
     <button class="btn btn-primary btn-sm" onclick="saveAlpaca()">Save</button>
   </div>
 </div>
-<div class="card mb-16">
-  <h4 class="mb-8">Data Management</h4>
-  <div class="flex-row">
-    <button class="btn btn-sm" onclick="resetData('US')">Reset US Data</button>
-    <button class="btn btn-sm" onclick="resetData('INDIA')">Reset India Data</button>
-  </div>
-</div>
 <div class="card">
   <h4 class="mb-8">System</h4>
   <p class="text-muted" style="font-size:13px">Market: {{ market }} | Status: <span id="sysStatus">Checking...</span></p>
@@ -28,7 +21,6 @@ fetch('/api/settings/alpaca').then(r=>r.json()).then(d=>{document.getElementById
 function saveAlpaca(){
   fetch('/api/settings/alpaca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:document.getElementById('setKey').value,api_secret:document.getElementById('setSecret').value,base_url:document.getElementById('setBase').value})}).then(r=>r.json()).then(()=>showToast('Saved'));
 }
-function resetData(m){if(!confirm('Reset all '+m+' data?'))return;fetch('/api/reset-data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({market:m})}).then(r=>r.json()).then(()=>showToast('Reset complete'));document.getElementById('sysStatus').textContent='Reset complete';}
 function checkHealth(){fetch('/api/health').then(r=>r.json()).then(d=>{document.getElementById('sysStatus').textContent=d.status==='ok'?'Healthy':'Error';});}
 checkHealth();
 </script>

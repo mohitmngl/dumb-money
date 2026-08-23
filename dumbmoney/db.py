@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS stats (
   confluence REAL DEFAULT 0,
   st_bars_below INTEGER DEFAULT 0, st_bars_above INTEGER DEFAULT 0,
   accel_bars_below INTEGER DEFAULT 0, accel_bars_above INTEGER DEFAULT 0,
+  r_squared REAL DEFAULT 0,
   old_swing_retest_score REAL);
+
+CREATE TABLE IF NOT EXISTS ipos (
+  symbol TEXT PRIMARY KEY, first_seen TEXT, first_bar TEXT);
 
 CREATE TABLE IF NOT EXISTS assets (
   symbol TEXT PRIMARY KEY, name TEXT, asset_class TEXT, exchange TEXT,
@@ -58,6 +62,7 @@ CREATE TABLE IF NOT EXISTS historical_screener (
   confluence REAL DEFAULT 0,
   st_bars_below INTEGER DEFAULT 0, st_bars_above INTEGER DEFAULT 0,
   accel_bars_below INTEGER DEFAULT 0, accel_bars_above INTEGER DEFAULT 0,
+  r_squared REAL DEFAULT 0,
   old_swing_retest_score REAL,
   PRIMARY KEY (symbol, date));
 
@@ -478,6 +483,21 @@ def _init_db(db_path):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
             except sqlite3.OperationalError:
                 pass
+    # Migration: r_squared straight-trend column (asof-v3)
+    for table in ("stats", "historical_screener", "string_screener_metrics", "historical_string_screener"):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN r_squared REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_r2 ON stats(r_squared)")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: portfolio string ordering (present in US/India, missing in crypto/fresh DBs)
+    try:
+        conn.execute("ALTER TABLE portfolio_strings ADD COLUMN sort_order INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     # Migration: add AI score columns to crypto tables
     for table in ("crypto_stats", "crypto_historical_screener"):
         for col, typedef in [

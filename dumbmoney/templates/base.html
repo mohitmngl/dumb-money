@@ -46,10 +46,6 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
         <span>String Screener</span>
       </a>
-      <a class="sidebar-item {% if '/basket-screener' in request.path and '/leaderboard' not in request.path and '/long-short' not in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/></svg>
-        <span>Basket Strings</span>
-      </a>
       {% if market != 'INDIA' %}
       <a class="sidebar-item {% if '/long-short' in request.path %}active{% endif %}" href="/long-short-screener/">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg>
@@ -62,10 +58,6 @@
         <span>Leverage ETFs</span>
       </a>
       {% endif %}
-      <a class="sidebar-item {% if '/basket-screener/leaderboard' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}basket-screener/leaderboard">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3 7h7l-5.5 4.5 2 7L12 16l-6.5 4.5 2-7L2 9h7z"/></svg>
-        <span>Leaderboard</span>
-      </a>
       <a class="sidebar-item {% if '/ai-discovered' in request.path %}active{% endif %}" href="/{{ 'india/' if market == 'INDIA' else '' }}portfolio/ai-discovered">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
         <span>AI Strategies</span>

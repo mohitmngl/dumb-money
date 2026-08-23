@@ -1,0 +1,349 @@
+{% extends "base.html" %}
+{% block title %}Crypto Screener{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Crypto Screener <span class="badge badge-info">CRYPTO</span></h1>
+  <div class="flex-row">
+    <button class="btn btn-sm" onclick="openColumnReference()">Columns</button>
+    <button class="btn btn-sm" onclick="downloadCandles()">Download History</button>
+    <button class="btn btn-sm" onclick="exportCSV()">Export CSV</button>
+    <span id="cacheStatus" class="text-muted" style="font-size:11px"></span>
+  </div>
+</div>
+
+<div class="filter-rail" id="filterRail">
+  <label>Search:</label>
+  <input type="text" id="fSearch" placeholder="Symbol..." style="width:150px">
+  <label>Date (As Of):</label>
+  <input type="date" id="fDateCutoff" style="width:140px">
+  <label>Min Price:</label>
+  <input type="number" id="fMinPrice" style="width:80px" placeholder="0">
+  <label>Max Price:</label>
+  <input type="number" id="fMaxPrice" style="width:80px" placeholder="99999">
+  <label>Min WA:</label>
+  <input type="number" id="fMinWA" style="width:70px" placeholder="-999">
+  <label>Max WA:</label>
+  <input type="number" id="fMaxWA" style="width:70px" placeholder="999">
+  <label>Min Chg%:</label>
+  <input type="number" id="fMinChg" style="width:70px" step="0.1" placeholder="-100">
+  <label>Max Chg%:</label>
+  <input type="number" id="fMaxChg" style="width:70px" step="0.1" placeholder="100">
+  <label>Min Streak:</label>
+  <input type="number" id="fMinStreak" style="width:60px" placeholder="-99">
+  <label>Min Vol:</label>
+  <input type="number" id="fMinVol" style="width:80px" placeholder="0">
+  <label>Min OI:</label>
+  <input type="number" id="fMinOI" style="width:80px" placeholder="0">
+  <label>ST:</label>
+  <select id="fST"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>ST W:</label>
+  <select id="fSTW"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>ST M:</label>
+  <select id="fSTM"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
+  <label>Accel:</label>
+  <select id="fAccel"><option value="">All</option><option value="up">Up</option><option value="down">Down</option><option value="crossed-up">Cross Up</option><option value="crossed-down">Cross Down</option></select>
+  <label>Min ST Bars Below:</label>
+  <input type="number" id="fMinSTBarsBelow" style="width:60px" placeholder="0">
+  <label>Min ST Bars Above:</label>
+  <input type="number" id="fMinSTBarsAbove" style="width:60px" placeholder="0">
+  <label>Min Accel Bars Below:</label>
+  <input type="number" id="fMinAccelBarsBelow" style="width:60px" placeholder="0">
+  <label>Min Accel Bars Above:</label>
+  <input type="number" id="fMinAccelBarsAbove" style="width:60px" placeholder="0">
+  <button class="btn btn-sm" onclick="loadScreener()">Apply</button>
+  <button class="btn btn-sm" onclick="clearFilters()">Clear</button>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="screener-table" id="screenerTable">
+    <div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>
+  </div>
+</div>
+
+<div class="pagination" id="pagination"></div>
+
+<div class="modal-overlay" id="columnModal" style="display:none">
+  <div class="modal" style="max-width:920px;max-height:82vh;overflow:auto">
+    <div class="flex-between mb-16">
+      <h3 style="margin:0">Crypto Screener Columns</h3>
+      <button class="btn btn-sm" onclick="closeColumnReference()">Close</button>
+    </div>
+    <div class="screener-table">
+      <table>
+        <thead><tr><th>Column</th><th>Current source</th><th>Date source</th><th>Meaning</th></tr></thead>
+        <tbody id="columnReferenceBody">
+          <tr><td colspan="4" style="padding:20px;text-align:center"><div class="spinner"></div></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentPage = 1, currentSort = 'volume', currentDir = 'desc';
+const PRICE_PREFIX = '$';
+let columnReferenceLoaded = false;
+
+const COLUMNS = [
+  {key:'symbol', label:'Symbol', width:110, sort:true},
+  {key:'price', label:'Price', width:90, sort:true, num:true},
+  {key:'change_pct', label:'Chg%', width:80, sort:true, num:true},
+  {key:'next_day_return', label:'Next Day %', width:90, sort:true, num:true},
+  {key:'prob_up_1d', label:'P(Up) 1D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_5d', label:'P(Up) 5D', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_1w', label:'P(Up) 1W', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_1m', label:'P(Up) 1M', width:80, sort:true, num:true, heat:true},
+  {key:'prob_up_st_cross', label:'P(Up) ST Cross', width:105, sort:true, num:true, heat:true},
+  {key:'weighted_alpha', label:'Wtd Alpha', width:85, sort:true, num:true},
+  {key:'volume', label:'Volume', width:100, sort:true, num:true},
+  {key:'oi', label:'Open Int', width:100, sort:true, num:true},
+  {key:'oi_value', label:'OI Value', width:100, sort:true, num:true},
+  {key:'funding_rate', label:'Funding %', width:85, sort:true, num:true},
+  {key:'streak', label:'Streak', width:70, sort:true, num:true},
+  {key:'confluence', label:'Confluence', width:90, sort:true, num:true, heat:true},
+  {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
+  {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
+  {key:'ai_trendline_score', label:'Trend Score', width:95, sort:true, num:true},
+  {key:'ai_sentiment_score', label:'Sentiment', width:90, sort:true, num:true},
+  {key:'ai_conclusion', label:'Conclusion', width:90, sort:true},
+  {key:'ai_matrix', label:'AI Matrix', width:90, sort:true, num:true, heat:true},
+  {key:'atr_signal', label:'ST Signal', width:80, sort:true},
+  {key:'atr_crossed_above', label:'Cross Up', width:80, sort:true},
+  {key:'atr_crossed_below', label:'Cross Down', width:90, sort:true},
+  {key:'atr_stop', label:'ST Stop 14x1', width:105, sort:true, num:true},
+  {key:'atr_signal_w', label:'ST W', width:60, sort:true},
+  {key:'atr_crossed_above_w', label:'Cross Up W', width:90, sort:true},
+  {key:'atr_crossed_below_w', label:'Cross Down W', width:100, sort:true},
+  {key:'atr_stop_w', label:'ST Stop W', width:90, sort:true, num:true},
+  {key:'atr_signal_m', label:'ST M', width:60, sort:true},
+  {key:'atr_crossed_above_m', label:'Cross Up M', width:90, sort:true},
+  {key:'atr_crossed_below_m', label:'Cross Down M', width:100, sort:true},
+  {key:'atr_stop_m', label:'ST Stop M', width:90, sort:true, num:true},
+  {key:'atrp', label:'ATR%', width:70, sort:true, num:true},
+  {key:'accel_signal', label:'Accel', width:70, sort:true},
+  {key:'accel_crossed_up', label:'Accel Up', width:85, sort:true},
+  {key:'accel_crossed_down', label:'Accel Down', width:95, sort:true},
+  {key:'st_bars_below', label:'ST Bars Below', width:95, sort:true, num:true},
+  {key:'st_bars_above', label:'ST Bars Above', width:95, sort:true, num:true},
+  {key:'accel_bars_below', label:'Accel Bars Below', width:105, sort:true, num:true},
+  {key:'accel_bars_above', label:'Accel Bars Above', width:105, sort:true, num:true},
+  {key:'mark_price', label:'Mark', width:90, num:true},
+  {key:'bid', label:'Bid', width:90, num:true},
+  {key:'ask', label:'Ask', width:90, num:true},
+  {key:'spread', label:'Spread', width:80, num:true},
+  {key:'high_24h', label:'24h High', width:90, num:true},
+  {key:'low_24h', label:'24h Low', width:90, num:true},
+];
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function formatSignedPercent(raw) {
+  if (raw == null || raw === '') return {html: '-', cls: ''};
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return {html: '-', cls: ''};
+  return {html: (n >= 0 ? '+' : '') + n.toFixed(2) + '%', cls: n >= 0 ? 'text-up' : 'text-down'};
+}
+
+function openColumnReference() {
+  document.getElementById('columnModal').style.display = 'flex';
+  if (columnReferenceLoaded) return;
+  fetch('/api/crypto/screener/columns').then(r => r.json()).then(d => {
+    const rows = (d.columns || []).map(c => (
+      `<tr><td><strong>${escHtml(c.label)}</strong><br><span class="text-muted">${escHtml(c.key)}</span></td>` +
+      `<td><code>${escHtml(c.current)}</code></td><td><code>${escHtml(c.historical)}</code></td>` +
+      `<td>${escHtml(c.meaning)}</td></tr>`
+    )).join('');
+    document.getElementById('columnReferenceBody').innerHTML = rows || '<tr><td colspan="4">No column reference found.</td></tr>';
+    columnReferenceLoaded = true;
+  }).catch(() => {
+    document.getElementById('columnReferenceBody').innerHTML = '<tr><td colspan="4">Failed to load column reference.</td></tr>';
+  });
+}
+
+function closeColumnReference() {
+  document.getElementById('columnModal').style.display = 'none';
+}
+
+function getFilters() {
+  return {
+    page: currentPage, per_page: 50,
+    sort: currentSort, sort_dir: currentDir,
+    search: document.getElementById('fSearch').value,
+    date_cutoff: document.getElementById('fDateCutoff').value,
+    min_price: document.getElementById('fMinPrice').value,
+    max_price: document.getElementById('fMaxPrice').value,
+    min_change: document.getElementById('fMinChg').value,
+    max_change: document.getElementById('fMaxChg').value,
+    min_wa: document.getElementById('fMinWA').value,
+    max_wa: document.getElementById('fMaxWA').value,
+    min_streak: document.getElementById('fMinStreak').value,
+    min_volume: document.getElementById('fMinVol').value,
+    min_oi: document.getElementById('fMinOI').value,
+    atr_status: document.getElementById('fST').value,
+    atr_status_w: document.getElementById('fSTW').value,
+    atr_status_m: document.getElementById('fSTM').value,
+    accel_status: document.getElementById('fAccel').value,
+    min_st_bars_below: document.getElementById('fMinSTBarsBelow').value,
+    min_st_bars_above: document.getElementById('fMinSTBarsAbove').value,
+    min_accel_bars_below: document.getElementById('fMinAccelBarsBelow').value,
+    min_accel_bars_above: document.getElementById('fMinAccelBarsAbove').value,
+  };
+}
+
+function loadScreener() {
+  const params = new URLSearchParams(getFilters());
+  document.getElementById('screenerTable').innerHTML = '<div class="loading" style="padding:40px"><div class="spinner"></div> Loading...</div>';
+  fetch('/api/crypto/screener?' + params).then(r => r.json()).then(d => {
+    renderTable(d.data, d.total, d.page, d.total_pages, d.historical, d.date);
+  }).catch(() => {
+    document.getElementById('screenerTable').innerHTML = '<div class="empty-state"><h3>Failed to load</h3><p>Check server connection.</p></div>';
+  });
+}
+
+function renderTable(data, total, page, totalPages, historical, histDate) {
+  let html = '<table><thead><tr>';
+  COLUMNS.forEach(col => {
+    const sorted = currentSort === col.key;
+    const arrow = sorted ? (currentDir === 'desc' ? ' v' : ' ^') : '';
+    html += `<th style="width:${col.width}px;${sorted?'color:var(--brand)':''}" onclick="sort('${col.key}')">${col.label}<span class="sort-icon">${col.sort ? arrow : ''}</span></th>`;
+  });
+  html += '</tr></thead><tbody>';
+  if (!data || data.length === 0) {
+    html += `<tr><td colspan="${COLUMNS.length}" style="text-align:center;padding:40px;color:var(--text-muted)">No data. Click "Refresh Now" to compute indicators.</td></tr>`;
+  }
+  (data || []).forEach(row => {
+    html += '<tr>';
+    html += `<td><a href="/crypto/stock/${row.symbol}" target="_blank">${row.symbol}</a></td>`;
+    COLUMNS.forEach(col => {
+      if (col.key === 'symbol') return;
+      let val = row[col.key];
+      let cls = '';
+      if (col.key === 'price') {
+        val = val != null ? PRICE_PREFIX + parseFloat(val).toFixed(4) : '-';
+      } else if (col.key === 'change_pct' || col.key === 'next_day_return') {
+        const pct = formatSignedPercent(val); val = pct.html; cls = pct.cls;
+      } else if (col.key === 'funding_rate') {
+        val = val != null ? (val * 100).toFixed(4) + '%' : '-';
+      } else if (col.key === 'volume' || col.key === 'oi' || col.key === 'oi_value') {
+        val = val != null ? parseFloat(val).toLocaleString() : '-';
+      } else if (col.key === 'atr_signal') {
+        val = val === 1 ? '<span class="badge badge-up">Above ST</span>' : val === -1 ? '<span class="badge badge-down">Below ST</span>' : '-';
+      } else if (col.key === 'atr_crossed_above') {
+        val = val ? '<span class="cross-chip cross-up">Cross Up</span>' : (row.atr_signal === 1 ? '<span class="badge badge-up">Above</span>' : '-');
+      } else if (col.key === 'atr_crossed_below') {
+        val = val ? '<span class="cross-chip cross-down">Cross Down</span>' : (row.atr_signal === -1 ? '<span class="badge badge-down">Below</span>' : '-');
+      } else if (col.key === 'atr_signal_w') {
+        val = val === 1 ? '<span class="badge badge-up">Above</span>' : val === -1 ? '<span class="badge badge-down">Below</span>' : '-';
+      } else if (col.key === 'atr_crossed_above_w') {
+        val = val ? '<span class="cross-chip cross-up">Cross Up</span>' : (row.atr_signal_w === 1 ? '<span class="badge badge-up">Above</span>' : '-');
+      } else if (col.key === 'atr_crossed_below_w') {
+        val = val ? '<span class="cross-chip cross-down">Cross Down</span>' : (row.atr_signal_w === -1 ? '<span class="badge badge-down">Below</span>' : '-');
+      } else if (col.key === 'atr_signal_m') {
+        val = val === 1 ? '<span class="badge badge-up">Above</span>' : val === -1 ? '<span class="badge badge-down">Below</span>' : '-';
+      } else if (col.key === 'atr_crossed_above_m') {
+        val = val ? '<span class="cross-chip cross-up">Cross Up</span>' : (row.atr_signal_m === 1 ? '<span class="badge badge-up">Above</span>' : '-');
+      } else if (col.key === 'atr_crossed_below_m') {
+        val = val ? '<span class="cross-chip cross-down">Cross Down</span>' : (row.atr_signal_m === -1 ? '<span class="badge badge-down">Below</span>' : '-');
+      } else if (col.key === 'accel_signal') {
+        val = val === 1 ? '<span class="badge badge-up">UP</span>' : val === -1 ? '<span class="badge badge-down">DOWN</span>' : '-';
+      } else if (col.key === 'accel_crossed_up') {
+        val = val ? '<span class="cross-chip cross-up">UP</span>' : '-';
+      } else if (col.key === 'accel_crossed_down') {
+        val = val ? '<span class="cross-chip cross-down">DOWN</span>' : '-';
+      } else if (col.key === 'ai_conclusion') {
+        val = val || '-';
+        const cls2 = val === 'BUY' ? 'badge-up' : val === 'SELL' ? 'badge-down' : 'badge-info';
+        val = `<span class="badge ${cls2}">${val}</span>`;
+      } else if (col.key === 'streak') {
+        const sn = Number(val);
+        cls = (val != null && sn > 0) ? 'text-up' : (val != null && sn < 0) ? 'text-down' : '';
+        val = val != null ? (sn > 0 ? '+' + val : val) : '-';
+      } else if (col.key === 'weighted_alpha') {
+        const n = Number(val);
+        val = Number.isFinite(n) ? n.toFixed(2) : '-';
+        cls = Number.isFinite(n) ? (n >= 0 ? 'text-up' : 'text-down') : '';
+      } else if (col.key === 'atr_stop' || col.key === 'atr_stop_w' || col.key === 'atr_stop_m' || col.key === 'atrp') {
+        val = val != null ? parseFloat(val).toFixed(2) : '-';
+      } else if (col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m' || col.key === 'prob_up_st_cross' || col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'ai_matrix') {
+        const v = parseFloat(val);
+        val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';
+      } else if (col.num) {
+        val = val != null ? parseFloat(val).toLocaleString(undefined, {maximumFractionDigits: 4}) : '-';
+      } else {
+        val = val != null ? val : '-';
+      }
+      html += `<td class="${col.num ? 'numeric' : ''} ${cls}">${val}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById('screenerTable').innerHTML = html;
+
+  let ph = '';
+  for (let i = 1; i <= totalPages; i++) {
+    if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
+      ph += `<button class="${i===page?'active':''}" onclick="goPage(${i})">${i}</button>`;
+    } else if (Math.abs(i - page) === 3) {
+      ph += '<span>...</span>';
+    }
+  }
+  let countHtml = `<div class="screener-count">Showing ${(page-1)*50+1}-${Math.min(page*50, total)} of ${total.toLocaleString()} perpetuals`;
+  if (historical) countHtml += ` <span style="color:var(--brand);font-weight:600">as of ${histDate}</span>`;
+  countHtml += '</div>';
+  document.getElementById('pagination').innerHTML = countHtml + ph;
+}
+
+function sort(key) {
+  if (currentSort === key) { currentDir = currentDir === 'desc' ? 'asc' : 'desc'; }
+  else { currentSort = key; currentDir = 'desc'; }
+  loadScreener();
+}
+
+function goPage(p) { currentPage = p; loadScreener(); }
+
+function clearFilters() {
+  ['fSearch','fDateCutoff','fMinPrice','fMaxPrice','fMinChg','fMaxChg','fMinVol','fMinOI','fMinWA','fMaxWA','fMinStreak',
+   'fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  ['fST','fSTW','fSTM','fAccel'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  currentPage = 1;
+  loadScreener();
+}
+
+function exportCSV() {
+  const params = new URLSearchParams(getFilters());
+  params.set('per_page', '9999');
+  fetch('/api/crypto/screener?' + params).then(r => r.json()).then(d => {
+    const data = d.data || [];
+    if (!data.length) { showToast('No data to export'); return; }
+    const headers = COLUMNS.map(c => c.key).join(',');
+    const rows = data.map(r => COLUMNS.map(c => {
+      let v = r[c.key];
+      if (c.key === 'funding_rate') v = (v||0)*100;
+      return v == null ? '' : (typeof v === 'number' ? v.toFixed(4) : v);
+    }).join(','));
+    const csv = [headers, ...rows].join('\n');
+    const blob = new Blob([csv], {type: 'text/csv'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'crypto_screener_' + new Date().toISOString().slice(0,10) + '.csv'; a.click();
+  });
+}
+
+function downloadCandles() {
+  showToast('Downloading all timeframes (this may take several minutes)...');
+  fetch('/api/crypto/backfill-all', {method:'POST', headers:{'Content-Type':'application/json'}})
+    .then(r => r.json()).then(d => {
+    showToast(`Backfill complete: ${d.done}/${d.total} operations`);
+    startRefresh();
+  }).catch(() => showToast('Backfill failed'));
+}
+
+// Initial load — server-side filtered
+loadScreener();
+</script>
+{% endblock %}
