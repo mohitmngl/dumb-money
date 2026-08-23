@@ -1,36 +1,44 @@
-"""Crypto full rebuild: migrations -> stats (ATR 2x + AI) -> historical (crypto-v2)
--> live ticker columns. Logs to crypto_rebuild.log."""
-import sqlite3, sys, logging, time
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
-                    handlers=[logging.FileHandler("crypto_rebuild.log"), logging.StreamHandler()])
-log = logging.getLogger("crypto")
+"""Crypto full rebuild: stats (ATR 2x) -> historical (crypto-v2) -> live columns."""
+import sys, logging
+from multiprocessing import freeze_support
 
-conn = sqlite3.connect("crypto.db", timeout=30)
-cur = conn.cursor()
-for table in ("crypto_stats", "crypto_historical_screener"):
-    try:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN r_squared REAL DEFAULT 0")
-        log.info(f"+{table}.r_squared")
-    except sqlite3.OperationalError:
-        pass
-conn.commit(); conn.close()
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
+                        handlers=[logging.FileHandler("crypto_rebuild.log"), logging.StreamHandler()])
+    log = logging.getLogger("crypto")
+    sys.path.insert(0, ".")
 
-sys.path.insert(0, ".")
-from dumbmoney.engine import compute_crypto_stats_batch, update_crypto_historical_screener
+    import sqlite3
+    t0 = __import__("time").time()
+    conn = sqlite3.connect("crypto.db", timeout=600)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_crypto_bars_tf_date ON crypto_bars(timeframe, date)")
+    conn.commit()
+    conn.close()
+    log.info(f"tf-date index ready ({time.time()-t0:.1f}s)")
 
-log.info("crypto stats recompute (ATR 2x)")
-n = compute_crypto_stats_batch(progress_callback=lambda d, t: None)
-log.info(f"crypto stats done: {n} symbols")
+    from dumbmoney.engine import compute_crypto_stats_batch, update_crypto_historical_screener
+    from dumbmoney.data_crypto import update_live_columns
 
-def prog(pct, msg):
-    if isinstance(pct, (int, float)) and int(pct) % 20 == 0:
-        log.info(f"  hist {pct:.0f}% {msg}")
+    log.info("crypto stats recompute (ATR 2x)")
+    n = compute_crypto_stats_batch(progress_callback=lambda d, t: None)
+    if n == 0:
+        log.error("stats recompute returned 0 symbols - ABORTING (live table would stay stale)")
+        return
+    log.info(f"crypto stats done: {n} symbols")
 
-log.info("crypto historical rebuild (crypto-v2)")
-update_crypto_historical_screener(progress_callback=prog)
-log.info("crypto historical done")
+    def prog(pct, msg):
+        if isinstance(pct, (int, float)) and int(pct) % 20 == 0:
+            log.info(f"  hist {pct:.0f}% {msg}")
 
-from dumbmoney.data_crypto import update_live_columns
-n = update_live_columns()
-log.info(f"live columns updated for {n} symbols")
-log.info("CRYPTO DONE")
+    log.info("crypto historical rebuild (crypto-v2, force: include backfilled dates)")
+    update_crypto_historical_screener(force_rebuild=True, progress_callback=prog)
+    log.info("crypto historical done")
+
+    n = update_live_columns()
+    log.info(f"live columns updated for {n} symbols")
+    log.info("CRYPTO DONE")
+
+if __name__ == "__main__":
+    freeze_support()
+    main()

@@ -330,6 +330,7 @@ CREATE INDEX IF NOT EXISTS idx_russell2000_date ON russell2000_constituents(from
 CREATE INDEX IF NOT EXISTS idx_dow30_date ON dow30_constituents(from_date, to_date);
 -- CRYPTO indexes
 CREATE INDEX IF NOT EXISTS idx_crypto_bars_tf_sym_date ON crypto_bars(timeframe, symbol, date);
+CREATE INDEX IF NOT EXISTS idx_crypto_bars_tf_date ON crypto_bars(timeframe, date);
 CREATE INDEX IF NOT EXISTS idx_crypto_bars_sym_date ON crypto_bars(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_crypto_bars_tf_sym_date_cover ON crypto_bars(timeframe, symbol, date, open, high, low, close, volume);
 CREATE INDEX IF NOT EXISTS idx_cs_wa ON crypto_stats(weighted_alpha);
