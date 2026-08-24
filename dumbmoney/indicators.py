@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -343,7 +345,170 @@ def compute_rolling_atr_trailing_stop(dates, opens, highs, lows, closes,
     return result
 
 
+if HAVE_NUMBA:
+    @njit(cache=True)
+    def _rolling_atr_incremental_numba(highs, lows, closes, sessions, period,
+                                       multiplier, min_idx, trends, stops, atrs,
+                                       streaks, cross_above, cross_below,
+                                       bars_bl, bars_ab):
+        """O(n) equivalent of the per-date anchored-block rebuild.
+
+        Block anchors depend only on eval_idx mod sessions, so one sequential
+        pass per residue class reproduces every per-eval call's block prefix
+        exactly -> bitwise-identical outputs (same recursion, same order)."""
+        n = closes.shape[0]
+
+        bh = np.full(n, np.nan)
+        bl = np.full(n, np.nan)
+        bc = np.full(n, np.nan)
+        for i in range(sessions - 1, n):
+            max_h = highs[i - sessions + 1]
+            min_l = lows[i - sessions + 1]
+            for j in range(i - sessions + 2, i + 1):
+                if highs[j] > max_h:
+                    max_h = highs[j]
+                if lows[j] < min_l:
+                    min_l = lows[j]
+            bh[i] = max_h
+            bl[i] = min_l
+            bc[i] = closes[i]
+
+        for r in range(sessions):
+            m = r
+            while m < sessions - 1:
+                m += sessions
+            if m >= n:
+                continue
+
+            # trailing-stop recursion state (mirrors _atr_trailing_stop_numba)
+            prev_st = np.nan
+            prev_dir = np.int8(0)
+            prev_c = np.nan
+            streak = np.int32(0)
+            # ATR: seed = mean of first `period` TRs, then Wilder RMA
+            tr_sum = 0.0
+            tr_seen = 0
+            atr_val = np.nan
+            # bars_at_side second-pass state
+            bas_run = 0
+            bas_prev_s = np.int8(0)
+            bas_last_cc = 0
+            kk = 0
+
+            while m < n:
+                h_b = bh[m]
+                l_b = bl[m]
+                c_b = bc[m]
+                pc = c_b if kk == 0 else prev_c
+                tr = max(h_b - l_b, max(abs(h_b - pc), abs(l_b - pc)))
+                if tr_seen < period:
+                    tr_sum += tr
+                    tr_seen += 1
+                    if tr_seen == period:
+                        atr_val = tr_sum / period
+                else:
+                    atr_val = (atr_val * (period - 1) + tr) / period
+
+                if np.isnan(atr_val):
+                    d = np.int8(-1)
+                    st = np.nan
+                else:
+                    loss = multiplier * atr_val
+                    if np.isnan(prev_st):
+                        d = np.int8(-1)
+                        st = c_b + loss
+                    elif c_b > prev_st and pc > prev_st:
+                        d = np.int8(1)
+                        st = max(prev_st, c_b - loss)
+                    elif c_b < prev_st and pc < prev_st:
+                        d = np.int8(-1)
+                        st = min(prev_st, c_b + loss)
+                    elif c_b > prev_st and pc <= prev_st:
+                        d = np.int8(1)
+                        st = c_b - loss
+                    elif c_b < prev_st and pc >= prev_st:
+                        d = np.int8(-1)
+                        st = c_b + loss
+                    else:
+                        d = prev_dir if kk > 0 else np.int8(-1)
+                        st = prev_st
+
+                if d == 0:
+                    streak = np.int32(0)
+                elif kk == 0 or d != prev_dir:
+                    streak = np.int32(1) if d == 1 else np.int32(-1)
+                else:
+                    streak = streak + (np.int32(1) if d == 1 else np.int32(-1))
+
+                if d == 0:
+                    bas_run = 0
+                    bas_prev_s = np.int8(0)
+                    bas_last_cc = 0
+                    bas = 0
+                elif d == bas_prev_s:
+                    bas_run += 1
+                    bas = bas_last_cc
+                else:
+                    bas_last_cc = bas_run if bas_run > 0 and bas_prev_s != 0 else 0
+                    bas = bas_last_cc
+                    bas_run = 1
+                    bas_prev_s = d
+
+                xa = 1 if (d == 1 and prev_dir == -1) else 0
+                xb = 1 if (d == -1 and prev_dir == 1) else 0
+
+                kk += 1
+                if m >= min_idx and kk >= 3:
+                    trends[m] = d
+                    stops[m] = 0.0 if np.isnan(st) else st
+                    atrs[m] = 0.0 if np.isnan(atr_val) else atr_val
+                    streaks[m] = streak
+                    cross_above[m] = xa
+                    cross_below[m] = xb
+                    bars_bl[m] = bas if d == 1 else 0
+                    bars_ab[m] = bas if d == -1 else 0
+
+                prev_st = st
+                prev_dir = d
+                prev_c = c_b
+                m += sessions
+
+
 def compute_rolling_atr_batch(dates, opens, highs, lows, closes, sessions,
+                               period=14, multiplier=2.0):
+    """Compute rolling ATR Trailing Stop for ALL dates in one symbol.
+
+    Default impl is an O(n) incremental kernel (ROLLING_ATR_IMPL=legacy
+    restores the original per-date anchored rebuild)."""
+    n = len(dates)
+    trends = np.zeros(n, dtype=np.int32)
+    stops = np.zeros(n, dtype=np.float64)
+    atrs = np.zeros(n, dtype=np.float64)
+    streaks = np.zeros(n, dtype=np.int32)
+    cross_above = np.zeros(n, dtype=np.int32)
+    cross_below = np.zeros(n, dtype=np.int32)
+    bars_bl = np.zeros(n, dtype=np.int32)
+    bars_ab = np.zeros(n, dtype=np.int32)
+
+    if n < sessions + 1:
+        return trends, stops, atrs, streaks, cross_above, cross_below, bars_bl, bars_ab
+
+    min_idx = max(period + 1, sessions) - 1
+
+    if HAVE_NUMBA and os.environ.get("ROLLING_ATR_IMPL", "fast") != "legacy":
+        _rolling_atr_incremental_numba(
+            np.asarray(highs, dtype=np.float64),
+            np.asarray(lows, dtype=np.float64),
+            np.asarray(closes, dtype=np.float64),
+            sessions, period, multiplier, min_idx,
+            trends, stops, atrs, streaks, cross_above, cross_below, bars_bl, bars_ab)
+        return trends, stops, atrs, streaks, cross_above, cross_below, bars_bl, bars_ab
+
+    return _compute_rolling_atr_batch_legacy(dates, opens, highs, lows, closes,
+                                             sessions, period, multiplier)
+
+
+def _compute_rolling_atr_batch_legacy(dates, opens, highs, lows, closes, sessions,
                                period=14, multiplier=2.0):
     """Compute rolling ATR Trailing Stop for ALL dates in one symbol.
 
