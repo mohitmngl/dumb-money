@@ -627,15 +627,35 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
                 if r[0] in date_map:
                     date_map[r[0]] = (date_map[r[0]][0], r[1])
     else:
-        date_rows = conn.execute(
-            f"""SELECT a.symbol,
-                      (SELECT MAX(b.date) FROM bars b
-                       WHERE b.symbol=a.symbol AND b.timeframe='1Day'),
-                      {oldest_select}
-               FROM assets a
-               WHERE a.status='active' AND a.tradable=1 AND COALESCE(a.exchange, '') <> 'OTC'"""
-        ).fetchall()
-        date_map = {r[0]: (r[1], r[2]) for r in date_rows}
+        _update_status(phase="Planning: scanning stored dates...", symbols_total=len(symbols), symbols_done=0)
+        asset_syms = [r[0] for r in conn.execute(
+            "SELECT symbol FROM assets WHERE status='active' AND tradable=1 AND COALESCE(exchange, '') <> 'OTC'"
+        ).fetchall()]
+        date_map = {}
+        chunk_size = 400
+        for ci in range(0, len(asset_syms), chunk_size):
+            if _check_cancel(market):
+                conn.close()
+                return []
+            chunk = asset_syms[ci:ci + chunk_size]
+            placeholders_a = ",".join("?" * len(chunk))
+            date_rows = conn.execute(
+                f"""SELECT a.symbol,
+                          (SELECT MAX(b.date) FROM bars b
+                           WHERE b.symbol=a.symbol AND b.timeframe='1Day'),
+                          {oldest_select}
+                   FROM assets a
+                   WHERE a.symbol IN ({placeholders_a})""",
+                chunk,
+            ).fetchall()
+            for r in date_rows:
+                date_map[r[0]] = (r[1], r[2])
+            done = min(ci + chunk_size, len(asset_syms))
+            _update_status(
+                phase=f"Planning: scanned {done}/{len(asset_syms)} symbols",
+                step_pct=round(done / max(len(asset_syms), 1) * 3, 1),
+                symbols_total=len(symbols), symbols_done=0,
+            )
 
     if not symbols:
         _update_status(step_pct=100, symbols_total=0, symbols_done=0)
@@ -805,15 +825,35 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
         oldest_select = ("(SELECT MIN(b.date) FROM bars b "
                          "WHERE b.symbol=a.symbol AND b.timeframe='1Day')"
                          if allow_backfill else "NULL")
-        date_rows = conn.execute(
-            f"""SELECT a.symbol,
-                      (SELECT MAX(b.date) FROM bars b
-                       WHERE b.symbol=a.symbol AND b.timeframe='1Day'),
-                      {oldest_select}
-               FROM assets a
-               WHERE a.status='active'"""
-        ).fetchall()
-        date_map = {row[0]: (row[1], row[2]) for row in date_rows}
+        _update_status(phase="Planning: scanning stored dates...", symbols_total=len(symbols), symbols_done=0)
+        asset_syms = [r[0] for r in conn.execute(
+            "SELECT symbol FROM assets WHERE status='active'"
+        ).fetchall()]
+        date_map = {}
+        chunk_size = 400
+        for ci in range(0, len(asset_syms), chunk_size):
+            if _check_cancel(market):
+                conn.close()
+                return []
+            chunk = asset_syms[ci:ci + chunk_size]
+            placeholders_a = ",".join("?" * len(chunk))
+            date_rows = conn.execute(
+                f"""SELECT a.symbol,
+                          (SELECT MAX(b.date) FROM bars b
+                           WHERE b.symbol=a.symbol AND b.timeframe='1Day'),
+                          {oldest_select}
+                   FROM assets a
+                   WHERE a.symbol IN ({placeholders_a})""",
+                chunk,
+            ).fetchall()
+            for row in date_rows:
+                date_map[row[0]] = (row[1], row[2])
+            done = min(ci + chunk_size, len(asset_syms))
+            _update_status(
+                phase=f"Planning: scanned {done}/{len(asset_syms)} symbols",
+                step_pct=round(done / max(len(asset_syms), 1) * 3, 1),
+                symbols_total=len(symbols), symbols_done=0,
+            )
 
     if not symbols:
         _update_status(step_pct=100, symbols_total=0, symbols_done=0)
