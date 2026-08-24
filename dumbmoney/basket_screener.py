@@ -176,6 +176,48 @@ def _eligible_symbols(market):
 
 
 
+def _load_composition(market, string_ids=None):
+    """Return (string_ids, sym_list, indices, weights).
+    indices: (n_strings, 10) int array — column indices into close_pivot
+    weights: (n_strings, 10) float array — corresponding weights"""
+    conn = get_db(market)
+    try:
+        if string_ids is None:
+            rows = conn.execute(
+                "SELECT sc.string_id, sc.symbol, sc.weight FROM string_constituents sc "
+                "JOIN string_universe u ON u.string_id=sc.string_id "
+                "WHERE u.market=?", (market,)).fetchall()
+        else:
+            placeholders = ",".join("?" * len(string_ids))
+            rows = conn.execute(
+                f"SELECT string_id, symbol, weight FROM string_constituents "
+                f"WHERE string_id IN ({placeholders})", string_ids).fetchall()
+        if not rows:
+            return [], [], None, None
+        sids = []
+        seen = set()
+        for r in rows:
+            if r[0] not in seen:
+                seen.add(r[0]); sids.append(r[0])
+        sym_list = sorted({r[1] for r in rows})
+        sym_idx = {s: i for i, s in enumerate(sym_list)}
+        sid_to_row = {s: i for i, s in enumerate(sids)}
+        n = len(sids)
+        indices = np.zeros((n, MAX_CONSTITUENTS), dtype=np.int32)
+        weights = np.zeros((n, MAX_CONSTITUENTS), dtype=np.float32)
+        counts = np.zeros(n, dtype=np.int32)
+        for r in rows:
+            ri = sid_to_row[r[0]]
+            ci = counts[ri]
+            if ci < MAX_CONSTITUENTS:
+                indices[ri, ci] = sym_idx[r[1]]
+                weights[ri, ci] = float(r[2])
+                counts[ri] += 1
+        return sids, sym_list, indices, weights
+    finally:
+        conn.close()
+
+
 def _get_cache_path(market):
     os.makedirs(_CACHE_DIR, exist_ok=True)
     return os.path.join(_CACHE_DIR, f"close_pivot_{market}.npy"), os.path.join(_CACHE_DIR, f"close_meta_{market}.json")

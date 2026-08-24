@@ -115,7 +115,7 @@ def _download_one(sym, start_date=None):
             params = {"period1": p1, "period2": p2, "interval": "1d", "crumb": crumb}
         else:
             # period1=0 => full history since listing (max available)
-            p2 = int(dt.now().timestamp())
+            p2 = int(datetime.now().timestamp())
             params = {"period1": 0, "period2": p2, "interval": "1d", "crumb": crumb}
         r = session.get(url, params=params, timeout=10)
         if r.status_code != 200:
