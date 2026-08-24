@@ -1164,12 +1164,14 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
 
     where_str = " AND ".join(where)
 
-    # crypto.db namespaces its tables (crypto_historical_screener); the plain
-    # name is empty there, which made the crypto history view return 0 rows.
-    hs_table = ("crypto_historical_screener"
-                if str(market).upper() == "CRYPTO" else "historical_screener")
+    # crypto.db namespaces its tables (crypto_historical_screener) and keeps no
+    # asset rows, so the assets join must not filter there.
+    is_crypto = str(market).upper() == "CRYPTO"
+    hs_table = "crypto_historical_screener" if is_crypto else "historical_screener"
+    asset_join = ("LEFT JOIN assets a ON h.symbol = a.symbol" if is_crypto
+                  else "JOIN assets a ON h.symbol = a.symbol")
     base_from = (f"FROM {hs_table} h "
-                 f"JOIN assets a ON h.symbol = a.symbol "
+                 f"{asset_join} "
                  f"LEFT JOIN stats s ON h.symbol = s.symbol "
                  f"WHERE {where_str}")
     # COUNT never needs the stats LEFT JOIN (profit_status is not filterable in date
@@ -1178,7 +1180,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
         count_from = base_from
     else:
         count_from = (f"FROM {hs_table} h "
-                      f"JOIN assets a ON h.symbol = a.symbol "
+                      f"{asset_join} "
                       f"WHERE {where_str}")
 
     direction = "DESC" if sort_dir == "desc" else "ASC"
