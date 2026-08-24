@@ -2,6 +2,26 @@ import threading
 import time
 import logging
 import json
+
+_perf_logger = logging.getLogger("refresh_perf")
+
+
+class _timed:
+    """Context manager: PERF|phase|seconds|k=v,... lines to refresh_perf log."""
+
+    def __init__(self, phase, **tags):
+        self.phase = phase
+        self.tags = tags
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        dt = time.perf_counter() - self.t0
+        tag = ",".join(f"{k}={v}" for k, v in self.tags.items())
+        _perf_logger.info(f"PERF|{self.phase}|{dt:.2f}s|{tag}")
+        return False
 from datetime import datetime
 from dumbmoney.db import get_db, init_all_dbs, ensure_schema, migrate_nulls
 from dumbmoney.config import DB_PATHS
@@ -242,6 +262,7 @@ def cancel_refresh(market="US"):
 def _refresh_worker(market):
     _refresh_context.market = _norm_market(market)
     start_time = time.time()
+    _refresh_t0 = time.perf_counter()
     step_errors = []
 
     try:
@@ -303,10 +324,12 @@ def _refresh_worker(market):
 
         _update_status(step_current=1, step_name="Download bars", phase="Downloading daily bars...", step_pct=0, symbols_done=0)
         updated_symbols = []
-        if market == "US":
-            updated_symbols = _download_us_bars_incremental(market)
-        else:
-            updated_symbols = _download_india_bars(market) or []
+        with _timed("download", market=market):
+            if market == "US":
+                updated_symbols = _download_us_bars_incremental(market)
+            else:
+                updated_symbols = _download_india_bars(market) or []
+        _perf_logger.info(f"PERF|download_updated|symbols={len(updated_symbols)}")
 
         if _check_cancel():
             return
@@ -365,7 +388,8 @@ def _refresh_worker(market):
                 _stats_pct["val"] = pct
                 _parallel_progress()
             try:
-                n_stats = vectorized_stats_pass(market, only_symbols=stats_symbols, progress_callback=_stats_progress)
+                with _timed("stats_pass", symbols=len(stats_symbols) if stats_symbols else 0):
+                    n_stats = vectorized_stats_pass(market, only_symbols=stats_symbols, progress_callback=_stats_progress)
             except Exception as e:
                 logger.error(f"Stats computation failed: {e}", exc_info=True)
                 step_errors.append(f"Step 2 (stats): {e}")
@@ -380,7 +404,8 @@ def _refresh_worker(market):
                     return
                 _fund_pct["val"] = pct
                 _parallel_progress()
-            update_asset_info(market, progress_callback=_asset_progress, only_symbols=stats_symbols)
+            with _timed("asset_info", symbols=len(stats_symbols) if stats_symbols else 0):
+                update_asset_info(market, progress_callback=_asset_progress, only_symbols=stats_symbols)
             _fund_pct["val"] = 100
             _parallel_progress()
 
@@ -394,7 +419,8 @@ def _refresh_worker(market):
                     return
                 _prepost_pct["val"] = pct
                 _parallel_progress()
-            update_pre_post_prices(market, progress_callback=_prepost_progress, symbols=stats_symbols)
+            with _timed("prepost", symbols=len(stats_symbols) if stats_symbols else 0):
+                update_pre_post_prices(market, progress_callback=_prepost_progress, symbols=stats_symbols)
             _prepost_pct["val"] = 100
             _parallel_progress()
 
@@ -418,7 +444,8 @@ def _refresh_worker(market):
             s = _update_status(step_pct=round(pct * 0.5, 1), phase=f"Asset info: {msg}")
             s["overall_pct"] = _compute_overall_pct(s)
             _persist_status(s)
-        update_asset_info(market, progress_callback=_asset_progress, only_symbols=stats_symbols)
+        with _timed("asset_info", symbols=len(stats_symbols) if stats_symbols else 0):
+            update_asset_info(market, progress_callback=_asset_progress, only_symbols=stats_symbols)
 
         s = _update_status(step_pct=100)
         s["overall_pct"] = _compute_overall_pct(s)
@@ -440,7 +467,8 @@ def _refresh_worker(market):
         else:
             _bg_progress(5, f"Historical screener: {len(hist_symbols)} symbols")
             try:
-                update_historical_screener(market, progress_callback=_bg_progress, only_symbols=hist_symbols, cancel_check=_check_cancel)
+                with _timed("historical_update", symbols=len(hist_symbols)):
+                    update_historical_screener(market, progress_callback=_bg_progress, only_symbols=hist_symbols, cancel_check=_check_cancel)
             except Exception as e:
                 logger.error(f"Historical screener failed: {e}", exc_info=True)
                 step_errors.append(f"Step 5 (historical screener): {e}")
@@ -452,6 +480,7 @@ def _refresh_worker(market):
         final_phase = "All done!" if not step_errors else f"Done with {len(step_errors)} warning(s)"
         has_critical = any("stats" in e.lower() or "fatal" in e.lower() for e in step_errors)
         final_status = "error" if has_critical else "complete"
+        _perf_logger.info(f"PERF|refresh_total|{time.perf_counter() - _refresh_t0:.2f}s|market={market},status={final_status}")
         s = _update_status(step_pct=100, overall_pct=100, status=final_status,
                            step_name="Complete", phase=final_phase, errors=step_errors)
         _persist_status(s)
