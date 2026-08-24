@@ -674,6 +674,11 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
     new_stocks = []
     up_to_date = 0
     backfill_stocks = []
+    # Skip only when the stored latest bar is already the newest expected bar:
+    # market open -> today, market closed -> latest weekday. Computed once —
+    # _latest_expected_bar walks the pandas US-holiday calendar and costs
+    # ~100ms; per-symbol it added tens of minutes to every refresh.
+    expected_latest = today_str if market_open else _latest_expected_bar(market)
     for sym in symbols:
         ld, od = date_map.get(sym, (None, None))
         if ld is None:
@@ -681,9 +686,6 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
             start_groups.setdefault(warmup_start, []).append(sym)
             new_stocks.append(sym)
             continue
-        # Skip only when the stored latest bar is already the newest expected bar:
-        # market open -> today, market closed -> latest weekday.
-        expected_latest = today_str if market_open else _latest_expected_bar(market)
         if ld >= expected_latest and not market_open:
             up_to_date += 1
             if allow_backfill and od and od > BACKFILL_CUTOFF:
@@ -872,6 +874,9 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
     new_stocks = []
     up_to_date = 0
     backfill_stocks = []
+    # Same hoist as the US path: _latest_expected_bar is calendar-walk expensive
+    # and symbol-independent.
+    expected_latest = today_str if market_open else _latest_expected_bar(market)
     for sym in symbols:
         ld, od = date_map.get(sym, (None, None))
         if ld is None:
@@ -879,7 +884,6 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
             start_groups.setdefault(NEW_SEED_START, []).append(sym)
             new_stocks.append(sym)
             continue
-        expected_latest = today_str if market_open else _latest_expected_bar(market)
         if ld >= expected_latest and not market_open:
             up_to_date += 1
             if allow_backfill and od and od > BACKFILL_CUTOFF:
