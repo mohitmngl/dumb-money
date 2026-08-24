@@ -70,6 +70,8 @@
   <input type="number" id="fMinVol" style="width:80px" placeholder="0">
   <label>Fractionable:</label>
   <select id="fFractionable"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label id="lblShortable">Shortable:</label>
+  <select id="fShortable"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
   <label id="lblIndex">Index:</label>
   <select id="fIndex"><option value="">All</option></select>
   <label>Profit:</label>
@@ -139,6 +141,13 @@ if (MARKET === 'INDIA') {
 } else {
   if (idxLabel) idxLabel.style.display = 'none';
   if (idxSelect) idxSelect.style.display = 'none';
+}
+// Alpaca shortability is US-only — hide the filter elsewhere
+if (MARKET !== 'US') {
+  const slLabel = document.getElementById('lblShortable');
+  const slSelect = document.getElementById('fShortable');
+  if (slLabel) slLabel.style.display = 'none';
+  if (slSelect) slSelect.style.display = 'none';
 }
 
 const COLUMNS = [
@@ -247,6 +256,7 @@ function getFilters() {
     accel_status: document.getElementById('fAccelStatus').value,
     min_volume: document.getElementById('fMinVol').value,
     fractionable: document.getElementById('fFractionable').value,
+    shortable: document.getElementById('fShortable') ? document.getElementById('fShortable').value : '',
     index: document.getElementById('fIndex') ? document.getElementById('fIndex').value : '',
     profit_status: document.getElementById('fProfitStatus').value,
     min_st_bars_below: document.getElementById('fMinSTBarsBelow') ? document.getElementById('fMinSTBarsBelow').value : '',
@@ -378,7 +388,7 @@ function goPage(p) { currentPage = p; loadScreener(); }
 
 function clearFilters() {
   ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinRetestScore','fDateCutoff'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-  ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fShortable','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   currentPage = 1;
   loadScreener();
 }

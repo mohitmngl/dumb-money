@@ -1120,6 +1120,10 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     if fractionable:
         where.append("a.fractionable = ?")
         params.append(1 if fractionable == "yes" else 0)
+    shortable = args.get("shortable")
+    if shortable:
+        where.append("a.shortable = ?")
+        params.append(1 if shortable == "yes" else 0)
 
     profit_status = args.get("profit_status")
     if profit_status and not date_cutoff:
@@ -1364,6 +1368,10 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
     if fractionable:
         where.append("fractionable = ?")
         params.append(1 if fractionable == "yes" else 0)
+    shortable = args.get("shortable")
+    if shortable:
+        where.append("s.shortable = ?")
+        params.append(1 if shortable == "yes" else 0)
 
     profit_status = args.get("profit_status")
     if profit_status:
