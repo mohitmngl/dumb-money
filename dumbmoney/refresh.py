@@ -892,13 +892,7 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
 
 
 def start_background_daemon(market="US"):
-    def _daemon():
-        while True:
-            time.sleep(300)
-            try:
-                update_historical_screener(market)
-            except Exception as e:
-                logger.error(f"Background daemon error: {e}")
-    t = threading.Thread(target=_daemon, daemon=True)
-    t.start()
-    return t
+    """Removed: scheduled background refresh is intentionally not supported.
+    Refresh runs only when explicitly requested via POST /api/refresh."""
+    logger.warning("start_background_daemon called but background refresh is disabled")
+    return None
