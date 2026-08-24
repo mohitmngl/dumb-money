@@ -1429,7 +1429,7 @@ CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
     "weighted_alpha", "atrp", "streak", "atr_value", "atr_stop", "atr_signal",
     "atr_crossed_above", "atr_crossed_below", "atr_streak",
     "next_day_return", "prob_up_1d", "prob_up_5d", "prob_up_1w", "prob_up_1m",
-    "prob_up_st_cross",
+    "prob_up_st_cross", "r_squared",
     "accel_a", "accel_base", "accel_signal", "accel_crossed_up", "accel_crossed_down",
     "confluence",
     "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
@@ -1441,7 +1441,8 @@ CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
 ]
 
 # crypto-v2: ATR trailing stop multiplier 1.0 -> 2.0 (matches equities)
-CRYPTO_STATS_VERSION = "crypto-v2"
+# crypto-v3: added r_squared to stats + historical frames
+CRYPTO_STATS_VERSION = "crypto-v3"
 
 
 def _compute_crypto_stats_batch(batch_args):
@@ -1463,6 +1464,7 @@ def _compute_crypto_stats_batch(batch_args):
         bars_at_side as _bars_at_side,
         compute_confluence as _compute_confluence,
         compute_rolling_atr_trailing_stop as _compute_rolling_atr_trailing_stop,
+        r_squared as _r_squared,
     )
 
     def _si(v):
@@ -1599,6 +1601,7 @@ def _compute_crypto_stats_batch(batch_args):
             ndr = ((c.shift(-1) - c) / c * 100).fillna(0.0)
             ndr_val = _sf(ndr.iloc[-2]) if len(ndr) >= 2 else 0
             streak_val = _si(_streak_vectorized(c)[-1]) if len(c) > 1 else 0
+            r2_val = _sf(_r_squared(c, R_SQUARED_WINDOW).iloc[-1]) if len(c) > 1 else 0.0
 
             # AI scores — vectorized (same as _historical_ai_columns)
             grp_df = grp.copy()
@@ -1630,6 +1633,7 @@ def _compute_crypto_stats_batch(batch_args):
                 "prob_up_1d": round(prob_1d, 2), "prob_up_5d": round(prob_5d, 2),
                 "prob_up_st_cross": round(prob_st_cross, 2),
                 "prob_up_1w": round(prob_1w, 2), "prob_up_1m": round(prob_1m, 2),
+                "r_squared": round(r2_val, 4),
                 "atrp": round(atrp_val, 4),
                 "accel_a": round(accel_a_val, 6), "accel_base": round(accel_base_val, 6),
                 "accel_signal": accel_signal_val, "accel_crossed_up": accel_cross_up,
@@ -1737,6 +1741,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     r.get("streak", 0),
                     r.get("next_day_return", 0), r.get("prob_up_1d", 50), r.get("prob_up_5d", 50),
                     r.get("prob_up_st_cross", 50), r.get("prob_up_1w", 50), r.get("prob_up_1m", 50),
+                    r.get("r_squared", 0),
                     r.get("accel_a", 0), r.get("accel_base", 0), r.get("accel_signal", 0),
                     r.get("accel_crossed_up", 0), r.get("accel_crossed_down", 0),
                     r.get("confluence", 0),
@@ -1757,6 +1762,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     atr_signal, atr_stop, atr_value, atr_streak, atr_crossed_above, atr_crossed_below,
                     streak,
                     next_day_return, prob_up_1d, prob_up_5d, prob_up_st_cross, prob_up_1w, prob_up_1m,
+                    r_squared,
                     accel_a, accel_base, accel_signal, accel_crossed_up, accel_crossed_down,
                     confluence,
                     st_bars_below, st_bars_above, accel_bars_below, accel_bars_above,
@@ -1766,7 +1772,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     ai_volume_score, ai_events_score, ai_volume_profile_score,
                     ai_trendline_score, ai_sentiment_score, ai_conclusion, ai_matrix,
                     last_updated
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 records
             )
             conn.commit()
@@ -2034,6 +2040,7 @@ def _compute_historical_crypto_frame(grp):
     out["prob_up_5d"] = prob_up(c, 5).fillna(50.0)
     out["prob_up_1w"] = prob_up(c, 5).fillna(50.0)
     out["prob_up_1m"] = prob_up(c, 22).fillna(50.0)
+    out["r_squared"] = r_squared(c, R_SQUARED_WINDOW)
     out["prob_up_st_cross"] = prob_up_after_st_cross_up(
         st["crossed_above"].fillna(0).values,
         out["next_day_return"].values,
