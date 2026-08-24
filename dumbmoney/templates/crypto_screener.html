@@ -95,6 +95,7 @@ const COLUMNS = [
   {key:'prob_up_1m', label:'P(Up) 1M', width:80, sort:true, num:true, heat:true},
   {key:'prob_up_st_cross', label:'P(Up) ST Cross', width:105, sort:true, num:true, heat:true},
   {key:'weighted_alpha', label:'Wtd Alpha', width:85, sort:true, num:true},
+  {key:'r_squared', label:'R\u00b2', width:70, sort:true, num:true},
   {key:'volume', label:'Volume', width:100, sort:true, num:true},
   {key:'oi', label:'Open Int', width:100, sort:true, num:true},
   {key:'oi_value', label:'OI Value', width:100, sort:true, num:true},
@@ -264,6 +265,10 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
         const n = Number(val);
         val = Number.isFinite(n) ? n.toFixed(2) : '-';
         cls = Number.isFinite(n) ? (n >= 0 ? 'text-up' : 'text-down') : '';
+      } else if (col.key === 'r_squared') {
+        const n = Number(val);
+        val = Number.isFinite(n) ? n.toFixed(2) : '-';
+        cls = Number.isFinite(n) ? (n > 0.05 ? 'text-up' : n < -0.05 ? 'text-down' : '') : '';
       } else if (col.key === 'atr_stop' || col.key === 'atr_stop_w' || col.key === 'atr_stop_m' || col.key === 'atrp') {
         val = val != null ? parseFloat(val).toFixed(2) : '-';
       } else if (col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m' || col.key === 'prob_up_st_cross' || col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'ai_matrix') {
