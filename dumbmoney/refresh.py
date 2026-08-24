@@ -679,10 +679,9 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
     new_stocks = []
     up_to_date = 0
     backfill_stocks = []
-    # Skip only when the stored latest bar is already the newest expected bar:
-    # market open -> today, market closed -> latest weekday. Computed once —
-    # _latest_expected_bar walks the pandas US-holiday calendar and costs
-    # ~100ms; per-symbol it added tens of minutes to every refresh.
+    # Skip only when the stored latest bar is certainly final. A candle DATED
+    # today can be a pre-close snapshot (fetched mid-session), so in a closed
+    # market it must be re-fetched inclusively to finalize OHLCV.
     expected_latest = today_str if market_open else _latest_expected_bar(market)
     for sym in symbols:
         ld, od = date_map.get(sym, (None, None))
@@ -691,7 +690,7 @@ def _download_us_bars_incremental(market, allow_backfill=False, symbols=None):
             start_groups.setdefault(warmup_start, []).append(sym)
             new_stocks.append(sym)
             continue
-        if ld >= expected_latest and not market_open:
+        if not market_open and ld >= expected_latest and ld != today_str:
             up_to_date += 1
             if allow_backfill and od and od > BACKFILL_CUTOFF:
                 backfill_stocks.append(sym)
@@ -879,8 +878,8 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
     new_stocks = []
     up_to_date = 0
     backfill_stocks = []
-    # Same hoist as the US path: _latest_expected_bar is calendar-walk expensive
-    # and symbol-independent.
+    # Same finality rule as the US path: a candle dated today may be a pre-close
+    # snapshot and must be re-fetched after close.
     expected_latest = today_str if market_open else _latest_expected_bar(market)
     for sym in symbols:
         ld, od = date_map.get(sym, (None, None))
@@ -889,7 +888,7 @@ def _download_india_bars(market, allow_backfill=False, symbols=None):
             start_groups.setdefault(NEW_SEED_START, []).append(sym)
             new_stocks.append(sym)
             continue
-        if ld >= expected_latest and not market_open:
+        if not market_open and ld >= expected_latest and ld != today_str:
             up_to_date += 1
             if allow_backfill and od and od > BACKFILL_CUTOFF:
                 backfill_stocks.append(sym)
