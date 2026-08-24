@@ -1427,8 +1427,8 @@ def update_signal_prob_matrix(market="US", progress_callback=None):
 CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
     "symbol", "date", "price", "change_pct", "volume",
     "weighted_alpha", "atrp", "streak", "atr_value", "atr_stop", "atr_signal",
-    "atr_crossed_above", "atr_crossed_below", "atr_streak",
-    "next_day_return", "prob_up_1d", "prob_up_5d", "prob_up_1w", "prob_up_1m",
+    "atr_crossed_above", "atr_crossed_below", "atr_streak", "atr_multiplier",
+    "next_day_return", "next_5d_return", "prob_up_1d", "prob_up_5d", "prob_up_1w", "prob_up_1m",
     "prob_up_st_cross", "r_squared",
     "accel_a", "accel_base", "accel_signal", "accel_crossed_up", "accel_crossed_down",
     "confluence",
@@ -2033,9 +2033,11 @@ def _compute_historical_crypto_frame(grp):
         "atr_crossed_above": st["crossed_above"].fillna(0).replace([_np.inf, -_np.inf], _np.nan).fillna(0).astype(int),
         "atr_crossed_below": st["crossed_below"].fillna(0).replace([_np.inf, -_np.inf], _np.nan).fillna(0).astype(int),
         "atr_streak": st["streak"].fillna(0).replace([_np.inf, -_np.inf], _np.nan).fillna(0).astype(int),
+        "atr_multiplier": ATR_MULTIPLIER,
     })
     out = _pd.concat([out, ai], axis=1)
     out["next_day_return"] = c.shift(-1).sub(c).div(c).replace([_np.inf, -_np.inf], _np.nan).fillna(0) * 100
+    out["next_5d_return"] = c.shift(-5).sub(c).div(c).replace([_np.inf, -_np.inf], _np.nan).fillna(0) * 100
     out["prob_up_1d"] = prob_up(c, 1).fillna(50.0)
     out["prob_up_5d"] = prob_up(c, 5).fillna(50.0)
     out["prob_up_1w"] = prob_up(c, 5).fillna(50.0)
