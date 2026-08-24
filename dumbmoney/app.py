@@ -1170,6 +1170,9 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     hs_table = "crypto_historical_screener" if is_crypto else "historical_screener"
     asset_join = ("LEFT JOIN assets a ON h.symbol = a.symbol" if is_crypto
                   else "JOIN assets a ON h.symbol = a.symbol")
+    # Alpaca shortability only exists for US; other markets get NULL so the UI
+    # renders '-' instead of a misleading "No".
+    shortable_expr = "a.shortable" if str(market).upper() == "US" else "NULL as shortable"
     base_from = (f"FROM {hs_table} h "
                  f"{asset_join} "
                  f"LEFT JOIN stats s ON h.symbol = s.symbol "
@@ -1202,6 +1205,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
                  "ai_bias": "h.ai_bias", "ai_conclusion": "h.ai_conclusion",
                  "exchange": "a.exchange", "asset_class": "a.asset_class",
                  "marginable": "a.marginable", "fractionable": "a.fractionable",
+                 "shortable": "a.shortable",
                   "st_bars_below": "h.st_bars_below", "st_bars_above": "h.st_bars_above",
                   "accel_bars_below": "h.accel_bars_below", "accel_bars_above": "h.accel_bars_above",
                   "atr_signal_w": "h.atr_signal_w", "atr_stop_w": "h.atr_stop_w",
@@ -1229,7 +1233,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
          f"h.st_bars_below, h.st_bars_above, h.accel_bars_below, h.accel_bars_above, "
          f"h.atr_signal_w, h.atr_stop_w, h.atr_crossed_above_w, h.atr_crossed_below_w, h.atr_streak_w, "
          f"h.atr_signal_m, h.atr_stop_m, h.atr_crossed_above_m, h.atr_crossed_below_m, h.atr_streak_m, "
-         f"s.profit_status, a.fractionable, a.marginable, NULL as pre_price, NULL as pre_change_pct, "
+         f"s.profit_status, a.fractionable, a.marginable, {shortable_expr}, NULL as pre_price, NULL as pre_change_pct, "
         f"NULL as post_price, NULL as post_change_pct, h.date as last_updated, "
         f"h.ai_overall_score, h.ai_bias, h.ai_tech_score, h.ai_momentum_score, "
         f"h.ai_volume_score, h.ai_events_score, h.ai_volume_profile_score, "
@@ -1415,7 +1419,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
         "atr_crossed_above", "atr_crossed_below",
         "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
         "next_day_return", "pre_price", "pre_change_pct", "post_price", "post_change_pct",
-        "profit_status", "fractionable", "marginable", "asset_class", "exchange", "confluence",
+        "profit_status", "fractionable", "marginable", "shortable", "asset_class", "exchange", "confluence",
         "accel_a", "accel_base", "accel_signal", "accel_streak", "accel_crossed_up", "accel_crossed_down",
         "ai_overall_score", "ai_bias", "ai_tech_score", "ai_volume_profile_score",
         "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
@@ -1437,6 +1441,9 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
         "ai_conclusion": "a.conclusion",
         "ai_matrix": "a.ai_matrix",
     }
+    # Alpaca shortability only exists for US; other markets get NULL so the UI
+    # renders '-' instead of a misleading "No".
+    shortable_expr = "s.shortable" if str(market).upper() == "US" else "NULL as shortable"
     sort_col = ai_col_map.get(sort) or f"s.{sort}"
 
     # "<col> <dir> NULLS LAST" is row-identical to the old CASE-WHEN-NULL wrapper but
@@ -1450,7 +1457,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
         f"s.atr_crossed_above, s.atr_crossed_below, s.atr_multiplier, s.streak, s.r_squared, "
         f"s.next_day_return, s.prob_up_1d, s.prob_up_5d, s.prob_up_st_cross, s.prob_up_1w, s.prob_up_1m, "
         f"s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct, "
-        f"s.profit_status, s.fractionable, s.marginable, s.asset_class, s.exchange, "
+        f"s.profit_status, s.fractionable, s.marginable, {shortable_expr}, s.asset_class, s.exchange, "
         f"s.last_updated, s.oldest_data, s.accel_a, s.accel_base, s.accel_signal, "
         f"s.accel_crossed_up, s.accel_crossed_down, s.accel_streak, s.confluence, "
          f"s.st_bars_below, s.st_bars_above, s.accel_bars_below, s.accel_bars_above, "

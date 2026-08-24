@@ -186,6 +186,7 @@ const COLUMNS = [
   {key:'st_bars_above', label:'ST Bars Above', width:95, sort:true, num:true},
   {key:'accel_bars_below', label:'Accel Bars Below', width:105, sort:true, num:true},
   {key:'accel_bars_above', label:'Accel Bars Above', width:105, sort:true, num:true},
+  {key:'shortable', label:'Short', width:60, sort:true},
   {key:'marginable', label:'Margin', width:65},
   {key:'fractionable', label:'Frac', width:55},
   {key:'profit_status', label:'Profit', width:80},
@@ -336,6 +337,10 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
       else if (col.key === 'accel_signal') { val = val === 1 ? '<span class="badge badge-up">UP</span>' : val === -1 ? '<span class="badge badge-down">DOWN</span>' : '-'; }
       else if (col.key === 'accel_crossed_up') { val = val ? '<span class="cross-chip cross-up">UP</span>' : '-'; }
       else if (col.key === 'accel_crossed_down') { val = val ? '<span class="cross-chip cross-down">DOWN</span>' : '-'; }
+      else if (col.key === 'shortable') {
+        if (val == null) { val = '-'; }
+        else { const ok = !!val; val = `<span class="badge ${ok ? 'badge-up' : 'badge-down'}">${ok ? 'Yes' : 'No'}</span>`; }
+      }
       else if (col.key === 'marginable' || col.key === 'fractionable') { val = val ? 'Yes' : 'No'; }
       else if (col.key === 'last_updated') { val = val ? new Date(val).toLocaleDateString() : '-'; }
       else { val = val != null ? val : '-'; }

@@ -628,14 +628,14 @@ def update_asset_info(market="US", progress_callback=None, only_symbols=None):
             requested = sorted(set(only_symbols))
             placeholders = ",".join("?" * len(requested))
             asset_rows = conn.execute(
-                f"SELECT symbol, name, asset_class, exchange, status, tradable, fractionable, marginable "
+                f"SELECT symbol, name, asset_class, exchange, status, tradable, fractionable, marginable, shortable "
                 f"FROM assets WHERE symbol IN ({placeholders})",
                 requested,
             ).fetchall()
             target_syms = requested
         else:
             asset_rows = conn.execute(
-                "SELECT symbol, name, asset_class, exchange, status, tradable, fractionable, marginable FROM assets"
+                "SELECT symbol, name, asset_class, exchange, status, tradable, fractionable, marginable, shortable FROM assets"
             ).fetchall()
             target_syms = [r[0] for r in conn.execute("SELECT symbol FROM stats").fetchall()]
 
@@ -645,14 +645,14 @@ def update_asset_info(market="US", progress_callback=None, only_symbols=None):
             a = asset_map.get(sym)
             if a:
                 records.append((
-                    a[1], a[2], a[3], a[4], a[5], a[6], a[7], sym
+                    a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], sym
                 ))
 
         if records:
             conn.executemany(
                 """UPDATE stats SET
                     name = ?, asset_class = ?, exchange = ?, status = ?,
-                    tradable = ?, fractionable = ?, marginable = ?
+                    tradable = ?, fractionable = ?, marginable = ?, shortable = ?
                    WHERE symbol = ?""",
                 records
             )

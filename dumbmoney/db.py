@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS stats (
   profit_status TEXT, profit_last_qtr_pct REAL, profit_millions REAL,
   profit_expectations TEXT, profit_post_result_dir TEXT,
   fractionable BOOLEAN DEFAULT 0, marginable BOOLEAN DEFAULT 0,
+  shortable BOOLEAN DEFAULT 0,
   asset_class TEXT, exchange TEXT, status TEXT, tradable BOOLEAN DEFAULT 0,
   pattern_name TEXT, pattern_prob REAL,
   last_updated TEXT, oldest_data TEXT,
@@ -387,6 +388,10 @@ def _init_db(db_path):
         pass
     try:
         conn.execute("ALTER TABLE assets ADD COLUMN shortable INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE stats ADD COLUMN shortable BOOLEAN DEFAULT 0")
     except sqlite3.OperationalError:
         pass
     try:
