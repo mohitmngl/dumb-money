@@ -2,8 +2,21 @@ import threading
 import time
 import logging
 import json
+import os
 
 _perf_logger = logging.getLogger("refresh_perf")
+try:
+    _perf_file = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "refresh_perf.log",
+    )
+    _perf_h = logging.FileHandler(_perf_file, encoding="utf-8")
+    _perf_h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _perf_logger.addHandler(_perf_h)
+    _perf_logger.setLevel(logging.INFO)
+    _perf_logger.propagate = False
+except Exception:
+    pass
 
 
 class _timed:
