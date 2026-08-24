@@ -455,8 +455,13 @@ def _r_squared_matrix(V, window=90):
     csty = np.cumsum(t * y, axis=1)
 
     def _roll(cs):
+        # window sum ending at j is cs[j] - cs[j-w]; pad w zeros on the left
+        # so cs[j-w] aligns at column j. Correct even when w == n_dates,
+        # where the old cs[:, :-w] shift produced empty slices.
         tot = np.zeros_like(cs)
-        tot[:, w-1:] = cs[:, w-1:] - np.concatenate([np.zeros((cs.shape[0], 1)), cs[:, :-w]], axis=1)[:, w-1:]
+        pad = np.concatenate(
+            [np.zeros((cs.shape[0], w), dtype=cs.dtype), cs], axis=1)
+        tot[:, w-1:] = cs[:, w-1:] - pad[:, w-1:w-1+cs.shape[1] - (w - 1)]
         tot[:, :w-1] = cs[:, :w-1]
         return tot
 
