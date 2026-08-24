@@ -490,7 +490,12 @@ def _refresh_worker(market):
         # Retest v2: too slow for refresh (2.4s/sym). Compute on demand only.
         _bg_progress(100, "Retest v2: skipped (compute on demand)")
 
-        final_phase = "All done!" if not step_errors else f"Done with {len(step_errors)} warning(s)"
+        if step_errors:
+            final_phase = f"Done with {len(step_errors)} warning(s)"
+        elif not updated_symbols:
+            final_phase = "No new bars — all symbols already current"
+        else:
+            final_phase = "All done!"
         has_critical = any("stats" in e.lower() or "fatal" in e.lower() for e in step_errors)
         final_status = "error" if has_critical else "complete"
         _perf_logger.info(f"PERF|refresh_total|{time.perf_counter() - _refresh_t0:.2f}s|market={market},status={final_status}")
