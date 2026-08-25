@@ -1168,8 +1168,16 @@ def update_historical_screener(market="US", progress_callback=None, only_symbols
         needs_rebuild = force_rebuild or (version_mismatch and only_symbols is None)
 
         if needs_rebuild:
-            conn.execute("DELETE FROM historical_screener")
-            conn.execute("DELETE FROM signal_prob_matrix")
+            if only_symbols:
+                # targeted rebuild: wipe only the requested symbols' rows
+                placeholders = ",".join("?" * len(only_symbols))
+                conn.execute(
+                    f"DELETE FROM historical_screener WHERE symbol IN ({placeholders})",
+                    list(only_symbols),
+                )
+            else:
+                conn.execute("DELETE FROM historical_screener")
+                conn.execute("DELETE FROM signal_prob_matrix")
             # bulk-load mode: rebuild indexes after the fill (3-10x faster inserts)
             conn.execute("DROP INDEX IF EXISTS idx_hs_sym_date")
             conn.execute("DROP INDEX IF EXISTS idx_hs_date")
@@ -1882,7 +1890,15 @@ def update_crypto_historical_screener(only_symbols=None, progress_callback=None,
         needs_rebuild = force_rebuild or (version_mismatch and only_symbols is None)
 
         if needs_rebuild:
-            conn.execute("DELETE FROM crypto_historical_screener")
+            if only_symbols:
+                # targeted rebuild: wipe only the requested symbols' rows
+                placeholders = ",".join("?" * len(only_symbols))
+                conn.execute(
+                    f"DELETE FROM crypto_historical_screener WHERE symbol IN ({placeholders})",
+                    list(only_symbols),
+                )
+            else:
+                conn.execute("DELETE FROM crypto_historical_screener")
             conn.commit()
 
         if requested:
