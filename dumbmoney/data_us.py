@@ -211,10 +211,12 @@ def sync_assets(force=False, cache_max_age_days=7):
     return len(filtered)
 
 
-def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, max_workers=8, incremental=False, progress_callback=None, cancel_check=None):
+def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, max_workers=8, incremental=False, progress_callback=None, cancel_check=None, adjustment="split"):
     """Download daily bars for US symbols using Alpaca multi-symbol endpoint.
     Optimized: large batches, parallel downloads, bulk DB writes.
     incremental=True: skip pagination (1 page per batch, ~3 bars/symbol).
+    adjustment: "split" (default) or "raw" — reverse-split+spin-off survivors
+    are stored raw because split-adjustment inflates their pre-event history.
     cancel_check: fn() -> bool — aborts pending batches/pages when it returns True."""
     from dumbmoney.db import get_db
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -231,7 +233,7 @@ def download_bars(symbols, start_date=None, timeframe="1Day", batch_size=2000, m
             "timeframe": timeframe,
             "start": start_date,
             "limit": 10000,
-            "adjustment": "split",
+            "adjustment": adjustment,
             "feed": "iex",
             "sort": "asc"
         }
