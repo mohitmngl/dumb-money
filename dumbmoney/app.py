@@ -46,6 +46,8 @@ SCREENER_COLUMN_REFERENCE = [
     {"key": "volume", "label": "Volume", "current": "stats.volume", "historical": "historical_screener.volume", "meaning": "Daily bar volume for the row date; never signed."},
     {"key": "streak", "label": "Streak", "current": "stats.streak", "historical": "historical_screener.streak", "meaning": "Consecutive up or down close streak as of the row date."},
     {"key": "r_squared", "label": "R²", "current": "stats.r_squared", "historical": "historical_screener.r_squared", "meaning": "Signed R² of a linear fit on log(close) over the last 90 bars: +1 = perfectly straight uptrend, -1 = perfectly straight downtrend. Sort descending for the straightest uptrending charts."},
+    {"key": "ath", "label": "ATH", "current": "stats.ath", "historical": "historical_screener.ath", "meaning": "All-time high: highest daily bar high from the first stored bar through the row date."},
+    {"key": "atl", "label": "ATL", "current": "stats.atl", "historical": "historical_screener.atl", "meaning": "All-time low: lowest daily bar low from the first stored bar through the row date."},
     {"key": "confluence", "label": "Confluence", "current": "stats.confluence", "historical": "historical_screener.confluence", "meaning": "Combined technical score computed from row-date indicator values."},
     {"key": "ai_overall_score", "label": "AI Score", "current": "ai_analysis.overall_score", "historical": "historical_screener.ai_overall_score", "meaning": "Local vectorized score, not external generated text."},
     {"key": "ai_volume_profile_score", "label": "VP Score", "current": "ai_analysis.volume_profile_score", "historical": "historical_screener.ai_volume_profile_score", "meaning": "Local volume-profile score computed from available bars."},
@@ -1194,6 +1196,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     h_col_map = {"symbol": "h.symbol", "name": "a.name", "price": "h.price",
                  "change_pct": "h.change_pct", "weighted_alpha": "h.weighted_alpha",
                  "volume": "h.volume", "streak": "h.streak", "r_squared": "h.r_squared",
+                 "ath": "h.ath", "atl": "h.atl",
                  "atr_signal": "h.atr_signal", "atr_stop": "h.atr_stop",
                  "atr_value": "h.atr_value", "atr_streak": "h.atr_streak",
                  "atrp": "h.atrp", "atr_crossed_above": "h.atr_crossed_above",
@@ -1230,6 +1233,7 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
     rows = conn.execute(
         f"SELECT h.symbol, h.price, h.volume, NULL as open, NULL as high, NULL as low, "
         f"h.change_pct, h.weighted_alpha, h.atrp, h.streak, h.r_squared, h.atr_value, h.atr_stop, h.atr_signal, "
+        f"h.ath, h.atl, "
         f"h.atr_crossed_above, h.atr_crossed_below, h.atr_streak, h.atr_multiplier, "
         f"h.prob_up_1d, h.prob_up_5d, h.prob_up_st_cross, h.next_day_return, h.next_5d_return, h.confluence, "
         f"h.prob_up_1w, h.prob_up_1m, "
@@ -1423,6 +1427,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
 
     allowed_sorts = {
         "symbol", "name", "price", "change_pct", "weighted_alpha", "volume", "streak", "r_squared",
+        "ath", "atl",
         "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
         "atr_crossed_above", "atr_crossed_below",
         "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
@@ -1463,6 +1468,7 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
         f"SELECT s.symbol, s.name, s.price, s.volume, s.change_pct, "
         f"s.atrp, s.weighted_alpha, s.atr_signal, s.atr_stop, s.atr_value, s.atr_streak, "
         f"s.atr_crossed_above, s.atr_crossed_below, s.atr_multiplier, s.streak, s.r_squared, "
+        f"s.ath, s.atl, "
         f"s.next_day_return, s.prob_up_1d, s.prob_up_5d, s.prob_up_st_cross, s.prob_up_1w, s.prob_up_1m, "
         f"s.pre_price, s.pre_change_pct, s.post_price, s.post_change_pct, "
         f"s.profit_status, s.fractionable, s.marginable, {shortable_expr}, s.asset_class, s.exchange, "

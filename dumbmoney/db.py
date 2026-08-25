@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS stats (
   st_bars_below INTEGER DEFAULT 0, st_bars_above INTEGER DEFAULT 0,
   accel_bars_below INTEGER DEFAULT 0, accel_bars_above INTEGER DEFAULT 0,
   r_squared REAL DEFAULT 0,
+  ath REAL DEFAULT 0, atl REAL DEFAULT 0,
   old_swing_retest_score REAL);
 
 CREATE TABLE IF NOT EXISTS ipos (
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS historical_screener (
   st_bars_below INTEGER DEFAULT 0, st_bars_above INTEGER DEFAULT 0,
   accel_bars_below INTEGER DEFAULT 0, accel_bars_above INTEGER DEFAULT 0,
   r_squared REAL DEFAULT 0,
+  ath REAL DEFAULT 0, atl REAL DEFAULT 0,
   old_swing_retest_score REAL,
   PRIMARY KEY (symbol, date));
 
@@ -277,6 +279,7 @@ CREATE TABLE IF NOT EXISTS crypto_stats (
   ai_volume_profile_score REAL DEFAULT 0, ai_trendline_score REAL DEFAULT 0,
   ai_sentiment_score REAL DEFAULT 0, ai_conclusion TEXT DEFAULT 'HOLD',
   ai_matrix TEXT DEFAULT '',
+  ath REAL DEFAULT 0, atl REAL DEFAULT 0,
   last_updated TEXT
 );
 
@@ -300,6 +303,7 @@ CREATE TABLE IF NOT EXISTS crypto_historical_screener (
   ai_volume_profile_score REAL DEFAULT 0, ai_trendline_score REAL DEFAULT 0,
   ai_sentiment_score REAL DEFAULT 0, ai_conclusion TEXT DEFAULT 'HOLD',
   ai_matrix TEXT DEFAULT '',
+  ath REAL DEFAULT 0, atl REAL DEFAULT 0,
   PRIMARY KEY (symbol, date)
 );"""
 
@@ -474,6 +478,13 @@ def _init_db(db_path):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_r2 ON stats(r_squared)")
     except sqlite3.OperationalError:
         pass
+    # Migration: all-time high/low columns (stats + historical, all markets)
+    for table in ("stats", "historical_screener", "crypto_stats", "crypto_historical_screener"):
+        for col in ("ath", "atl"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
     # Migration: portfolio string ordering (present in US/India, missing in crypto/fresh DBs)
     try:
         conn.execute("ALTER TABLE portfolio_strings ADD COLUMN sort_order INTEGER DEFAULT 0")

@@ -168,6 +168,8 @@ const COLUMNS = [
   {key:'volume', label:'Volume', width:85, sort:true, num:true},
   {key:'streak', label:'Streak', width:70, sort:true, num:true},
   {key:'r_squared', label:'R²', width:70, sort:true, num:true, heat:true},
+  {key:'ath', label:'ATH', width:80, sort:true, num:true},
+  {key:'atl', label:'ATL', width:80, sort:true, num:true},
   {key:'confluence', label:'Confluence', width:95, sort:true, num:true, heat:true},
   {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
   {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
@@ -335,6 +337,7 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
       else if (col.key === 'atr_signal_m') { val = val === 1 ? '<span class="badge badge-up">Above</span>' : val === -1 ? '<span class="badge badge-down">Below</span>' : '-'; }
       else if (col.key === 'streak') { const sn = Number(val); cls = (val != null && sn > 0) ? 'text-up' : (val != null && sn < 0) ? 'text-down' : ''; val = val != null ? (sn > 0 ? '+' + val : val) : '-'; }
       else if (col.key === 'r_squared') { const rv = Number(val); cls = rv >= 0.8 ? 'text-up' : rv <= -0.8 ? 'text-down' : ''; val = Number.isFinite(rv) && val != null ? rv.toFixed(2) : '-'; }
+      else if (col.key === 'ath' || col.key === 'atl') { const xv = Number(val); val = (val != null && Number.isFinite(xv) && xv > 0) ? xv.toFixed(2) : '-'; }
       else if (col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m') {
         const v = parseFloat(val);
         val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';

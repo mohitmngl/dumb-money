@@ -194,6 +194,7 @@ HISTORICAL_SCREENER_COLUMNS = [
     "atr_streak_w", "st_bars_below_w", "st_bars_above_w",
     "atr_signal_m", "atr_stop_m", "atr_crossed_above_m", "atr_crossed_below_m",
     "atr_streak_m", "st_bars_below_m", "st_bars_above_m",
+    "ath", "atl",
 ]
 
 
@@ -385,6 +386,9 @@ def _compute_stats_batch(batch_args):
             ndr_val = _sf(ndr.iloc[-2]) if len(ndr) >= 2 else 0
             streak_val = _si(_streak_vectorized(c)[-1]) if len(c) > 1 else 0
             r2_val = _sf(_r_squared(c, R_SQUARED_WINDOW).iloc[-1]) if len(c) > 1 else 0.0
+            # All-time extremes over the symbol's full stored history
+            ath_val = _sf(h.max()) if len(h) > 0 else 0.0
+            atl_val = _sf(l.min()) if len(l) > 0 else 0.0
 
             # Real vectorized AI scores (same model as historical/crypto rows)
             try:
@@ -433,6 +437,7 @@ def _compute_stats_batch(batch_args):
                 "last_updated": now,
                 "oldest_data": grp["date"].iloc[0].strftime("%Y-%m-%d") if hasattr(grp["date"].iloc[0], "strftime") else str(grp["date"].iloc[0])[:10],
                 "r_squared": round(r2_val, 4),
+                "ath": round(ath_val, 4), "atl": round(atl_val, 4),
                 "ai_overall_score": ai_overall, "ai_bias": ai_bias,
                 "ai_tech_score": ai_tech, "ai_momentum_score": ai_mom,
                 "ai_volume_score": ai_vol, "ai_events_score": ai_evt,
@@ -539,6 +544,7 @@ def vectorized_stats_pass(market="US", only_symbols=None, progress_callback=None
                     r.get("atr_signal_m", 0), r.get("atr_stop_m", 0), r.get("atr_crossed_above_m", 0), r.get("atr_crossed_below_m", 0),
                     r.get("atr_streak_m", 0), r.get("st_bars_below_m", 0), r.get("st_bars_above_m", 0),
                     r.get("r_squared", 0),
+                    r.get("ath", 0), r.get("atl", 0),
                 ))
             # Upsert ONLY the indicator columns. A bare INSERT OR REPLACE used to
             # delete each row and re-insert it, wiping profit_*, pre/post prices,
@@ -555,8 +561,8 @@ def vectorized_stats_pass(market="US", only_symbols=None, progress_callback=None
                     st_bars_below, st_bars_above, accel_bars_below, accel_bars_above,
                     atr_signal_w, atr_stop_w, atr_crossed_above_w, atr_crossed_below_w, atr_streak_w, st_bars_below_w, st_bars_above_w,
                     atr_signal_m, atr_stop_m, atr_crossed_above_m, atr_crossed_below_m, atr_streak_m, st_bars_below_m, st_bars_above_m,
-                    r_squared
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    r_squared, ath, atl
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     price=excluded.price, volume=excluded.volume, change_pct=excluded.change_pct,
                     atrp=excluded.atrp, weighted_alpha=excluded.weighted_alpha,
@@ -579,7 +585,7 @@ def vectorized_stats_pass(market="US", only_symbols=None, progress_callback=None
                     atr_signal_m=excluded.atr_signal_m, atr_stop_m=excluded.atr_stop_m,
                     atr_crossed_above_m=excluded.atr_crossed_above_m, atr_crossed_below_m=excluded.atr_crossed_below_m,
                     atr_streak_m=excluded.atr_streak_m, st_bars_below_m=excluded.st_bars_below_m, st_bars_above_m=excluded.st_bars_above_m,
-                    r_squared=excluded.r_squared""",
+                    r_squared=excluded.r_squared, ath=excluded.ath, atl=excluded.atl""",
                 records
             )
             conn.commit()
@@ -829,7 +835,7 @@ def _historical_ai_columns(grp):
     })
 
 
-def _compute_historical_symbol_frame(grp):
+def _compute_historical_symbol_frame(grp, ath_seed=None, atl_seed=None):
     grp = grp.sort_values("date").reset_index(drop=True).copy()
     c = grp["close"].astype(float)
     h = grp["high"].astype(float)
@@ -869,6 +875,17 @@ def _compute_historical_symbol_frame(grp):
         out["next_day_return"].values,
     )
     out["r_squared"] = r_squared(c, R_SQUARED_WINDOW)
+    # All-time high/low as of each date (running extremes over the full stored
+    # history; incremental callers seed these with the prior value so a truncated
+    # warmup window cannot understate them).
+    ath = h.cummax()
+    atl = l.cummin()
+    if ath_seed is not None:
+        ath = ath.clip(lower=float(ath_seed))
+    if atl_seed is not None:
+        atl = atl.clip(upper=float(atl_seed))
+    out["ath"] = ath
+    out["atl"] = atl
     out["accel_a"] = ac["accel_a"].fillna(0)
     out["accel_base"] = ac["accel_base"].fillna(0)
     out["accel_signal"] = ac["accel_signal"].fillna(0).replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
@@ -1070,7 +1087,24 @@ def _compute_symbol_batch(args):
                         continue
                     num_new = len(new_bars)
                     grp_sliced = grp.tail(num_new + 320).copy()
-                    hist = _compute_historical_symbol_frame(grp_sliced)
+                    # Seed ATH/ATL with the running extremes as of the bar just
+                    # before the slice so cummax/cummin over the warmup window
+                    # stay true all-time values.
+                    ath_seed = atl_seed = None
+                    try:
+                        _seed_row = conn.execute(
+                            """SELECT ath, atl FROM historical_screener
+                               WHERE symbol=? AND date < ? AND ath > 0
+                               ORDER BY date DESC LIMIT 1""",
+                            (sym, str(grp_sliced["date"].iloc[0])),
+                        ).fetchone()
+                        if _seed_row and _seed_row[0]:
+                            ath_seed = _seed_row[0]
+                            atl_seed = _seed_row[1] or None
+                    except Exception:
+                        pass
+                    hist = _compute_historical_symbol_frame(
+                        grp_sliced, ath_seed=ath_seed, atl_seed=atl_seed)
                     # Look back 5 days to recompute next_day_return for recent rows
                     # (new bars may change the next_day_return of the previous day)
                     from datetime import timedelta as _td, datetime as _dt
@@ -1438,6 +1472,7 @@ CRYPTO_HISTORICAL_SCREENER_COLUMNS = [
     "ai_overall_score", "ai_bias", "ai_tech_score", "ai_momentum_score",
     "ai_volume_score", "ai_events_score", "ai_volume_profile_score",
     "ai_trendline_score", "ai_sentiment_score", "ai_conclusion", "ai_matrix",
+    "ath", "atl",
 ]
 
 # crypto-v2: ATR trailing stop multiplier 1.0 -> 2.0 (matches equities)
@@ -1602,6 +1637,8 @@ def _compute_crypto_stats_batch(batch_args):
             ndr_val = _sf(ndr.iloc[-2]) if len(ndr) >= 2 else 0
             streak_val = _si(_streak_vectorized(c)[-1]) if len(c) > 1 else 0
             r2_val = _sf(_r_squared(c, R_SQUARED_WINDOW).iloc[-1]) if len(c) > 1 else 0.0
+            ath_val = _sf(h.max()) if len(h) > 0 else 0.0
+            atl_val = _sf(l.min()) if len(l) > 0 else 0.0
 
             # AI scores — vectorized (same as _historical_ai_columns)
             grp_df = grp.copy()
@@ -1634,6 +1671,7 @@ def _compute_crypto_stats_batch(batch_args):
                 "prob_up_st_cross": round(prob_st_cross, 2),
                 "prob_up_1w": round(prob_1w, 2), "prob_up_1m": round(prob_1m, 2),
                 "r_squared": round(r2_val, 4),
+                "ath": round(ath_val, 4), "atl": round(atl_val, 4),
                 "atrp": round(atrp_val, 4),
                 "accel_a": round(accel_a_val, 6), "accel_base": round(accel_base_val, 6),
                 "accel_signal": accel_signal_val, "accel_crossed_up": accel_cross_up,
@@ -1742,6 +1780,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     r.get("next_day_return", 0), r.get("prob_up_1d", 50), r.get("prob_up_5d", 50),
                     r.get("prob_up_st_cross", 50), r.get("prob_up_1w", 50), r.get("prob_up_1m", 50),
                     r.get("r_squared", 0),
+                    r.get("ath", 0), r.get("atl", 0),
                     r.get("accel_a", 0), r.get("accel_base", 0), r.get("accel_signal", 0),
                     r.get("accel_crossed_up", 0), r.get("accel_crossed_down", 0),
                     r.get("confluence", 0),
@@ -1763,6 +1802,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     streak,
                     next_day_return, prob_up_1d, prob_up_5d, prob_up_st_cross, prob_up_1w, prob_up_1m,
                     r_squared,
+                    ath, atl,
                     accel_a, accel_base, accel_signal, accel_crossed_up, accel_crossed_down,
                     confluence,
                     st_bars_below, st_bars_above, accel_bars_below, accel_bars_above,
@@ -1772,7 +1812,7 @@ def compute_crypto_stats_batch(only_symbols=None, progress_callback=None):
                     ai_volume_score, ai_events_score, ai_volume_profile_score,
                     ai_trendline_score, ai_sentiment_score, ai_conclusion, ai_matrix,
                     last_updated
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 records
             )
             conn.commit()
@@ -1985,7 +2025,24 @@ def _compute_crypto_symbol_batch(args):
                         continue
                     num_new = len(new_bars)
                     grp_sliced = grp.tail(num_new + 320).copy()
-                    hist = _compute_historical_crypto_frame(grp_sliced)
+                    # Seed ATH/ATL with the running extremes as of the bar just
+                    # before the slice so cummax/cummin over the warmup window
+                    # stay true all-time values.
+                    ath_seed = atl_seed = None
+                    try:
+                        _seed_row = conn.execute(
+                            """SELECT ath, atl FROM crypto_historical_screener
+                               WHERE symbol=? AND date < ? AND ath > 0
+                               ORDER BY date DESC LIMIT 1""",
+                            (sym, str(grp_sliced["date"].iloc[0])),
+                        ).fetchone()
+                        if _seed_row and _seed_row[0]:
+                            ath_seed = _seed_row[0]
+                            atl_seed = _seed_row[1] or None
+                    except Exception:
+                        pass
+                    hist = _compute_historical_crypto_frame(
+                        grp_sliced, ath_seed=ath_seed, atl_seed=atl_seed)
                     try:
                         _ld = datetime.strptime(str(last_hist_date)[:10], "%Y-%m-%d")
                         lookback = (_ld - timedelta(days=5)).strftime("%Y-%m-%d")
@@ -2004,7 +2061,7 @@ def _compute_crypto_symbol_batch(args):
         conn.close()
 
 
-def _compute_historical_crypto_frame(grp):
+def _compute_historical_crypto_frame(grp, ath_seed=None, atl_seed=None):
     """Compute historical screener columns for one crypto symbol (vectorized).
     Mirrors _compute_historical_symbol_frame but for CRYPTO."""
     import numpy as _np
@@ -2043,6 +2100,15 @@ def _compute_historical_crypto_frame(grp):
     out["prob_up_1w"] = prob_up(c, 5).fillna(50.0)
     out["prob_up_1m"] = prob_up(c, 22).fillna(50.0)
     out["r_squared"] = r_squared(c, R_SQUARED_WINDOW)
+    # All-time high/low as of each date (see _compute_historical_symbol_frame)
+    ath_s = h.cummax()
+    atl_s = l.cummin()
+    if ath_seed is not None:
+        ath_s = ath_s.clip(lower=float(ath_seed))
+    if atl_seed is not None:
+        atl_s = atl_s.clip(upper=float(atl_seed))
+    out["ath"] = ath_s
+    out["atl"] = atl_s
     out["prob_up_st_cross"] = prob_up_after_st_cross_up(
         st["crossed_above"].fillna(0).values,
         out["next_day_return"].values,
