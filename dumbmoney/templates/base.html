@@ -6,12 +6,14 @@
   <title>DumbMoney - {% block title %}Screener{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/theme.css">
   <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/responsive.css">
   <script>
   const MARKET = '{{ market }}';
   const OTHER_MARKET = '{{ other_market }}';
   </script>
 </head>
 <body>
+<div class="sidebar-backdrop" onclick="document.body.classList.remove('nav-open')"></div>
 <div class="shell">
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-logo">
@@ -90,6 +92,9 @@
   <main class="main" id="main">
     <header class="navbar">
       <div class="market-switch">
+        <button class="nav-toggle" id="menuBtn" aria-label="Menu" onclick="document.body.classList.toggle('nav-open')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
         <button class="market-btn {% if market == 'US' %}active{% endif %}" onclick="window.location.href='/'">USA</button>
         <button class="market-btn {% if market == 'INDIA' %}active{% endif %}" onclick="window.location.href='/india/'">IN</button>
         <button class="market-btn {% if market == 'CRYPTO' %}active{% endif %}" onclick="window.location.href='/crypto/'">CRYPTO</button>
@@ -293,6 +298,44 @@ function loadSidebarStats() {
   }).catch(() => {});
 }
 loadSidebarStats();
+
+// --- Responsive helpers -------------------------------------------------
+(function () {
+  const mobile = window.matchMedia('(max-width: 768px)');
+  // Close the drawer after tapping a nav item or pressing Escape
+  document.addEventListener('click', function (e) {
+    if (mobile.matches && e.target.closest('.sidebar-item')) {
+      document.body.classList.remove('nav-open');
+    }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') document.body.classList.remove('nav-open');
+  });
+
+  // Wide tables scroll horizontally instead of stretching the page.
+  // Wraps tables rendered later by innerHTML too (MutationObserver).
+  function wrap(t) {
+    if (!t.parentNode) return;
+    if (t.closest('.table-scroll') || t.closest('.screener-table')) return;
+    const w = document.createElement('div');
+    w.className = 'table-scroll';
+    t.parentNode.insertBefore(w, t);
+    w.appendChild(t);
+  }
+  function scan(root) {
+    if (!root || !root.querySelectorAll) return;
+    if (root.tagName === 'TABLE') wrap(root);
+    root.querySelectorAll('table').forEach(wrap);
+  }
+  scan(document.body);
+  new MutationObserver(function (muts) {
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n.nodeType === 1) scan(n);
+      }
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+})();
 </script>
 
     {% if market == 'CRYPTO' %}

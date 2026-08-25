@@ -106,5 +106,4 @@ tbody tr:hover { background: rgba(16,185,129,.04); }
   .sidebar .sidebar-item span { display: none; }
   .main { margin-left: var(--sidebar-collapsed); }
   .content { padding: 16px; }
-  .filter-rail { flex-direction: column; }
 }
