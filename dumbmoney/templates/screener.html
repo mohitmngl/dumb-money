@@ -72,6 +72,10 @@
   <select id="fFractionable"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
   <label id="lblShortable">Shortable:</label>
   <select id="fShortable"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label>New High:</label>
+  <select id="fNewAth"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label>New Low:</label>
+  <select id="fNewAtl"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
   <label id="lblIndex">Index:</label>
   <select id="fIndex"><option value="">All</option></select>
   <label>Profit:</label>
@@ -170,6 +174,8 @@ const COLUMNS = [
   {key:'r_squared', label:'R²', width:70, sort:true, num:true, heat:true},
   {key:'ath', label:'ATH', width:80, sort:true, num:true},
   {key:'atl', label:'ATL', width:80, sort:true, num:true},
+  {key:'new_ath', label:'New High', width:92, sort:true},
+  {key:'new_atl', label:'New Low', width:88, sort:true},
   {key:'confluence', label:'Confluence', width:95, sort:true, num:true, heat:true},
   {key:'ai_overall_score', label:'AI Score', width:85, sort:true, num:true, heat:true},
   {key:'ai_volume_profile_score', label:'VP Score', width:85, sort:true, num:true},
@@ -259,6 +265,8 @@ function getFilters() {
     min_volume: document.getElementById('fMinVol').value,
     fractionable: document.getElementById('fFractionable').value,
     shortable: document.getElementById('fShortable') ? document.getElementById('fShortable').value : '',
+    new_ath: document.getElementById('fNewAth') ? document.getElementById('fNewAth').value : '',
+    new_atl: document.getElementById('fNewAtl') ? document.getElementById('fNewAtl').value : '',
     index: document.getElementById('fIndex') ? document.getElementById('fIndex').value : '',
     profit_status: document.getElementById('fProfitStatus').value,
     min_st_bars_below: document.getElementById('fMinSTBarsBelow') ? document.getElementById('fMinSTBarsBelow').value : '',
@@ -338,6 +346,8 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
       else if (col.key === 'streak') { const sn = Number(val); cls = (val != null && sn > 0) ? 'text-up' : (val != null && sn < 0) ? 'text-down' : ''; val = val != null ? (sn > 0 ? '+' + val : val) : '-'; }
       else if (col.key === 'r_squared') { const rv = Number(val); cls = rv >= 0.8 ? 'text-up' : rv <= -0.8 ? 'text-down' : ''; val = Number.isFinite(rv) && val != null ? rv.toFixed(2) : '-'; }
       else if (col.key === 'ath' || col.key === 'atl') { const xv = Number(val); val = (val != null && Number.isFinite(xv) && xv > 0) ? xv.toFixed(2) : '-'; }
+      else if (col.key === 'new_ath') { val = val ? '<span class="cross-chip cross-up">▲ New High</span>' : '-'; }
+      else if (col.key === 'new_atl') { val = val ? '<span class="cross-chip cross-down">▼ New Low</span>' : '-'; }
       else if (col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m') {
         const v = parseFloat(val);
         val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';
@@ -391,7 +401,7 @@ function goPage(p) { currentPage = p; loadScreener(); }
 
 function clearFilters() {
   ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinRetestScore','fDateCutoff'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-  ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fShortable','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fShortable','fNewAth','fNewAtl','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   currentPage = 1;
   loadScreener();
 }

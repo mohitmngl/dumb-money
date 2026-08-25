@@ -42,6 +42,10 @@
   <select id="fSTM"><option value="">All</option><option value="above">Above</option><option value="below">Below</option><option value="crossed-above">Crossed Up</option><option value="crossed-below">Crossed Down</option></select>
   <label>Accel:</label>
   <select id="fAccel"><option value="">All</option><option value="up">Up</option><option value="down">Down</option><option value="crossed-up">Cross Up</option><option value="crossed-down">Cross Down</option></select>
+  <label>New High:</label>
+  <select id="fNewAth"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label>New Low:</label>
+  <select id="fNewAtl"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
   <label>Min ST Bars Below:</label>
   <input type="number" id="fMinSTBarsBelow" style="width:60px" placeholder="0">
   <label>Min ST Bars Above:</label>
@@ -98,6 +102,8 @@ const COLUMNS = [
   {key:'r_squared', label:'R\u00b2', width:70, sort:true, num:true},
   {key:'ath', label:'ATH', width:85, sort:true, num:true},
   {key:'atl', label:'ATL', width:85, sort:true, num:true},
+  {key:'new_ath', label:'New High', width:92, sort:true},
+  {key:'new_atl', label:'New Low', width:88, sort:true},
   {key:'volume', label:'Volume', width:100, sort:true, num:true},
   {key:'oi', label:'Open Int', width:100, sort:true, num:true},
   {key:'oi_value', label:'OI Value', width:100, sort:true, num:true},
@@ -192,6 +198,8 @@ function getFilters() {
     min_st_bars_above: document.getElementById('fMinSTBarsAbove').value,
     min_accel_bars_below: document.getElementById('fMinAccelBarsBelow').value,
     min_accel_bars_above: document.getElementById('fMinAccelBarsAbove').value,
+    new_ath: document.getElementById('fNewAth') ? document.getElementById('fNewAth').value : '',
+    new_atl: document.getElementById('fNewAtl') ? document.getElementById('fNewAtl').value : '',
   };
 }
 
@@ -276,6 +284,10 @@ function renderTable(data, total, page, totalPages, historical, histDate) {
       } else if (col.key === 'prob_up_1d' || col.key === 'prob_up_5d' || col.key === 'prob_up_1w' || col.key === 'prob_up_1m' || col.key === 'prob_up_st_cross' || col.key === 'confluence' || col.key === 'ai_overall_score' || col.key === 'ai_matrix') {
         const v = parseFloat(val);
         val = (v != null && Number.isFinite(v)) ? `<span class="heat-pill">${v.toFixed(1)}</span>` : '-';
+      } else if (col.key === 'new_ath') {
+        val = val ? '<span class="cross-chip cross-up">▲ New High</span>' : '-';
+      } else if (col.key === 'new_atl') {
+        val = val ? '<span class="cross-chip cross-down">▼ New Low</span>' : '-';
       } else if (col.num) {
         val = val != null ? parseFloat(val).toLocaleString(undefined, {maximumFractionDigits: 4}) : '-';
       } else {
@@ -315,7 +327,7 @@ function clearFilters() {
    'fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
-  ['fST','fSTW','fSTM','fAccel'].forEach(id => {
+  ['fST','fSTW','fSTM','fAccel','fNewAth','fNewAtl'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
   currentPage = 1;

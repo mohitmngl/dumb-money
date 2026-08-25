@@ -127,6 +127,14 @@ def _build_crypto_stats_query(conn, search, sort, sort_dir, page, per_page, args
     if min_funding_rate:
         where.append("funding_rate >= ?")
         params.append(float(min_funding_rate))
+    new_ath = args.get("new_ath")
+    if new_ath:
+        where.append("new_ath = ?")
+        params.append(1 if new_ath == "yes" else 0)
+    new_atl = args.get("new_atl")
+    if new_atl:
+        where.append("new_atl = ?")
+        params.append(1 if new_atl == "yes" else 0)
 
     where_str = " AND ".join(where)
 
@@ -136,7 +144,7 @@ def _build_crypto_stats_query(conn, search, sort, sort_dir, page, per_page, args
         "symbol", "price", "change_pct", "weighted_alpha", "volume", "streak", "confluence",
         "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
         "atr_crossed_above", "atr_crossed_below", "r_squared",
-        "ath", "atl",
+        "ath", "atl", "new_ath", "new_atl",
         "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
         "next_day_return", "accel_a", "accel_base", "accel_signal", "accel_crossed_up", "accel_crossed_down",
         "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
@@ -283,6 +291,15 @@ def _build_crypto_hist_query(conn, date_cutoff, search, sort, sort_dir, page, pe
         where.append("h.accel_bars_above >= ?")
         params.append(int(min_accel_bars_above))
 
+    new_ath = args.get("new_ath")
+    if new_ath:
+        where.append("h.new_ath = ?")
+        params.append(1 if new_ath == "yes" else 0)
+    new_atl = args.get("new_atl")
+    if new_atl:
+        where.append("h.new_atl = ?")
+        params.append(1 if new_atl == "yes" else 0)
+
     where_str = " AND ".join(where)
 
     total = conn.execute(
@@ -293,7 +310,7 @@ def _build_crypto_hist_query(conn, date_cutoff, search, sort, sort_dir, page, pe
         "symbol", "price", "change_pct", "weighted_alpha", "volume", "streak", "confluence",
         "atr_signal", "atr_stop", "atr_value", "atr_streak", "atrp",
         "atr_crossed_above", "atr_crossed_below", "r_squared",
-        "ath", "atl",
+        "ath", "atl", "new_ath", "new_atl",
         "prob_up_1d", "prob_up_5d", "prob_up_st_cross", "prob_up_1w", "prob_up_1m",
         "next_day_return", "accel_a", "accel_base", "accel_signal", "accel_crossed_up", "accel_crossed_down",
         "st_bars_below", "st_bars_above", "accel_bars_below", "accel_bars_above",
