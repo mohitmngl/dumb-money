@@ -15,6 +15,10 @@
    every table not already inside one (.screener-table does its own). */
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+/* Touch-friendly panning for wide data tables: keep momentum scrolling,
+   stop horizontal swipes from rubber-banding the page. */
+.screener-table, .table-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y; }
+
 /* Flex min-size guard: .main is a flex item, so without min-width:0 its
    automatic minimum tracks the 2000px screener table and stretches the
    whole page past the viewport (classic flexbox min-width:auto trap). */
@@ -79,4 +83,15 @@
   .toast { left: 12px; right: 12px; bottom: 12px; text-align: center; }
 
   .action-bar { flex-wrap: wrap; }
+
+  /* Wide-table horizontal scroll: the three sticky columns (40+120+140px)
+     ate ~300px of a ~350px viewport, leaving a ~50px sliver of moving
+     content — swiping looked dead. Pin only checkbox + symbol and let the
+     rest scroll, restoring a ~230px window. */
+  .screener-table th:first-child, .screener-table td:first-child { min-width: 32px; }
+  .screener-table th:nth-child(2), .screener-table td:nth-child(2) { min-width: 84px; left: 32px; }
+  .screener-table th:nth-child(3), .screener-table td:nth-child(3) { position: static; min-width: 110px; }
+  /* Thin but visible scrollbar so the extra columns are discoverable */
+  .screener-table::-webkit-scrollbar, .table-scroll::-webkit-scrollbar { height: 5px; }
+  .screener-table::-webkit-scrollbar-thumb, .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 }
