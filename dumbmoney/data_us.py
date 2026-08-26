@@ -99,16 +99,21 @@ def sync_assets(force=False, cache_max_age_days=7):
     assets = []
     params = {"status": "active", "asset_class": "us_equity"}
     url = f"{ALPACA_BASE_URL}/v2/assets"
+    prev_last_id = None
     for _ in range(200):
         data = _api_get(url, params=params)
         if not data:
             break
+        last_id = data[-1].get("id", "")
+        # /v2/assets returns the full list in one call and ignores page_token:
+        # stop when the page's last id repeats instead of refetching it 200x
+        if last_id == prev_last_id:
+            break
         assets.extend(data)
-        if len(data) < 100:
+        if len(data) < 100 or not last_id:
             break
-        params["page_token"] = data[-1].get("id", "")
-        if not params.get("page_token"):
-            break
+        prev_last_id = last_id
+        params["page_token"] = last_id
 
     junk_patterns = [".W", ".R", ".U", ".P", ".C", ".D", ".E", ".F", "WARRANT",
                      "RIGHT", "UNIT", "PREFERRED", "BOND", "NOTE", "DEBT"]
