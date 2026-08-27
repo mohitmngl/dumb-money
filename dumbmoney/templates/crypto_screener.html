@@ -28,6 +28,10 @@
   <input type="number" id="fMinChg" style="width:70px" step="0.1" placeholder="-100">
   <label>Max Chg%:</label>
   <input type="number" id="fMaxChg" style="width:70px" step="0.1" placeholder="100">
+  <label>Min Next Day %:</label>
+  <input type="number" id="fMinNextDay" style="width:70px" step="0.1" placeholder="-100">
+  <label>Max Next Day %:</label>
+  <input type="number" id="fMaxNextDay" style="width:70px" step="0.1" placeholder="100">
   <label>Min Streak:</label>
   <input type="number" id="fMinStreak" style="width:60px" placeholder="-99">
   <label>Min Vol:</label>
@@ -200,6 +204,8 @@ function getFilters() {
     min_accel_bars_above: document.getElementById('fMinAccelBarsAbove').value,
     new_ath: document.getElementById('fNewAth') ? document.getElementById('fNewAth').value : '',
     new_atl: document.getElementById('fNewAtl') ? document.getElementById('fNewAtl').value : '',
+    min_next_day: document.getElementById('fMinNextDay') ? document.getElementById('fMinNextDay').value : '',
+    max_next_day: document.getElementById('fMaxNextDay') ? document.getElementById('fMaxNextDay').value : '',
   };
 }
 
@@ -324,7 +330,7 @@ function goPage(p) { currentPage = p; loadScreener(); }
 
 function clearFilters() {
   ['fSearch','fDateCutoff','fMinPrice','fMaxPrice','fMinChg','fMaxChg','fMinVol','fMinOI','fMinWA','fMaxWA','fMinStreak',
-   'fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove'].forEach(id => {
+   'fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinNextDay','fMaxNextDay'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
   ['fST','fSTW','fSTM','fAccel','fNewAth','fNewAtl'].forEach(id => {

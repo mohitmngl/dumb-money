@@ -76,6 +76,10 @@
   <select id="fNewAth"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
   <label>New Low:</label>
   <select id="fNewAtl"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select>
+  <label>Min Next Day %:</label>
+  <input type="number" id="fMinNextDay" style="width:70px" step="0.1" placeholder="-100">
+  <label>Max Next Day %:</label>
+  <input type="number" id="fMaxNextDay" style="width:70px" step="0.1" placeholder="100">
   <label id="lblIndex">Index:</label>
   <select id="fIndex"><option value="">All</option></select>
   <label>Profit:</label>
@@ -267,6 +271,8 @@ function getFilters() {
     shortable: document.getElementById('fShortable') ? document.getElementById('fShortable').value : '',
     new_ath: document.getElementById('fNewAth') ? document.getElementById('fNewAth').value : '',
     new_atl: document.getElementById('fNewAtl') ? document.getElementById('fNewAtl').value : '',
+    min_next_day: document.getElementById('fMinNextDay') ? document.getElementById('fMinNextDay').value : '',
+    max_next_day: document.getElementById('fMaxNextDay') ? document.getElementById('fMaxNextDay').value : '',
     index: document.getElementById('fIndex') ? document.getElementById('fIndex').value : '',
     profit_status: document.getElementById('fProfitStatus').value,
     min_st_bars_below: document.getElementById('fMinSTBarsBelow') ? document.getElementById('fMinSTBarsBelow').value : '',
@@ -400,7 +406,7 @@ function sort(key) {
 function goPage(p) { currentPage = p; loadScreener(); }
 
 function clearFilters() {
-  ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinRetestScore','fDateCutoff'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  ['fSearch','fMinPrice','fMaxPrice','fMinWA','fMaxWA','fMinChg','fMaxChg','fMinStreak','fMinVol','fMinSTBarsBelow','fMinSTBarsAbove','fMinAccelBarsBelow','fMinAccelBarsAbove','fMinRetestScore','fDateCutoff','fMinNextDay','fMaxNextDay'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   ['fExchange','fType','fLeveraged','fATRStatus','fATRStatusW','fATRStatusM','fAccelStatus','fFractionable','fShortable','fNewAth','fNewAtl','fIndex','fProfitStatus'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   currentPage = 1;
   loadScreener();

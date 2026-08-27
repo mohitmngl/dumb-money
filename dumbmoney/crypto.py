@@ -39,6 +39,15 @@ def _build_crypto_stats_query(conn, search, sort, sort_dir, page, per_page, args
         where.append("change_pct <= ?")
         params.append(float(max_change))
 
+    min_next = args.get("min_next_day")
+    max_next = args.get("max_next_day")
+    if min_next:
+        where.append("next_day_return >= ?")
+        params.append(float(min_next))
+    if max_next:
+        where.append("next_day_return <= ?")
+        params.append(float(max_next))
+
     min_wa = args.get("min_wa")
     max_wa = args.get("max_wa")
     if min_wa:
@@ -210,6 +219,15 @@ def _build_crypto_hist_query(conn, date_cutoff, search, sort, sort_dir, page, pe
     if max_change:
         where.append("h.change_pct <= ?")
         params.append(float(max_change))
+
+    min_next = args.get("min_next_day")
+    max_next = args.get("max_next_day")
+    if min_next:
+        where.append("h.next_day_return >= ?")
+        params.append(float(min_next))
+    if max_next:
+        where.append("h.next_day_return <= ?")
+        params.append(float(max_next))
 
     min_wa = args.get("min_wa")
     max_wa = args.get("max_wa")

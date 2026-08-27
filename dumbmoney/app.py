@@ -313,6 +313,8 @@ def api_crypto_screener():
         "min_funding_rate": request.args.get("min_funding_rate"),
         "new_ath": request.args.get("new_ath"),
         "new_atl": request.args.get("new_atl"),
+        "min_next_day": request.args.get("min_next_day"),
+        "max_next_day": request.args.get("max_next_day"),
     }
     result = get_crypto_screener(page=page, per_page=per_page, sort=sort, sort_dir=sort_dir,
                                   search=search, force=force, date_cutoff=date_cutoff, args=args)
@@ -1073,6 +1075,15 @@ def _build_historical_query(conn, market, date_cutoff, search, exchange, asset_t
         where.append("h.weighted_alpha <= ?")
         params.append(float(max_wa))
 
+    min_next = args.get("min_next_day")
+    max_next = args.get("max_next_day")
+    if min_next:
+        where.append("h.next_day_return >= ?")
+        params.append(float(min_next))
+    if max_next:
+        where.append("h.next_day_return <= ?")
+        params.append(float(max_next))
+
     min_streak = args.get("min_streak")
     if min_streak:
         where.append("h.streak >= ?")
@@ -1326,6 +1337,15 @@ def _build_stats_query(conn, market, search, exchange, asset_type,
     if max_change:
         where.append("change_pct <= ?")
         params.append(float(max_change))
+
+    min_next = args.get("min_next_day")
+    max_next = args.get("max_next_day")
+    if min_next:
+        where.append("next_day_return >= ?")
+        params.append(float(min_next))
+    if max_next:
+        where.append("next_day_return <= ?")
+        params.append(float(max_next))
 
     min_streak = args.get("min_streak")
     if min_streak:
